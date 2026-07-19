@@ -17,16 +17,26 @@ market_gate         the sample-based CLV gate: grade the model against
                     the captured odds store (close AND open), per market
                     family — n graded prices, log-loss edge vs the
                     de-vigged close, date-block bootstrap CIs,
-                    Benjamini-Hochberg control across families, and
-                    edge-bucket realization tables. Verdicts are
+                    Benjamini-Hochberg control across families,
+                    edge-bucket realization tables, and close-quality
+                    columns (share of single-capture prices, median
+                    open->close capture span). Verdicts are
                     PASS / NO-EDGE / INSUFFICIENT n — never elapsed
                     weeks.
+ab_compare          the paired ship test: two replay-row ledgers over
+                    the same slates joined row-for-row on
+                    (GamePk, market, PlayerId), date-block bootstrap CI
+                    on the per-row log-loss DIFFERENCE, BH control
+                    across families — strictly more power than reading
+                    two aggregate ledgers side by side.
 
 Usage:
     python Model/evaluate.py --grade --start 2025-06-01 --end 2025-06-03
     python Model/evaluate.py --fit-calibrators --start 2025-05-01 \
         --end 2025-05-15
     python Model/evaluate.py --gate --start 2026-07-08 --end 2026-07-17
+    python Model/evaluate.py --ab artifacts/rows_baseline.parquet \
+        artifacts/calib_rows.parquet
 """
 
 import argparse
@@ -331,11 +341,36 @@ def fit_calibrators(start, end, n_sims=4000, min_n=500,
         out[fam] = cal
         print(f"  {fam}: n={len(sub):,} logloss {before:.5f} -> "
               f"{after:.5f} (in-sample; a={a:+.3f}, b={b:.3f})")
+    # stamp the fit range so downstream evaluation can flag overlap
+    # (every consumer looks families up by key, so "_meta" is inert)
+    out["_meta"] = dict(fit_start=str(df.Date.min()),
+                        fit_end=str(df.Date.max()),
+                        n_rows=int(len(df)),
+                        n_games=int(df.GamePk.nunique()))
     F.write_artifact(ART / "output_calibrators.joblib",
                      lambda p: joblib.dump(out, p))
-    print(f"wrote {len(out)} family calibrators -> "
+    print(f"wrote {len(out) - 1} family calibrators "
+          f"(fit range {out['_meta']['fit_start']}.."
+          f"{out['_meta']['fit_end']}) -> "
           f"{ART / 'output_calibrators.joblib'}")
     return out
+
+
+def _warn_calib_overlap(calib, start, end, context):
+    """Loud warning when an evaluation range overlaps the output-
+    calibrator fit range — calibrated probabilities are then partly
+    in-sample. A warning, not a refusal: the in-sample view is sometimes
+    wanted deliberately; the discipline just has to be visible."""
+    meta = (calib or {}).get("_meta")
+    if not meta or start is None or end is None:
+        return
+    fs, fe = str(meta.get("fit_start")), str(meta.get("fit_end"))
+    s, e = str(start), str(end)
+    if not (e < fs or s > fe):
+        print(f"\n*** WARNING [{context}]: eval range {s}..{e} overlaps "
+              f"the output-calibrator fit range {fs}..{fe} — calibrated "
+              "probabilities are partly IN-SAMPLE here; use a disjoint "
+              "range for an honest read. ***\n")
 
 
 def skill_ledger(start=None, end=None):
@@ -353,6 +388,9 @@ def skill_ledger(start=None, end=None):
     cal_path = ART / "output_calibrators.joblib"
     cal = joblib.load(cal_path) if cal_path.exists() else {}
     df = df.copy()
+    if len(df):
+        _warn_calib_overlap(cal, start or df.Date.min(),
+                            end or df.Date.max(), "skill ledger")
     df["p_cal"] = df["p"]
     for fam in df["family"].unique():
         c = cal.get(fam)
@@ -401,6 +439,105 @@ def skill_ledger(start=None, end=None):
     print(f"\nwrote skill_ledger_families.csv / skill_ledger_markets.csv"
           f" -> {ART}")
     return fam_rep, mkt_rep
+
+
+def ab_compare(path_a, path_b, start=None, end=None, boot=500,
+               alpha=0.05, min_n=800):
+    """Paired A/B between two replay-row ledgers graded over the same
+    slates (calib_rows-style parquets; A = baseline, B = candidate —
+    copy artifacts/calib_rows.parquet aside before replaying the new
+    stack). Rows join on (GamePk, market, PlayerId) so every comparison
+    is like-for-like; the mean per-row log-loss difference gets a
+    date-block bootstrap CI and BH control across families. RAW serve
+    probabilities are compared — each stack refits its own output
+    calibrators, so pre-calibration p is the clean model-vs-model
+    signal. Positive delta = B better."""
+    key = ["GamePk", "market", "PlayerId"]
+    a = pd.read_parquet(path_a).drop_duplicates(key)
+    b = pd.read_parquet(path_b).drop_duplicates(key)
+    if start:
+        a, b = a[a.Date >= str(start)], b[b.Date >= str(start)]
+    if end:
+        a, b = a[a.Date <= str(end)], b[b.Date <= str(end)]
+    m = a.merge(b, on=key, suffixes=("_a", "_b"))
+    bad = m.y_a != m.y_b
+    if bad.any():
+        print(f"WARNING: {int(bad.sum())} joined rows disagree on the "
+              "realized outcome — dropped (ledgers graded from "
+              "different box-score data?)")
+        m = m[~bad]
+    if m.empty:
+        print("no shared rows between the two ledgers")
+        return m
+    print(f"paired A/B: {len(m):,} shared rows "
+          f"({len(a) - len(m):,} only in A, {len(b) - len(m):,} only "
+          f"in B), {m.Date_a.nunique()} slates "
+          f"{m.Date_a.min()}..{m.Date_a.max()}")
+
+    y = m.y_a.values.astype(float)
+    pa = np.clip(m.p_a.values.astype(float), 1e-6, 1 - 1e-6)
+    pb = np.clip(m.p_b.values.astype(float), 1e-6, 1 - 1e-6)
+    m = m.assign(
+        Date=m.Date_a, family=m.family_a,
+        ll_a=-(y * np.log(pa) + (1 - y) * np.log(1 - pa)),
+        ll_b=-(y * np.log(pb) + (1 - y) * np.log(1 - pb)))
+    m["d"] = m.ll_a - m.ll_b
+
+    rng = np.random.default_rng(7)
+
+    def _boot(sub):
+        """Date-block bootstrap of the mean per-row delta: resample
+        slates, delta = sum of per-date delta sums / total n. Returns
+        (ci_lo, ci_hi, two-sided p)."""
+        g = sub.groupby("Date")["d"].agg(["sum", "size"])
+        sums = g["sum"].values
+        ns = g["size"].values.astype(float)
+        k = len(sums)
+        if k < 2:
+            return np.nan, np.nan, 1.0
+        idx = rng.integers(0, k, size=(boot, k))
+        ds = sums[idx].sum(axis=1) / ns[idx].sum(axis=1)
+        p_two = 2.0 * min(float((ds <= 0).mean()),
+                          float((ds >= 0).mean()))
+        return (float(np.quantile(ds, 0.05)),
+                float(np.quantile(ds, 0.95)), min(p_two, 1.0))
+
+    stats = []
+    for fam, sub in m.groupby("family"):
+        lo, hi, p_two = _boot(sub)
+        stats.append(dict(
+            family=fam, n=len(sub),
+            ll_a=round(float(sub.ll_a.mean()), 5),
+            ll_b=round(float(sub.ll_b.mean()), 5),
+            delta=round(float(sub.d.mean()), 5),
+            ci_lo=round(lo, 5), ci_hi=round(hi, 5), p_raw=p_two))
+    rep = pd.DataFrame(stats).sort_values("p_raw")
+    nf = len(rep)
+    q = rep.p_raw.values * nf / np.arange(1, nf + 1)
+    rep["p_bh"] = np.minimum.accumulate(q[::-1])[::-1].clip(max=1.0)
+    rep["verdict"] = np.where(
+        rep.n < min_n, "INSUFFICIENT n",
+        np.where((rep.p_bh < alpha) & (rep.ci_lo > 0), "B BETTER",
+                 np.where((rep.p_bh < alpha) & (rep.ci_hi < 0),
+                          "A BETTER", "TIE")))
+    lo, hi, p_two = _boot(m)
+    rep = pd.concat([rep, pd.DataFrame([dict(
+        family="ALL", n=len(m),
+        ll_a=round(float(m.ll_a.mean()), 5),
+        ll_b=round(float(m.ll_b.mean()), 5),
+        delta=round(float(m.d.mean()), 5),
+        ci_lo=round(lo, 5), ci_hi=round(hi, 5),
+        p_raw=p_two, p_bh=np.nan, verdict="")])], ignore_index=True)
+    print("\nper family (delta = ll_A - ll_B on raw p; positive = B "
+          "better; 90% date-block bootstrap CI, BH across families):")
+    print(rep.to_string(index=False))
+    mk = (m.groupby(["family", "market"])
+          .agg(n=("d", "size"), delta=("d", "mean")).reset_index())
+    mk["delta"] = mk.delta.round(5)
+    print("\nper market (point deltas only, no test):")
+    print(mk.sort_values("delta", ascending=False)
+          .to_string(index=False))
+    return rep
 
 
 # ------------------------------------------------------- the CLV gate
@@ -453,7 +590,7 @@ def _gate_fingerprint(n_sims):
 
 
 GATE_CACHE_COLS = ["key", "family", "Date", "y", "p_model", "p_close",
-                   "p_open"]
+                   "p_open", "one_cap", "gap_min"]
 
 
 def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
@@ -463,6 +600,7 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
     captured odds changed since the last run (gate_rows_cache.parquet);
     unchanged slates load their graded rows from the cache."""
     P = PR.Predictor()
+    _warn_calib_overlap(P.calib, start, end, "CLV gate")
     odds = pd.read_csv(O.DEFAULT_STORE, encoding="utf-8-sig",
                        low_memory=False)
     odds = odds[(odds.Date >= str(start)) & (odds.Date <= str(end))]
@@ -474,6 +612,10 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
     cache_path = ART / "gate_rows_cache.parquet"
     cache = (pd.read_parquet(cache_path) if cache_path.exists()
              else pd.DataFrame(columns=GATE_CACHE_COLS))
+    if not set(GATE_CACHE_COLS) <= set(cache.columns):
+        print("gate cache predates the close-quality columns — "
+              "discarding (one-time re-sim)")
+        cache = pd.DataFrame(columns=GATE_CACHE_COLS)
     new_frames, seen_keys = [], set()
 
     rows = []
@@ -482,7 +624,7 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
         if day_games.empty:
             continue
         osig = int(pd.util.hash_pandas_object(
-            day_odds[["PlayerId", "Market", "Line", "OverPrice",
+            day_odds[["PlayerId", "Team", "Market", "Line", "OverPrice",
                       "UnderPrice", "OpenOverPrice", "OpenUnderPrice"]]
             .astype(str)).sum() % 10 ** 12)
         key = f"{date}|{fp}|{len(day_odds)}|{osig}"
@@ -494,7 +636,7 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
             continue
         day_list = []
         # replay the slate once; map players/games to sim results
-        by_pid, by_home = {}, {}
+        by_pid, by_home, by_team = {}, {}, {}
         for _, g in day_games.iterrows():
             spec = B.build_spec(P, g, lineups, starters, umps, wx)
             if len(spec["away_lineup"]) < 9 or None in (
@@ -502,6 +644,8 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
                 continue
             res = P.predict_slate([spec], n_sims=n_sims)[0]
             by_home[g.HomeTeam] = (res, int(g.GamePk))
+            by_team[str(g.AwayTeam)] = (res, int(g.GamePk), 0)
+            by_team[str(g.HomeTeam)] = (res, int(g.GamePk), 1)
             for row_i, pid in enumerate(res["meta"]["players"]):
                 if pid >= 0 and row_i < 20:
                     by_pid.setdefault(int(pid), (res, row_i,
@@ -509,8 +653,15 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
         print(f"  {date}: {len(by_home)} games replayed", flush=True)
 
         s = sim.SIDX
-        for (pid_s, market, line_s), grp in day_odds.groupby(
-                ["PlayerId", "Market", "Line"], dropna=False):
+        # game markets group by TEAM (their PlayerId is blank — grouping
+        # them by PlayerId would fold every game on the slate into one
+        # group); player props group by PlayerId as before
+        gm_mask = day_odds.Market.isin(("h2h", "totals", "team_totals"))
+        grouped = list(day_odds[~gm_mask].groupby(
+            ["PlayerId", "Market", "Line"], dropna=False)) + \
+            list(day_odds[gm_mask].groupby(
+                ["Team", "Market", "Line"], dropna=False))
+        for (pid_s, market, line_s), grp in grouped:
             fam = PR.MKT_FAM.get(market)
             if fam is None:
                 continue
@@ -522,11 +673,35 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
             fair_open = O.sharp_fair(op)
             if fair is None:
                 continue
+            # close quality: was this price ever re-captured, and how
+            # long a span does open->close actually cover?
+            cts = pd.to_datetime(grp.CapturedAt, errors="coerce")
+            ots = pd.to_datetime(grp.OpenCapturedAt,
+                                 errors="coerce").fillna(cts)
+            gap_min = max(0.0, float(
+                ((cts - ots).dt.total_seconds() / 60.0).fillna(0).max()))
+            one_cap = int(gap_min <= 0)
             try:
                 line = float(line_s)
             except (TypeError, ValueError):
                 line = np.nan
-            if market in ("h2h", "totals"):
+            if market == "team_totals":
+                if not np.isfinite(line):
+                    continue
+                hit = by_team.get(str(grp.Team.iloc[0]))
+                if hit is None:
+                    continue
+                res, pk, side = hit
+                p_model = PR._cal(res.get("calib"), "tt", float(
+                    (res["score"][:, side] > line).mean()))
+                grow = games[games.GamePk == pk]
+                if grow.empty:
+                    continue
+                sc_ = pd.to_numeric(
+                    grow.iloc[0].HomeScore if side
+                    else grow.iloc[0].AwayScore, errors="coerce")
+                y = None if pd.isna(sc_) else int(sc_ > line)
+            elif market in ("h2h", "totals"):
                 team = grp.Team.iloc[0]
                 hit = by_home.get(team)
                 if hit is None:
@@ -569,7 +744,8 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
                 continue
             day_list.append(dict(family=fam, Date=date, y=y,
                                  p_model=p_model, p_close=fair,
-                                 p_open=fair_open))
+                                 p_open=fair_open, one_cap=one_cap,
+                                 gap_min=gap_min))
         rows.extend(day_list)
         if day_list:
             new_frames.append(
@@ -614,6 +790,7 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
         d_open = (logloss(moved.y, moved.p_open)
                   - logloss(moved.y, np.clip(moved.p_model, 0, 1))
                   ) if len(moved) >= 30 else np.nan
+        recap = sub.gap_min[sub.gap_min > 0]
         fam_stats.append(dict(
             family=fam, n=len(sub),
             ll_model=round(d_model, 5), ll_close=round(d_close, 5),
@@ -622,7 +799,10 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
             if len(boots) else np.nan,
             p_raw=pval, n_moved=len(moved),
             d_vs_open=round(float(d_open), 5)
-            if d_open == d_open else np.nan))
+            if d_open == d_open else np.nan,
+            pct_1cap=round(float(sub.one_cap.mean()), 3),
+            med_gap_min=round(float(recap.median()), 1)
+            if len(recap) else np.nan))
     rep = pd.DataFrame(fam_stats).sort_values("p_raw")
     # Benjamini-Hochberg across families: reverse cumulative minimum of
     # p * m / rank over the ascending-p ordering
@@ -647,6 +827,10 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
     print(bt.to_string())
     print("\nverdicts are per-family and sample-gated: PASS needs "
           f"n >= {min_n} AND BH-adjusted bootstrap CI above zero.")
+    print("close quality: pct_1cap = share of graded prices captured "
+          "only once (their 'close' is that lone capture — likely a "
+          "soft early line, which flatters delta); med_gap_min = "
+          "median open->close capture span among re-captured prices.")
     return df, rep
 
 
@@ -659,6 +843,10 @@ if __name__ == "__main__":
     ap.add_argument("--ledger", action="store_true",
                     help="skill ledger from calib_rows.parquet (no "
                          "re-sim; optional --start/--end filter)")
+    ap.add_argument("--ab", nargs=2, metavar=("A_ROWS", "B_ROWS"),
+                    help="paired A/B between two replay-row parquets "
+                         "(A=baseline, B=candidate; optional "
+                         "--start/--end filter)")
     ap.add_argument("--start", default=None)
     ap.add_argument("--end", default=None)
     ap.add_argument("--sims", type=int, default=4000)
@@ -671,10 +859,14 @@ if __name__ == "__main__":
                     help="batched replay path (sim_batch prepare_games "
                          "+ run_batch on CUDA)")
     args = ap.parse_args()
-    needs_range = not (args.ledger or (args.fitcal and args.reuse_rows))
+    needs_range = not (args.ledger or args.ab
+                       or (args.fitcal and args.reuse_rows))
     if needs_range and not (args.start and args.end):
         ap.error("--start and --end are required for this mode")
-    if args.ledger:
+    if args.ab:
+        ab_compare(args.ab[0], args.ab[1], start=args.start,
+                   end=args.end, min_n=args.min_n)
+    elif args.ledger:
         skill_ledger(args.start, args.end)
     elif args.fitcal:
         fit_calibrators(args.start, args.end, n_sims=args.sims,

@@ -12,12 +12,20 @@ Then run it near game time to snapshot that day's closing-ish lines:
     python "Tools/2) Scrape Odds.py"                        # today, everything (default)
     python "Tools/2) Scrape Odds.py" --markets props        # player props only, no game markets
     python "Tools/2) Scrape Odds.py" --markets hr,pk,totals --date 2026-07-04
+    python "Tools/2) Scrape Odds.py" --include-started      # includes started games (live odds)
+                                     
 
 The default 'all' captures every posted player prop the model predicts plus the
-game markets (totals = over/under runs, h2h = moneyline / winner), from the
+game markets (totals = over/under runs, h2h = moneyline / winner, team_totals
+= per-club run totals — the engine's tt family), from the
 DEFAULT_BOOKS list: the prop-posting US books plus Pinnacle, the sharp book a
 de-vig consensus prefers as its reference — same credit
-cost as the plain regions=us default. Run it twice a day and it just works: player-prop markets cost 1 credit PER GAME while the
+cost as the plain regions=us default. Every market drags its alternate-line
+partner along (O.ALT_MARKET: hits/TB/RBI, pitcher K/hits/walks ladders,
+totals and team totals) and the rows are stored under the BASE market name —
+the engine prices those deep lines, and per-event calls bill on markets
+RETURNED, so alternates and unposted markets (batter Ks) ride free until a
+book actually posts them. Run it twice a day and it just works: player-prop markets cost 1 credit PER GAME while the
 game markets are one flat bulk call, and a rerun near first pitch SKIPS games
 already underway (their pregame line is final), so the second run only pays for
 games not yet started. write_store keeps one row per (Date, PlayerId, Market,
@@ -63,13 +71,22 @@ norm_name = _gtg.norm_name
 API = "https://api.the-odds-api.com/v4/sports/baseball_mlb"
 PROP_APIS = sorted({m["api"] for m in O.PROP_MARKET.values()} |
                    {m["api"] for m in O.STARTER_MARKET.values()})
-GAME_MARKETS = ["totals", "h2h"]           # over/under total runs; moneyline
+GAME_MARKETS = ["totals", "h2h"]   # featured: ONE bulk call for the slate
 
-# US sportsbooks don't post every market the model predicts: none posts
-# batter strikeouts. 'props'/'all' skip these so a run never
-# requests an always-empty market; an explicit --markets bk still works
-# (e.g. a book that does post it).
-UNPOSTED_APIS = {"batter_strikeouts"}
+# Game markets that exist only on the per-event endpoint; they ride
+# along with each game's prop request (team_totals = per-club run
+# totals, the engine's tt family; the alternate_* keys are extra lines
+# that normalize into totals / team_totals at parse time, O.ALT_MARKET).
+EVENT_GAME_APIS = ("team_totals", "alternate_totals",
+                   "alternate_team_totals")
+
+# Markets the model prices that no US book currently posts (batter
+# strikeouts, once listed here). Per-event calls bill on markets
+# RETURNED, not requested, so an unposted market rides along in the
+# auto sets at zero cost — the day a book starts posting it, it is
+# captured with no code change. Populate this set only if a market
+# ever becomes expensive to request.
+UNPOSTED_APIS = set()
 
 # Which books to pay for. The Odds API bills the bookmakers param in GROUPS OF
 # TEN (any group = one region-equivalent), so this list of 9 costs exactly what
@@ -117,26 +134,32 @@ def load_key(cli_key=None):
 
 def _api_of(k):
     """Odds API market key for one of our market keys (batter prop, pitcher
-    prop, or a game market that is already its own api key)."""
+    prop, team totals, or a game market that is already its own api key)."""
     if k in O.PROP_MARKET:
         return O.PROP_MARKET[k]["api"]
     if k in O.STARTER_MARKET:
         return O.STARTER_MARKET[k]["api"]
+    if k in ("tt", "team_totals"):
+        return "team_totals"
     return k
 
 
 def resolve_markets(spec):
-    """A market spec -> the ordered, de-duped list of Odds API market keys to
-    request. `spec` is 'all' (every player prop + game market), 'props' (every
-    player prop the model predicts, the default), or a comma list of our keys:
-    batter props (PROP_MARKET), pitcher props (STARTER_MARKET), and/or the game
-    markets totals, h2h."""
+    """A market spec -> the ordered, de-duped list of Odds API market keys
+    to request. `spec` is 'all' (every player prop + game markets incl.
+    team totals), 'props' (every player prop the model predicts), or a
+    comma list of our keys: batter props (PROP_MARKET), pitcher props
+    (STARTER_MARKET), team_totals (alias tt), and/or the game markets
+    totals, h2h. Every requested market drags its alternate-line partner
+    along (O.ALT_MARKET) — the engine prices the deep lines books post
+    as alternates, and per-event calls bill on markets RETURNED, so an
+    alternate nobody posts costs nothing."""
     prop_keys = list(O.PROP_MARKET) + list(O.STARTER_MARKET)
-    valid = prop_keys + GAME_MARKETS
+    valid = prop_keys + GAME_MARKETS + ["team_totals", "tt"]
     s = spec.strip().lower()
     if s in ("all", "props"):
-        # auto sets drop markets no US book posts; an explicit list keeps them
-        auto = prop_keys + (GAME_MARKETS if s == "all" else [])
+        auto = prop_keys + (GAME_MARKETS + ["team_totals"]
+                            if s == "all" else [])
         keys = [k for k in auto if _api_of(k) not in UNPOSTED_APIS]
     else:
         keys = [k.strip() for k in spec.split(",") if k.strip()]
@@ -144,12 +167,16 @@ def resolve_markets(spec):
     if unknown:
         raise SystemExit(f"unknown market(s): {', '.join(unknown)}. valid: "
                          f"{', '.join(valid)}, or 'props'/'all'.")
+    alt_of = {}
+    for alt, base in O.ALT_MARKET.items():
+        alt_of.setdefault(base, []).append(alt)
     apis, seen = [], set()
     for k in keys:
         api = _api_of(k)
-        if api not in seen:
-            seen.add(api)
-            apis.append(api)
+        for a in [api] + alt_of.get(api, []):
+            if a not in seen:
+                seen.add(a)
+                apis.append(a)
     return apis
 
 
@@ -209,14 +236,16 @@ def parse_event_props(event, resolver, date, gamepk, captured_at,
                       prop_apis=PROP_APIS):
     """Pure: an Odds API event JSON -> list of canonical prop rows (one per
     player/market/line/book, with matched over & under prices). Unresolved
-    player names are skipped."""
+    player names are skipped. Alternate-line markets are stored under
+    their BASE market name (O.ALT_MARKET) — one Market key per family in
+    the store, extra lines indistinguishable from main-line captures."""
     rows = []
     for bk in event.get("bookmakers", []):
         book = bk.get("key")
         for mkt in bk.get("markets", []):
             if mkt.get("key") not in prop_apis:
                 continue
-            market = mkt["key"]
+            market = O.ALT_MARKET.get(mkt["key"], mkt["key"])
             # group the market's outcomes by (player, line) -> {over, under}
             pairs = {}
             for o in mkt.get("outcomes", []):
@@ -243,30 +272,58 @@ def parse_event_props(event, resolver, date, gamepk, captured_at,
     return rows
 
 
-def parse_event_games(event, home_abbr, away_abbr, date, gamepk, captured_at):
-    """Game-level totals (over/under runs) and moneyline (home vs away) rows,
-    stored in the same schema: PlayerId blank, Team = home club. Totals ->
-    OverPrice/UnderPrice; h2h -> OverPrice = home, UnderPrice = away."""
+def parse_event_games(event, home_abbr, away_abbr, date, gamepk, captured_at,
+                      keys=("totals", "h2h")):
+    """Game-level rows in the same schema, PlayerId blank. totals (every
+    posted line, alternates normalized in) -> Team = home club; h2h ->
+    OverPrice = home, UnderPrice = away, Team = home club; team_totals ->
+    Team = the club the total is FOR (the outcome's description names
+    it). `keys` picks which raw API markets to read — the bulk featured
+    call passes the default, the per-event call passes EVENT_GAME_APIS."""
     rows = []
     for bk in event.get("bookmakers", []):
         book = bk.get("key")
         for mkt in bk.get("markets", []):
             k = mkt.get("key")
+            if k not in keys:
+                continue
             outs = mkt.get("outcomes", [])
-            if k == "totals":
-                by = {_side(o.get("name")): o for o in outs}
-                if "over" in by and "under" in by:
-                    rows.append(_game_row(date, gamepk, home_abbr, "totals",
-                                          by["over"].get("point"),
-                                          by["over"].get("price"),
-                                          by["under"].get("price"), book,
-                                          captured_at))
+            if k in ("totals", "alternate_totals"):
+                pairs = {}
+                for o in outs:
+                    side = _side(o.get("name"))
+                    if side is None or o.get("point") is None:
+                        continue
+                    pairs.setdefault(float(o["point"]),
+                                     {})[side] = o.get("price")
+                for line, pr in pairs.items():
+                    if "over" in pr and "under" in pr:
+                        rows.append(_game_row(date, gamepk, home_abbr,
+                                              "totals", line, pr["over"],
+                                              pr["under"], book,
+                                              captured_at))
+            elif k in ("team_totals", "alternate_team_totals"):
+                pairs = {}
+                for o in outs:
+                    side = _side(o.get("name"))
+                    ab = full_name_to_abbrev(o.get("description") or "")
+                    if side is None or ab is None or o.get("point") is None:
+                        continue
+                    pairs.setdefault((ab, float(o["point"])),
+                                     {})[side] = o.get("price")
+                for (ab, line), pr in pairs.items():
+                    if "over" in pr and "under" in pr:
+                        rows.append(_game_row(date, gamepk, ab,
+                                              "team_totals", line,
+                                              pr["over"], pr["under"],
+                                              book, captured_at))
             elif k == "h2h":
                 price = {full_name_to_abbrev(o.get("name")): o.get("price")
                          for o in outs}
                 rows.append(_game_row(date, gamepk, home_abbr, "h2h", None,
                                       price.get(home_abbr),
-                                      price.get(away_abbr), book, captured_at))
+                                      price.get(away_abbr), book,
+                                      captured_at))
     return rows
 
 
@@ -307,8 +364,20 @@ def write_store(rows, out):
             existing = list(csv.DictReader(f))
     best = {}  # key -> [open (ts, over, under), close (ts, row)]
     for row in existing + rows:
-        key = (str(row.get("Date")), str(row.get("PlayerId")),
-               row.get("Market"), str(row.get("Line")), row.get("Book"))
+        ident = str(row.get("PlayerId") or "").strip()
+        if not ident:
+            # game-market rows carry no PlayerId: the Team IS the
+            # identity. Without it every game's h2h/totals rows on a
+            # date collapsed to ONE surviving row per book (fixed
+            # 2026-07-19; earlier slates lost all but one game).
+            ident = "T:" + str(row.get("Team") or "")
+        # a lineless market (h2h) is None in memory but "" once
+        # round-tripped through the CSV — normalize or recaptures
+        # never merge with their stored row
+        line_v = row.get("Line")
+        line_k = "" if line_v in (None, "") else str(line_v)
+        key = (str(row.get("Date")), ident,
+               row.get("Market"), line_k, row.get("Book"))
         close_ts = str(row.get("CapturedAt") or "")
         open_ = (str(row.get("OpenCapturedAt") or close_ts),
                  row.get("OpenOverPrice") or row.get("OverPrice"),
@@ -396,8 +465,10 @@ def main():
     args = ap.parse_args()
     args.key = load_key(args.key)
     markets = resolve_markets(args.markets)
-    prop_markets = [m for m in markets if m not in GAME_MARKETS]
-    game_markets = [m for m in markets if m in GAME_MARKETS]
+    bulk_game = [m for m in markets if m in GAME_MARKETS]
+    event_game = [m for m in markets if m in EVENT_GAME_APIS]
+    prop_markets = [m for m in markets if m not in GAME_MARKETS
+                    and m not in EVENT_GAME_APIS]
 
     if not args.key:
         print("No Odds API key found. Get one at https://the-odds-api.com, "
@@ -438,14 +509,17 @@ def main():
     n_skip = len(events) - len(pending)
     pend_ids = {e.get("id") for e in pending}
 
-    est = len(prop_markets) * len(pending) * n_reg + len(game_markets) * n_reg
+    est = (len(prop_markets + event_game) * len(pending) * n_reg
+           + len(bulk_game) * n_reg)
     print(f"{len(events)} MLB events on {day}"
           f"{f' ({n_skip} already started, skipped)' if n_skip else ''} "
           f"(api requests left: {remain})")
-    print(f"markets [{', '.join(markets)}]: props x {len(pending)} games"
-          f"{f' x {n_reg} region-equivs' if n_reg > 1 else ''}"
-          f"{' + totals/h2h (1 bulk call)' if game_markets else ''} "
-          f"= ~{est} credits")
+    print(f"markets [{', '.join(markets)}]: per-event x {len(pending)} "
+          f"games{f' x {n_reg} region-equivs' if n_reg > 1 else ''}"
+          f"{' + totals/h2h (1 bulk call)' if bulk_game else ''} "
+          f"= at most ~{est} credits (billed on markets RETURNED — "
+          f"alternates and unposted markets that come back empty are "
+          f"free)")
 
     idx = build_name_index()
     all_rows, n_prop, n_game = [], 0, 0
@@ -454,12 +528,12 @@ def main():
     # ONE call returns the whole slate for markets x regions credits (not per
     # game). Keep only pending games so a rerun never overwrites a captured
     # closing line with an in-play price.
-    if game_markets and pend_ids:
+    if bulk_game and pend_ids:
         try:
             slate, remain = fetch(
                 f"{API}/odds",
                 {"apiKey": args.key, **scope,
-                 "markets": ",".join(game_markets), "oddsFormat": "american"})
+                 "markets": ",".join(bulk_game), "oddsFormat": "american"})
         except Exception as ex:
             print(f"  game markets fetch failed ({ex})", file=sys.stderr)
             slate = []
@@ -473,8 +547,12 @@ def main():
             n_game += len(gm)
         print(f"  game markets: {n_game} rows across the slate (left: {remain})")
 
-    # Player props live only on the per-event endpoint: one call per game.
-    for e in (pending if prop_markets else []):
+    # Player props and per-event game markets (team totals, alternates)
+    # live only on the per-event endpoint: one call per game covers both.
+    ev_req = prop_markets + event_game
+    base_req = [m for m in prop_markets if m not in O.ALT_MARKET]
+    warned_422 = False
+    for e in (pending if ev_req else []):
         home_abbr = full_name_to_abbrev(e.get("home_team", ""))
         away_abbr = full_name_to_abbrev(e.get("away_team", ""))
         resolver = make_resolver(idx, home_abbr, away_abbr)
@@ -482,16 +560,43 @@ def main():
             data, remain = fetch(
                 f"{API}/events/{e['id']}/odds",
                 {"apiKey": args.key, **scope,
-                 "markets": ",".join(prop_markets), "oddsFormat": "american"})
+                 "markets": ",".join(ev_req), "oddsFormat": "american"})
         except Exception as ex:
-            print(f"  {away_abbr}@{home_abbr}: odds fetch failed ({ex})",
-                  file=sys.stderr)
-            continue
-        pr = parse_event_props(data, resolver, day, "", captured_at,
-                               prop_apis=prop_markets)
-        all_rows += pr
+            # a 422 means some requested market key is unknown to the
+            # API — salvage the game with the base prop markets rather
+            # than losing the whole event's capture
+            if "422" in str(ex) and base_req and base_req != ev_req:
+                if not warned_422:
+                    print("  API rejected the alternate/event-game "
+                          "market list (422) — retrying base prop "
+                          "markets only; check O.ALT_MARKET keys "
+                          "against the Odds API docs", file=sys.stderr)
+                    warned_422 = True
+                try:
+                    data, remain = fetch(
+                        f"{API}/events/{e['id']}/odds",
+                        {"apiKey": args.key, **scope,
+                         "markets": ",".join(base_req),
+                         "oddsFormat": "american"})
+                except Exception as ex2:
+                    print(f"  {away_abbr}@{home_abbr}: odds fetch failed "
+                          f"({ex2})", file=sys.stderr)
+                    continue
+            else:
+                print(f"  {away_abbr}@{home_abbr}: odds fetch failed "
+                      f"({ex})", file=sys.stderr)
+                continue
+        pr = (parse_event_props(data, resolver, day, "", captured_at,
+                                prop_apis=prop_markets)
+              if prop_markets else [])
+        gm = (parse_event_games(data, home_abbr, away_abbr, day, "",
+                                captured_at, keys=EVENT_GAME_APIS)
+              if event_game else [])
+        all_rows += pr + gm
         n_prop += len(pr)
-        print(f"  {away_abbr}@{home_abbr}: {len(pr)} prop rows (left: {remain})")
+        n_game += len(gm)
+        print(f"  {away_abbr}@{home_abbr}: {len(pr)} prop + {len(gm)} "
+              f"game rows (left: {remain})")
 
     total = write_store(all_rows, args.out)
     print(f"\nwrote {n_prop} prop + {n_game} game rows this run; "

@@ -6,7 +6,10 @@ here, in one place, shared by the capture tool ("Tools/2) Scrape Odds.py")
 and every future consumer. This module defines:
 
   ODDS_COLUMNS     the store's column set. One row per (Date, PlayerId,
-                   Market, Line, Book). OverPrice/UnderPrice/CapturedAt
+                   Market, Line, Book) — for game-market rows (blank
+                   PlayerId: h2h, totals, team_totals) the Team column
+                   is the identity instead.
+                   OverPrice/UnderPrice/CapturedAt
                    are the LATEST capture (the closing side);
                    OpenOverPrice/OpenUnderPrice/OpenCapturedAt the
                    EARLIEST (the opening side) — so intraday recaptures
@@ -77,6 +80,28 @@ STARTER_MARKET = {
 API_DEFAULT_LINE = {
     "batter_home_runs": 0.5,
     "batter_stolen_bases": 0.5,
+}
+
+# Alternate-line API markets -> the base market they are stored AS. The
+# engine prices deep lines (2+ hits, 3+/4+ TB, 2+ RBI, the pitcher
+# ladders, every total) that books post mostly as alternates, so the
+# capture tool requests these alongside each base market and normalizes
+# the name away at parse time — one Market key per family in the store,
+# and the gate grades alternate lines with zero downstream changes.
+# Alternates whose extra lines the engine never prices (HR 1.5+, BB/SB
+# deep lines) are deliberately absent: requesting them buys nothing.
+# team_totals is its own market (Team column = which club the total is
+# for); h2h and totals are event-featured and need no alternate to cover
+# the main line.
+ALT_MARKET = {
+    "batter_hits_alternate": "batter_hits",
+    "batter_total_bases_alternate": "batter_total_bases",
+    "batter_rbis_alternate": "batter_rbis",
+    "pitcher_strikeouts_alternate": "pitcher_strikeouts",
+    "pitcher_hits_allowed_alternate": "pitcher_hits_allowed",
+    "pitcher_walks_alternate": "pitcher_walks",
+    "alternate_totals": "totals",
+    "alternate_team_totals": "team_totals",
 }
 
 # Books treated as the sharp reference, in preference order: their no-vig

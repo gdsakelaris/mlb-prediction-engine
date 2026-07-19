@@ -906,7 +906,8 @@ MKT_FAM = {"batter_hits": "h", "batter_home_runs": "hr",
            "batter_doubles": "b2", "batter_hits_runs_rbis": "hrr",
            "pitcher_strikeouts": "pk", "pitcher_outs": "pout",
            "pitcher_hits_allowed": "pha", "pitcher_walks": "pbb",
-           "pitcher_earned_runs": "per", "h2h": "ml", "totals": "tot"}
+           "pitcher_earned_runs": "per", "h2h": "ml", "totals": "tot",
+           "team_totals": "tt"}
 
 
 def _cal(calib, fam, p):
