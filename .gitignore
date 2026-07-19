@@ -1,0 +1,16 @@
+# Bulk data — rebuilt daily by Scrapers/ (multi-GB; only the glossary is tracked)
+Data/*
+!Data/GLOSSARY.md
+
+# Secrets
+.odds_api_key
+
+# Python
+__pycache__/
+*.pyc
+
+# Run outputs
+Logs/
+Predictions/
+Tools/PROP_RANKINGS.xlsx
+Model/artifacts/

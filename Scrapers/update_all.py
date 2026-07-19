@@ -1,0 +1,300 @@
+"""Run every scraper to bring all CSVs in Data/ up to date.
+
+Discovers scrape_*.py in this directory and runs each one with its default
+output (all default to Data/). The pitch-arsenal scraper runs twice (pitcher
+and batter views). build_ballparks.py is intentionally excluded: park
+dimensions and elevations don't change daily. Tools/2_scrape_odds.py lives
+outside this directory on purpose: betting lines must be captured near game
+time (closing lines), not in this morning data job — run it alongside
+Tools/1_get_todays_games.py near first pitch.
+
+Each scraper is fault-isolated: one failing doesn't stop the rest, and the
+exit code is non-zero if anything failed.
+
+Safety net (validate_data.py): before each scraper runs, its current
+known-good CSVs are copied to Data/backups/; after it runs, the fresh files
+are schema-validated (required columns, keys, row counts vs the backup, date
+sanity). A file that fails validation is REPLACED by its backup, the job is
+marked FAILED, and the retrain is skipped — a silent upstream format change
+can no longer poison the daily retrain. The last log line is always
+"RESULT: OK" or "RESULT: FAILED" for easy scanning of Logs/update_*.log.
+
+Usage:
+    python Scrapers/update_all.py [--retrain]
+
+    --retrain    also rebuild feature frames and retrain the models
+                 (Model/train.py --rebuild) after a fully successful update
+"""
+
+import argparse
+import datetime as dt
+import json
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import validate_data as V
+
+SCRIPTS_DIR = Path(__file__).resolve().parent
+MODEL_TRAIN = SCRIPTS_DIR.parent / "Model" / "train.py"
+PROP_RANKINGS = SCRIPTS_DIR.parent / "Tools" / "5_prop_rankings.py"
+DATA_DIR = V.DATA_DIR
+BACKUP_DIR = V.BACKUP_DIR
+# machine-readable outcome of the last run; the GUI reads this at startup
+# and warns when the morning job failed (otherwise the only signal is a
+# log line nobody looks at until predictions have quietly gone stale)
+STATUS_FILE = SCRIPTS_DIR.parent / "Logs" / "last_run_status.json"
+
+
+# names that must NOT run in the 6 AM data job even if a copy ever lands in
+# this directory (the odds scraper lives at Tools/2_scrape_odds.py and is
+# run by hand near first pitch): betting lines are captured near game time
+# (closing lines), and a morning run would grab opening/empty markets and
+# burn the odds-API quota.
+EXCLUDE = {"scrape_odds.py", "2_scrape_odds.py"}
+
+# which Data/ files each job owns (backed up before the run, validated after)
+JOB_FILES = {
+    "scrape_batting_stats.py": ["mlb_batting_stats.csv"],
+    "scrape_gamelogs.py": ["mlb_games.csv", "mlb_game_batting.csv", "mlb_game_pitching.csv"],
+    "scrape_handedness.py": ["mlb_handedness.csv"],
+    "scrape_homeruns.py": ["mlb_homeruns.csv"],
+    "scrape_pitch_arsenals.py (pitchers)": ["mlb_pitch_arsenals.csv"],
+    "scrape_pitch_arsenals.py (batters)": ["mlb_pitch_arsenals_batters.csv"],
+    "scrape_pitching_stats.py": ["mlb_pitching_stats.csv"],
+    "scrape_rosters.py": ["mlb_rosters.csv"],
+    "scrape_milb.py": ["milb_batting.csv", "milb_pitching.csv"],
+    "scrape_statcast.py": ["mlb_statcast_bip.csv"],
+    "scrape_pitches.py": ["mlb_pitch_daily_pitchers.csv", "mlb_pitch_daily_batters.csv"],
+    "scrape_sprint_speed.py": ["mlb_sprint_speed.csv"],
+    "scrape_oaa.py": ["mlb_oaa.csv", "mlb_oaa_players.csv"],
+    "scrape_baserunning.py": ["mlb_baserunning.csv"],
+    "scrape_weather.py": ["mlb_weather.csv"],
+    "scrape_umpires.py": ["mlb_umpires.csv"],
+    "scrape_bat_tracking.py": ["mlb_bat_tracking.csv"],
+    "scrape_linescores.py": ["mlb_linescores.csv"],
+    "scrape_catchers.py": ["mlb_catchers.csv", "mlb_catchers_team.csv"],
+    "scrape_transactions.py": ["mlb_il_events.csv", "mlb_il.csv"],
+}
+
+
+def discover_jobs():
+    jobs = []  # (label, [args])
+    for script in sorted(SCRIPTS_DIR.glob("scrape_*.py")):
+        if script.name in EXCLUDE:
+            continue
+        if "pitch_arsenals" in script.name:
+            jobs.append((f"{script.name} (pitchers)", [str(script)]))
+            jobs.append((f"{script.name} (batters)", [str(script), "--type", "batter"]))
+        else:
+            jobs.append((script.name, [str(script)]))
+    return jobs
+
+
+def run(label, args):
+    print(f"\n{'=' * 70}\n>>> {label}\n{'=' * 70}", flush=True)
+    t0 = time.time()
+    proc = subprocess.run([sys.executable, *args])
+    took = time.time() - t0
+    ok = proc.returncode == 0
+    print(f">>> {label}: {'OK' if ok else f'FAILED (exit {proc.returncode})'} "
+          f"in {took:.0f}s", flush=True)
+    return ok, took
+
+
+def backup_known_good(files):
+    """Copy each currently-valid file to Data/backups/ before its scraper
+    rewrites it. A file that is ALREADY invalid is not backed up — that would
+    clobber the last good backup with a bad copy."""
+    BACKUP_DIR.mkdir(exist_ok=True)
+    for name in files:
+        src = DATA_DIR / name
+        if not src.exists():
+            continue
+        if V.validate_file(src):        # current copy itself fails validation
+            print(f"    (not backing up {name}: current copy already fails "
+                  f"validation; keeping the existing backup)", flush=True)
+            continue
+        shutil.copy2(src, BACKUP_DIR / name)
+
+
+def validate_and_restore(files):
+    """Validate a job's fresh output against the backups. On failure, restore
+    the backup so downstream consumers keep working. Returns True if every
+    file passed."""
+    all_ok = True
+    for name in files:
+        prev = BACKUP_DIR / name
+        problems = V.validate_file(DATA_DIR / name,
+                                   prev if prev.exists() else None)
+        if not problems:
+            continue
+        all_ok = False
+        for p in problems:
+            print(f"    VALIDATION FAIL: {p}", flush=True)
+        if prev.exists():
+            shutil.copy2(prev, DATA_DIR / name)
+            print(f"    restored {name} from backup", flush=True)
+        else:
+            print(f"    no backup available for {name}; the bad file was "
+                  f"left in place for inspection", flush=True)
+    return all_ok
+
+
+def experiment_in_flight():
+    """True when the Model sources differ from the ones the current paired
+    baselines were snapshotted from (evaluate_deep --set-baseline writes
+    baseline_code_fp.json). The daily retrain must train SHIPPED code —
+    quietly retraining and re-baselining an in-flight candidate would make
+    the experiment its own reference — so a mismatch turns the run
+    scrape-only. No fingerprint file (pre-feature snapshots) = proceed."""
+    import hashlib
+    fp_file = MODEL_TRAIN.parent / "artifacts" / "baseline_code_fp.json"
+    if not fp_file.exists():
+        return False
+    try:
+        base = json.loads(fp_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    for name, digest in base.items():
+        p = MODEL_TRAIN.parent / name
+        if not p.exists() or hashlib.md5(p.read_bytes()).hexdigest() != digest:
+            return True
+    return False
+
+
+def confirm_is_stale():
+    """True when the shipped Model sources differ from the ones the last
+    2026 confirm stamp was made under (confirm_code_fp.json, written by
+    evaluate_deep --confirm --set-baseline) — i.e. a ship landed since that
+    stamp. The daily job then re-stamps the confirm ONCE (audit #6 as
+    amended 2026-07-15: auto-on-ship, user directive), so the README's
+    enumerated-looks ledger grows at most one entry per ship. Unlike
+    experiment_in_flight() — which fails OPEN on a missing fingerprint so
+    pre-feature snapshots don't strand the daily train — a missing or
+    unreadable file here means a pre-feature confirm: stamp once to
+    bootstrap. The experiment_in_flight() gate has already guaranteed the
+    tree is shipped code by the time this runs."""
+    import hashlib
+    fp_file = MODEL_TRAIN.parent / "artifacts" / "confirm_code_fp.json"
+    try:
+        base = json.loads(fp_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        return True
+    for name, digest in base.items():
+        p = MODEL_TRAIN.parent / name
+        if not p.exists() or hashlib.md5(p.read_bytes()).hexdigest() != digest:
+            return True
+    return False
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--retrain", action="store_true",
+                    help="retrain the models after a successful update")
+    args = ap.parse_args()
+
+    results = []
+    for label, cmd in discover_jobs():
+        files = JOB_FILES.get(label, [])
+        if files:
+            backup_known_good(files)
+        ok, took = run(label, cmd)
+        if ok and files:
+            ok = validate_and_restore(files)
+            if not ok:
+                print(f">>> {label}: data FAILED validation", flush=True)
+        results.append((label, ok, took))
+
+    all_ok = all(ok for _, ok, _ in results)
+    if args.retrain:
+        if all_ok and experiment_in_flight():
+            print("\n>>> retrain SKIPPED: EXPERIMENT IN FLIGHT — the Model "
+                  "sources differ from the last --set-baseline snapshot "
+                  "(baseline_code_fp.json). Data was still refreshed, so the "
+                  "next --paired read will demand a re-baseline: finish or "
+                  "revert the candidate, then run "
+                  "update_all.py --retrain (or wait for tomorrow's run).",
+                  flush=True)
+            results.append(("retrain models (skipped: experiment in flight)",
+                            True, 0.0))
+        elif all_ok:
+            ok, took = run("Model/train.py --rebuild",
+                           [str(MODEL_TRAIN), "--rebuild"])
+            results.append(("retrain models", ok, took))
+            all_ok = all_ok and ok
+            # refresh the paired-eval baselines to match the just-trained
+            # models: the retrain above makes yesterday's snapshots stale
+            # (evaluate_deep --paired refuses a stale read via its data
+            # fingerprint), and a snapshot is only valid when it captures
+            # the CURRENT artifacts on the CURRENT data — which is exactly
+            # the state right here. The experiment_in_flight() gate above
+            # guarantees this only ever snapshots SHIPPED code.
+            if ok:
+                # 2026 confirm doctrine (audit #6, amended 2026-07-15 —
+                # auto-on-ship, user directive): the selection-year baseline
+                # refreshes daily, but the 2026 confirm snapshot re-stamps
+                # ONLY on the first daily train after a ship (shipped
+                # sources differ from confirm_code_fp.json — see
+                # confirm_is_stale). Between ships the daily job never adds
+                # a 2026 look; each auto stamp is one ledgered look per
+                # ship. Blue-mark/rankings inputs read the last confirm
+                # snapshot, so it ages between ships by design.
+                ev = str(MODEL_TRAIN.parent / "evaluate_deep.py")
+                steps = [("evaluate_deep.py --set-baseline",
+                          [ev, "--set-baseline"])]
+                if confirm_is_stale():
+                    steps.append((
+                        "evaluate_deep.py --confirm --set-baseline "
+                        "(auto ship-confirm)",
+                        [ev, "--confirm", "--set-baseline"]))
+                base_ok = True
+                for label, cmd in steps:
+                    ok, took = run(label, cmd)
+                    results.append((label, ok, took))
+                    all_ok = all_ok and ok
+                    base_ok = base_ok and ok
+                # Warm the prop-rankings bootstrap cache. The selection
+                # baseline above rewrote its paired snapshot, and
+                # quality_boot.joblib is keyed by the snapshot fingerprints
+                # (2025 daily + the last DELIBERATE 2026 confirm) — so it is
+                # now stale, and without this the first predict of the day
+                # would stall ~60s rebuilding it before painting blue marks.
+                #
+                # Deliberately NON-FATAL: it does not touch all_ok. A cold
+                # cache costs one slow serve, never correctness, and a perf
+                # nicety must not be able to turn the nightly run FAILED.
+                if base_ok:
+                    w_ok, took = run("5_prop_rankings.py --warm-cache",
+                                     [str(PROP_RANKINGS), "--warm-cache"])
+                    results.append(("warm quality-bootstrap cache "
+                                    "(non-fatal)", w_ok, took))
+                    if not w_ok:
+                        print(">>> cache warm failed — harmless: the first "
+                              "predict of the day just rebuilds it itself",
+                              file=sys.stderr, flush=True)
+        else:
+            print("\nskipping retrain: at least one scraper failed or "
+                  "produced invalid data", file=sys.stderr)
+
+    print(f"\n{'=' * 70}\nSummary\n{'=' * 70}")
+    for label, ok, took in results:
+        print(f"  {'OK    ' if ok else 'FAILED'}  {took:6.0f}s  {label}")
+
+    STATUS_FILE.parent.mkdir(exist_ok=True)
+    STATUS_FILE.write_text(json.dumps({
+        "finished": dt.datetime.now().isoformat(timespec="seconds"),
+        "ok": all_ok,
+        "failed_jobs": [label for label, ok, _ in results if not ok],
+    }, indent=1))
+
+    if not all_ok:
+        print("\nRESULT: FAILED", flush=True)
+        sys.exit(1)
+    print("\nRESULT: OK")
+
+
+if __name__ == "__main__":
+    main()
