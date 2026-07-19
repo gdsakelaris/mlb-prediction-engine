@@ -1,7 +1,7 @@
 """Scrape Statcast batted-ball data (every ball in play) from Baseball Savant.
 
 The HR log covers only home runs — a sample censored to each batter's best
-contact. This pulls EVERY tracked ball in play 2020-2026 from the public
+contact. This pulls EVERY tracked ball in play (2015 on) from the public
 statcast_search CSV endpoint (the same service behind
 baseballsavant.mlb.com/statcast_search): exit velocity, launch angle, barrel
 classification, expected stats on contact (xBA/xwOBA), batted-ball type, and

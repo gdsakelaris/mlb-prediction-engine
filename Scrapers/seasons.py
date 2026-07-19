@@ -5,28 +5,20 @@ range, so the annual rollover (2026 -> 2027 -> ...) needs no code edits:
 from March 1 the new calendar year becomes the current season and every
 scraper starts fetching it alongside the stored history.
 
-The model side deliberately does NOT import this. train.py derives its
-train/calibration/holdout years from the seasons actually present in the
-data (which flips only once real new-season games accrue), and
-features.py / predict.py are already season-relative (prior-season
-lookups use Season-1, serving uses the game date's year).
-
 Also provides the stored-season cache helper the per-year scrapers share:
 a completed season's stats never change once scraped, so a scraper only
 needs to hit the network for the current season. That both speeds the
 daily job and removes the failure mode where an upstream hiccup on a
-HISTORICAL fetch (e.g. Savant throttling the 2021 OAA page, 2026-07-07)
-kills the whole job and blocks the retrain.
+HISTORICAL fetch (e.g. Savant throttling a years-old leaderboard page)
+kills the whole job.
 """
 
 import csv
 from datetime import date
 from pathlib import Path
 
-# 2015 = first Statcast season. Extended back from 2020 (2026-07-09) to
-# roughly double the training sample; sources that start later (OAA 2016,
-# arsenals ~2017, bat tracking 2023) are simply empty for the early years
-# and the feature pipeline imputes around them.
+# 2015 = first Statcast season. Sources that start later (OAA 2016,
+# arsenals ~2017, bat tracking 2023) are simply empty for the early years.
 FIRST_SEASON = 2015
 
 

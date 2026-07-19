@@ -1,7 +1,7 @@
 """Scrape pitch-level Statcast data, stored as DAILY PER-PLAYER AGGREGATES.
 
 The batted-ball file (scrape_statcast.py) covers only balls put in play —
-no whiffs, no called strikes, no chases. This pulls EVERY pitch 2020-2026
+no whiffs, no called strikes, no chases. This pulls EVERY pitch (2015 on)
 from the same statcast_search CSV endpoint, but ~700k pitches per season is
 too much to keep raw, so each chunk is aggregated on arrival into one row
 per player per day of sufficient statistics:
@@ -13,8 +13,8 @@ per player per day of sufficient statistics:
                 edge-of-zone count (edge_n, shadow band 0.67-1.33 of
                 scaled zone), first-pitch counts (fp_n seen, fp_sw swung,
                 fp_s strike)
-  pitcher file: + fastball velo sum/count (FF+SI), and the v6 sequencing/
-                count-state/movement sums (2026-07-14): 0-2 waste
+  pitcher file: + fastball velo sum/count (FF+SI), and sequencing/
+                count-state/movement sums: 0-2 waste
                 (c02_n/c02_w — located 0-2 pitches and the share thrown
                 beyond the shadow band), ahead/behind pitch-class usage
                 (ah_/bh_ n/brk/off — does the mix collapse when behind),
@@ -24,7 +24,7 @@ per player per day of sufficient statistics:
                 of FF/SI velo vs the pitcher's own pitch index (fade_w
                 weight, fade_num = slope x weight; in-game stamina), and
                 FF induced vertical break (ivb_n/ivb_sum, inches — ride)
-                + the v7 audit-wave sums (2026-07-14): FF/SI velo with
+                plus: FF/SI velo with
                 runners on (fbstr_n/fbstr_v — stretch-vs-windup split),
                 perceived-velo premium (fbe_n/fbe_sum = effective minus
                 release speed on FF/SI; extension), per-class release
@@ -33,14 +33,14 @@ per player per day of sufficient statistics:
                 within-class scatter refinement), and breaking-ball
                 movement magnitude (brkmov_n/brkmov_sum, inches,
                 12*hypot(pfx_x, pfx_z))
-  both (v7):    two-strike x breaking-class cell (ts_brk_n/sw/wh — the
+  both:         two-strike x breaking-class cell (ts_brk_n/sw/wh — the
                 putaway cell; batter side is the consumer)
-  both (v8):    damage-on-contact sums (2026-07-15): balls in play with a
+  both:         damage-on-contact sums: balls in play with a
                 Savant xwOBA estimate + the xwOBA sum, total (con_n/
                 con_xw) and per bucket — velo bands (fblo_/fbmid_/fb95_
                 bip + xw) and pitch classes (brk_/off_ bip + xw; the
                 fastball-remainder class is derived downstream as
-                con - brk - off, the fbk_sw/fbk_wh idiom) — the damage
+                con - brk - off) — the damage
                 sibling of every whiff cell, and the two-strike x elite-
                 velo cell (ts_fb95_n/sw/wh, the ts_brk mirror)
 
@@ -99,7 +99,7 @@ HEADERS = {
     )
 }
 
-# description buckets (verified against live data 2026-07)
+# description buckets (verified against live Savant data)
 SWINGS = {"foul", "foul_tip", "hit_into_play", "swinging_strike",
           "swinging_strike_blocked", "foul_bunt", "missed_bunt",
           "bunt_foul_tip"}
@@ -157,7 +157,7 @@ def aggregate(raw):
     """One Savant chunk -> (pitcher day rows, batter day rows)."""
     if raw.empty:
         return None, None
-    # canonical in-game pitch order (game, at-bat, pitch) so the v6
+    # canonical in-game pitch order (game, at-bat, pitch) so the
     # sequencing pairs and the per-start velo-fade index are well-defined;
     # mergesort keeps ties stable. Games never span a chunk (one day each).
     raw = raw.copy()
@@ -199,7 +199,7 @@ def aggregate(raw):
     z_sc = (pz - (top + bot) / 2).abs() / ((top - bot) / 2).clip(lower=0.1)
     loc = pd.concat([x_sc, z_sc], axis=1).max(axis=1)
     edge = (loc > EDGE_LO) & (loc <= EDGE_HI)
-    # ---- v6 sequencing / count-state / movement (2026-07-14) ----
+    # ---- sequencing / count-state / movement ----
     # 0-2 waste: of located 0-2 pitches, the share thrown beyond the shadow
     # band (loc > EDGE_HI = non-competitive by design)
     is02 = (balls == 0) & (strikes == 2)
@@ -221,16 +221,16 @@ def aggregate(raw):
     # FF induced vertical break (ride), inches — pfx_z x 12 on four-seamers
     pfz = pd.to_numeric(raw["pfx_z"], errors="coerce")
     ivb_ok = (raw["pitch_type"] == "FF") & pfz.notna()
-    # ---- v7 audit wave (2026-07-14) ----
+    # ---- stretch split / perceived velo / release centroids / movement ----
     # stretch split: FF/SI velo with any runner on (pitching from the
     # stretch) vs the windup complement (rebuilt downstream from fb_n/fb_v)
     runners = (raw["on_1b"].notna() | raw["on_2b"].notna()
                | raw["on_3b"].notna())
     fbv_ok = is_fb & velo.notna()
     # perceived-velo premium: effective (extension-adjusted) minus release
-    # speed on FF/SI — league mean drifts by tracking era (-0.56 in 2015 ->
-    # +0.30 in 2024, Hawk-Eye era ~+0.15), so downstream priors fit the
-    # recent era and the GBM absorbs the slow level shift
+    # speed on FF/SI — the league mean drifts by tracking era (-0.56 in
+    # 2015 -> +0.30 in 2024), a slow level shift downstream consumers
+    # must account for
     eff = pd.to_numeric(raw["effective_speed"], errors="coerce")
     fbe_ok = fbv_ok & eff.notna()
     # per-class release centroids: fastball-remainder class (everything not
@@ -245,7 +245,7 @@ def aggregate(raw):
     # covered by brk_wh) — total break in inches from pfx components
     pfx = pd.to_numeric(raw["pfx_x"], errors="coerce")
     brkmov_ok = is_brk & pfx.notna() & pfz.notna()
-    # ---- v8 damage-on-contact wave (2026-07-15) ----
+    # ---- damage-on-contact ----
     # Savant's estimated wOBA (EV+LA) on balls in play, per velo band and
     # pitch class — the damage sibling of the whiff cells (whiff says he
     # misses 95+; this says what happens when he doesn't). Counts gate on
@@ -358,7 +358,7 @@ def aggregate(raw):
               "edge_n", "fp_n", "fp_sw", "fp_s", "ts_n", "ts_sw", "ts_wh",
               "f32_n", "f32_z", "f32_b", "f32_sw", "f32_wh",
               "ts_brk_n", "ts_brk_sw", "ts_brk_wh",
-              # v8 damage-on-contact sums + 2K x elite-velo cell
+              # damage-on-contact sums + 2K x elite-velo cell
               "con_n", "con_xw",
               "fblo_bip", "fblo_xw", "fbmid_bip", "fbmid_xw",
               "fb95_bip", "fb95_xw",
@@ -379,7 +379,7 @@ def aggregate(raw):
            .astype({"PitcherId": "int64"})
            .groupby(["PitcherId", "Date"], as_index=False)[pit_stats].sum()
            .rename(columns={"PitcherId": "PlayerId"}))
-    # per-start velo-fade slope (v6): OLS of FF/SI velo against the
+    # per-start velo-fade slope: OLS of FF/SI velo against the
     # pitcher's own pitch index within the game (all pitches count toward
     # the index; only fastballs enter the regression). Stored as a
     # weight (fade_w = fastballs, gated at FADE_MIN_FB) and slope x weight

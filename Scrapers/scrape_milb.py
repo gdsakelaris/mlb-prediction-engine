@@ -1,8 +1,7 @@
 """Scrape minor-league player season stats (hitting + pitching) from the
-same data service that powers MLB.com (bdfed.stitch.mlbinfra.com), for the
-MiLB-priors program: level-translated rates feed (a) the PA model's EB
-prior for thin-MLB-history players and (b) main-model feature columns
-riding the Phase-3 retrain batch.
+same data service that powers MLB.com (bdfed.stitch.mlbinfra.com), for
+minor-league translation priors: level-translated rates for players with
+thin MLB history.
 
 One row per player-season-LEVEL (a player promoted mid-year gets one row
 per level; teams within a level are aggregated by the service). Regular
@@ -10,18 +9,18 @@ season only. Age and league ride along — age-at-level is the strongest
 translation covariate, league tags park/environment context (PCL vs INT).
 
 Seasons start at MILB_FIRST_SEASON (2010, defined HERE — deliberately not
-Scrapers/seasons.py: that file is code-fingerprinted for the daily guard
-and its FIRST_SEASON drives the MLB frames, which is a different decision).
-Players debuting in 2015 (the frame's first season) thus carry up to five
-years of minors history. 2020 is skipped: the minor-league season was
+Scrapers/seasons.py, whose FIRST_SEASON drives the MLB files; the MiLB
+history deliberately reaches further back for translation history).
+Players debuting in 2015 (the MLB files' first season) thus carry up to
+five years of minors history. 2020 is skipped: the minor-league season was
 canceled outright.
 
 LEAKAGE NOTE for consumers: these are season AGGREGATES. A season's line
 is only as-of-safe for MLB rows dated AFTER that season ended — join
 season <= row_season - 1. Never feed a row its own in-progress MiLB
 season from this file (the aggregate includes future games). In-season
-as-of signal needs a date-grain scrape (byDateRange splits) — a designed
-upgrade, not this file.
+as-of signal would need a date-grain scrape (byDateRange splits) —
+deliberately not this file.
 
 Completed seasons are served from the existing output CSVs (they never
 change); only the current season hits the network, with the previous

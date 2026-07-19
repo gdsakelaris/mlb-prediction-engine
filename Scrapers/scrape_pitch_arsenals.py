@@ -20,8 +20,8 @@ Relational keys shared with the other CSVs:
 
 Completed seasons are served from the existing output CSV (they never
 change); only the current season hits the network, and a failed
-current-season fetch falls back to the previous run's rows (the model
-consumes arsenals as prior-season values). --backfill forces a full
+current-season fetch falls back to the previous run's rows (consumers
+use arsenals as prior-season values). --backfill forces a full
 refetch of every season.
 
 Usage:
@@ -44,8 +44,8 @@ DATA_DIR = Path(__file__).resolve().parents[1] / "Data"
 
 API_URL = "https://baseballsavant.mlb.com/leaderboard/pitch-arsenal-stats"
 
-# Savant's pitch-arsenal-stats leaderboard has no data before 2017 (probed
-# 2026-07-09: 2015/2016 return 0 rows, 2017 returns 3,063). Earlier years
+# Savant's pitch-arsenal-stats leaderboard has no data before 2017
+# (2015/2016 return 0 rows). Earlier years
 # are legitimately absent, not an outage, so they're skipped rather than
 # treated as a fatal empty fetch.
 SOURCE_FLOOR = 2017

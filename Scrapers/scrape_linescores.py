@@ -2,9 +2,8 @@
 
 The First-5-innings (F5) markets — F5 moneyline and F5 totals — grade on
 runs through five innings, which `mlb_games.csv` (final scores only) cannot
-provide. This accumulates that grading history so the PA-sim's F5 outputs
-(backlog #H2) can be sold once the sim blend has earned trust: the market
-stays parked, the DATA accrues (G5 decision, 2026-07-14).
+provide. This accumulates that grading history from day one, so
+partial-game markets can be graded whenever they ship.
 
 Source: statsapi `/api/v1/game/{GamePk}/linescore`, whose `innings` list
 carries away/home runs per inning. Stored LONG — one row per (GamePk,

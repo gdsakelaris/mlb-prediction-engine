@@ -1,8 +1,8 @@
-"""Scrape per-game boxscore logs for every MLB regular-season game since 2020.
+"""Scrape per-game boxscore logs for every MLB regular-season game since 2015.
 
 Uses MLB's public Stats API (statsapi.mlb.com): one schedule call per season
 (Scrapers/seasons.py decides the covered years) to enumerate final games,
-then one boxscore call per game (~14,000 games, fetched concurrently).
+then one boxscore call per game (~2,400 per season, fetched concurrently).
 Writes three relational CSVs:
 
   mlb_games.csv          one row per game: teams, score, venue,

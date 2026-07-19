@@ -14,16 +14,17 @@ exit code is non-zero if anything failed.
 Safety net (validate_data.py): before each scraper runs, its current
 known-good CSVs are copied to Data/backups/; after it runs, the fresh files
 are schema-validated (required columns, keys, row counts vs the backup, date
-sanity). A file that fails validation is REPLACED by its backup, the job is
-marked FAILED, and the retrain is skipped — a silent upstream format change
-can no longer poison the daily retrain. The last log line is always
-"RESULT: OK" or "RESULT: FAILED" for easy scanning of Logs/update_*.log.
+sanity). A file that fails validation is REPLACED by its backup and the job
+is marked FAILED — a silent upstream format change cannot quietly poison
+everything downstream. The last log line is always "RESULT: OK" or
+"RESULT: FAILED" for easy scanning of Logs/update_*.log.
 
 Usage:
     python Scrapers/update_all.py [--retrain]
 
-    --retrain    also rebuild feature frames and retrain the models
-                 (Model/train.py --rebuild) after a fully successful update
+    --retrain    also retrain the models (Model/train.py --rebuild) after a
+                 fully successful update. Skipped harmlessly while no
+                 Model/train.py exists yet.
 """
 
 import argparse
@@ -39,7 +40,6 @@ import validate_data as V
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 MODEL_TRAIN = SCRIPTS_DIR.parent / "Model" / "train.py"
-PROP_RANKINGS = SCRIPTS_DIR.parent / "Tools" / "5_prop_rankings.py"
 DATA_DIR = V.DATA_DIR
 BACKUP_DIR = V.BACKUP_DIR
 # machine-readable outcome of the last run; the GUI reads this at startup
@@ -52,22 +52,27 @@ STATUS_FILE = SCRIPTS_DIR.parent / "Logs" / "last_run_status.json"
 # this directory (the odds scraper lives at Tools/2_scrape_odds.py and is
 # run by hand near first pitch): betting lines are captured near game time
 # (closing lines), and a morning run would grab opening/empty markets and
-# burn the odds-API quota.
+# waste the odds-API quota.
 EXCLUDE = {"scrape_odds.py", "2_scrape_odds.py"}
 
 # which Data/ files each job owns (backed up before the run, validated after)
 JOB_FILES = {
     "scrape_batting_stats.py": ["mlb_batting_stats.csv"],
-    "scrape_gamelogs.py": ["mlb_games.csv", "mlb_game_batting.csv", "mlb_game_pitching.csv"],
+    "scrape_gamelogs.py": ["mlb_games.csv",
+                              "mlb_game_batting.csv",
+                              "mlb_game_pitching.csv"],
     "scrape_handedness.py": ["mlb_handedness.csv"],
     "scrape_homeruns.py": ["mlb_homeruns.csv"],
-    "scrape_pitch_arsenals.py (pitchers)": ["mlb_pitch_arsenals.csv"],
-    "scrape_pitch_arsenals.py (batters)": ["mlb_pitch_arsenals_batters.csv"],
+    "scrape_pitch_arsenals.py (pitchers)":
+        ["mlb_pitch_arsenals.csv"],
+    "scrape_pitch_arsenals.py (batters)":
+        ["mlb_pitch_arsenals_batters.csv"],
     "scrape_pitching_stats.py": ["mlb_pitching_stats.csv"],
     "scrape_rosters.py": ["mlb_rosters.csv"],
     "scrape_milb.py": ["milb_batting.csv", "milb_pitching.csv"],
     "scrape_statcast.py": ["mlb_statcast_bip.csv"],
-    "scrape_pitches.py": ["mlb_pitch_daily_pitchers.csv", "mlb_pitch_daily_batters.csv"],
+    "scrape_pitches.py": ["mlb_pitch_daily_pitchers.csv",
+                          "mlb_pitch_daily_batters.csv"],
     "scrape_sprint_speed.py": ["mlb_sprint_speed.csv"],
     "scrape_oaa.py": ["mlb_oaa.csv", "mlb_oaa_players.csv"],
     "scrape_baserunning.py": ["mlb_baserunning.csv"],
@@ -143,53 +148,6 @@ def validate_and_restore(files):
     return all_ok
 
 
-def experiment_in_flight():
-    """True when the Model sources differ from the ones the current paired
-    baselines were snapshotted from (evaluate_deep --set-baseline writes
-    baseline_code_fp.json). The daily retrain must train SHIPPED code —
-    quietly retraining and re-baselining an in-flight candidate would make
-    the experiment its own reference — so a mismatch turns the run
-    scrape-only. No fingerprint file (pre-feature snapshots) = proceed."""
-    import hashlib
-    fp_file = MODEL_TRAIN.parent / "artifacts" / "baseline_code_fp.json"
-    if not fp_file.exists():
-        return False
-    try:
-        base = json.loads(fp_file.read_text())
-    except (OSError, json.JSONDecodeError):
-        return False
-    for name, digest in base.items():
-        p = MODEL_TRAIN.parent / name
-        if not p.exists() or hashlib.md5(p.read_bytes()).hexdigest() != digest:
-            return True
-    return False
-
-
-def confirm_is_stale():
-    """True when the shipped Model sources differ from the ones the last
-    2026 confirm stamp was made under (confirm_code_fp.json, written by
-    evaluate_deep --confirm --set-baseline) — i.e. a ship landed since that
-    stamp. The daily job then re-stamps the confirm ONCE (audit #6 as
-    amended 2026-07-15: auto-on-ship, user directive), so the README's
-    enumerated-looks ledger grows at most one entry per ship. Unlike
-    experiment_in_flight() — which fails OPEN on a missing fingerprint so
-    pre-feature snapshots don't strand the daily train — a missing or
-    unreadable file here means a pre-feature confirm: stamp once to
-    bootstrap. The experiment_in_flight() gate has already guaranteed the
-    tree is shipped code by the time this runs."""
-    import hashlib
-    fp_file = MODEL_TRAIN.parent / "artifacts" / "confirm_code_fp.json"
-    try:
-        base = json.loads(fp_file.read_text())
-    except (OSError, json.JSONDecodeError):
-        return True
-    for name, digest in base.items():
-        p = MODEL_TRAIN.parent / name
-        if not p.exists() or hashlib.md5(p.read_bytes()).hexdigest() != digest:
-            return True
-    return False
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--retrain", action="store_true",
@@ -210,74 +168,19 @@ def main():
 
     all_ok = all(ok for _, ok, _ in results)
     if args.retrain:
-        if all_ok and experiment_in_flight():
-            print("\n>>> retrain SKIPPED: EXPERIMENT IN FLIGHT — the Model "
-                  "sources differ from the last --set-baseline snapshot "
-                  "(baseline_code_fp.json). Data was still refreshed, so the "
-                  "next --paired read will demand a re-baseline: finish or "
-                  "revert the candidate, then run "
-                  "update_all.py --retrain (or wait for tomorrow's run).",
+        if not all_ok:
+            print("\nskipping retrain: at least one scraper failed or "
+                  "produced invalid data", file=sys.stderr)
+        elif not MODEL_TRAIN.exists():
+            print(f"\nskipping retrain: {MODEL_TRAIN} does not exist yet",
                   flush=True)
-            results.append(("retrain models (skipped: experiment in flight)",
+            results.append(("retrain models (skipped: no Model/train.py)",
                             True, 0.0))
-        elif all_ok:
+        else:
             ok, took = run("Model/train.py --rebuild",
                            [str(MODEL_TRAIN), "--rebuild"])
             results.append(("retrain models", ok, took))
             all_ok = all_ok and ok
-            # refresh the paired-eval baselines to match the just-trained
-            # models: the retrain above makes yesterday's snapshots stale
-            # (evaluate_deep --paired refuses a stale read via its data
-            # fingerprint), and a snapshot is only valid when it captures
-            # the CURRENT artifacts on the CURRENT data — which is exactly
-            # the state right here. The experiment_in_flight() gate above
-            # guarantees this only ever snapshots SHIPPED code.
-            if ok:
-                # 2026 confirm doctrine (audit #6, amended 2026-07-15 —
-                # auto-on-ship, user directive): the selection-year baseline
-                # refreshes daily, but the 2026 confirm snapshot re-stamps
-                # ONLY on the first daily train after a ship (shipped
-                # sources differ from confirm_code_fp.json — see
-                # confirm_is_stale). Between ships the daily job never adds
-                # a 2026 look; each auto stamp is one ledgered look per
-                # ship. Blue-mark/rankings inputs read the last confirm
-                # snapshot, so it ages between ships by design.
-                ev = str(MODEL_TRAIN.parent / "evaluate_deep.py")
-                steps = [("evaluate_deep.py --set-baseline",
-                          [ev, "--set-baseline"])]
-                if confirm_is_stale():
-                    steps.append((
-                        "evaluate_deep.py --confirm --set-baseline "
-                        "(auto ship-confirm)",
-                        [ev, "--confirm", "--set-baseline"]))
-                base_ok = True
-                for label, cmd in steps:
-                    ok, took = run(label, cmd)
-                    results.append((label, ok, took))
-                    all_ok = all_ok and ok
-                    base_ok = base_ok and ok
-                # Warm the prop-rankings bootstrap cache. The selection
-                # baseline above rewrote its paired snapshot, and
-                # quality_boot.joblib is keyed by the snapshot fingerprints
-                # (2025 daily + the last DELIBERATE 2026 confirm) — so it is
-                # now stale, and without this the first predict of the day
-                # would stall ~60s rebuilding it before painting blue marks.
-                #
-                # Deliberately NON-FATAL: it does not touch all_ok. A cold
-                # cache costs one slow serve, never correctness, and a perf
-                # nicety must not be able to turn the nightly run FAILED.
-                if base_ok:
-                    w_ok, took = run("5_prop_rankings.py --warm-cache",
-                                     [str(PROP_RANKINGS), "--warm-cache"])
-                    results.append(("warm quality-bootstrap cache "
-                                    "(non-fatal)", w_ok, took))
-                    if not w_ok:
-                        print(">>> cache warm failed — harmless: the first "
-                              "predict of the day just rebuilds it itself",
-                              file=sys.stderr, flush=True)
-        else:
-            print("\nskipping retrain: at least one scraper failed or "
-                  "produced invalid data", file=sys.stderr)
 
     print(f"\n{'=' * 70}\nSummary\n{'=' * 70}")
     for label, ok, took in results:

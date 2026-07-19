@@ -25,7 +25,7 @@ Re-running is safe and REPAIRS earlier grades: pass 1 reverts every
 occurred-color cell back to its base color (magenta/yellow -> plain, dark blue/
 green/purple -> the light pick shade), then pass 2 grades fresh.
 
-Doubleheaders (audit #10, 2026-07-15): workbooks now carry a G# column, so
+Doubleheaders: workbooks carry a G# column, so
 every batter/pitcher row grades against ITS OWN game's box line (the
 tag's G#-th final, schedule order) — a game-1 prediction is never credited
 with a game-2 stat. Legacy pre-G# workbooks fall back to the old
@@ -40,12 +40,12 @@ If some games are missing (they weren't final at the last scrape), their
 rows are skipped and counted — run  python Scrapers/scrape_gamelogs.py
 to pull the late finals, then grade again.
 
-After painting, prints a backtest-style day report (2026-07-14): per head,
+After painting, prints a backtest-style day report: per head,
 n / actual vs stated rate / AUC / logloss / Brier against the day's base
-rate — the same reads evaluate_deep prints per head — plus the over-50%
+rate — plus the over-50%
 pick ledger. One day is a small sample: treat thin-head AUC as directional
 and use --all for the across-days accumulation of the identical cell
-surface (hit_rate_report.py retired 2026-07-15 — --all replaced it).
+surface.
 
 The summary above that report also scores the blue picks: how many of the
 light-blue rank-quality cells actually hit (with the purple ones — a
@@ -57,7 +57,7 @@ Usage:
     python Tools/4_grade_results.py path\\to\\file.xlsx
     python Tools/4_grade_results.py --all            # grade EVERY workbook
 
---all (2026-07-15 PM: now grades, no longer read-only) paints EVERY dated
+--all paints EVERY dated
 workbook in Predictions/ in place — the same recolor as the single-file
 mode, idempotent on already-graded books — then pools every day's cell
 surface into one cumulative backtest-style report (same per-head table +
@@ -111,7 +111,7 @@ MISSED = {
 # dark green a HIT +EV cell gets on the prop grids — one "good outcome" hue.
 BETS_WIN = PatternFill("solid", fgColor="00B050")      # winning bet row
 BETS_BOARD = PatternFill("solid", fgColor="E7F3E2")    # the light-green board
-BET_PCT_COLS = {"Model %", "Mkt %", "Edge", "EV%"}     # bold over 50% (as _polish)
+BET_PCT_COLS = {"Model %", "Mkt %", "Edge", "EV%"}     # bold over 50%
 # Bets 'Prop' label (odds.PROP_MARKET / STARTER_MARKET) -> how to settle it.
 # Batter labels map to the BAT_EVENTS check above; pitcher labels prefix a
 # "... o<line>" string and settle off the row's own Line column.
@@ -126,8 +126,7 @@ BET_PIT_STAT = {"pitcher strikeouts": "SO", "pitcher outs": "outs",
                 "pitcher hits allowed": "H", "pitcher walks": "BB",
                 "pitcher earned runs": "ER"}
 
-# batter columns -> did the event happen, from the day's summed line
-# (2026-07-14: + the H1 deep binaries, H3 triple, H4 2+ RBI / 2+ runs)
+# batter columns -> did the event happen, from the summed line
 BAT_EVENTS = {
     "HR":          lambda s: s["HR"] >= 1,
     "Hit":         lambda s: s["H"] >= 1,
@@ -158,7 +157,7 @@ BAT_SUM_COLS = ["PA", "AB", "R", "H", "2B", "3B", "HR", "RBI", "BB", "SO",
 LINE_RE = re.compile(r"^(K|Outs|Hits|BB|ER) > (\d+(?:\.\d+)?)$")
 LINE_STAT = {"K": "SO", "Outs": "outs", "Hits": "H", "BB": "BB", "ER": "ER"}
 RUNS_RE = re.compile(r"^Runs > (\d+(?:\.\d+)?)$")
-# H5 team_total (2026-07-14): per-team run lines on the Games sheet
+# per-team run lines on the Games sheet
 TEAM_RUNS_RE = re.compile(r"^(Away|Home) Runs > (\d+(?:\.\d+)?)$")
 
 
@@ -176,7 +175,7 @@ def load_actuals(date):
     logs. The games lists keep mlb_games.csv row order (the schedule's
     game order), so a doubleheader's game 1 is entry 0 and game 2 entry 1.
 
-    audit #10 (2026-07-15): the per-GAME dicts are the primary grading
+    The per-GAME dicts are the primary grading
     source — workbooks with a G# column grade each row against ITS game's
     box line. The day-summed dicts remain only as the legacy fallback for
     pre-G# workbooks (where a DH day inflated hit rates: P(HR in game)
@@ -214,7 +213,7 @@ def load_actuals(date):
 
 
 def _row_stats(per_game, day_dict, games, pid, tag, gnum):
-    """Actual stats for one workbook row (audit #10): with a Game tag and a
+    """Actual stats for one workbook row: with a Game tag and a
     G# the row grades against its OWN game's line (None until that game is
     final); without them (legacy workbook / single-game book) fall back to
     the day sum. Returns None when unresolvable."""
@@ -243,7 +242,7 @@ UNGRADE = {"0070C0": BLUE, "2E75B6": BLUE,          # hits (new, old)
            "E8EDF3": BLUE, "EAF0E4": GREEN, "EDE8F3": PURPLE,
            "9DC3E6": BLUE, "C6E0B4": GREEN,          # old bases
            "C6EFCE": GREEN, "CCC0DA": PURPLE,
-           "F5DBE2": None}   # the retired red column tint -> plain white
+           "F5DBE2": None}   # a legacy red column tint -> plain white
 # base fill + its tinted text color (None = plain cell, default font)
 BASE_FILL = {
     BLUE:   (PatternFill("solid", fgColor=BLUE), "0B2E4F"),
@@ -348,7 +347,7 @@ def _settle_bet(row, batters, starters, games, bat_pid, pit_pid,
     """Did this Bets row win? True / False / None (can't settle yet: no
     final, unmatched player, or a doubleheader day we can't pin to one game
     — Bets rows carry no G#, so any multi-final matchup is unsettleable
-    rather than misgraded against a day sum; audit #10). `row` is
+    rather than misgraded against a day sum). `row` is
     {header: value}; `bat_pid` / `pit_pid` resolve a (game, name) to a
     PlayerId."""
     game, prop = str(row.get("Game", "")), str(row.get("Prop", ""))
@@ -430,7 +429,7 @@ def _grade_bets(wb, batters, starters, games, stats, bg=None, sg=None):
     ncol = ws.max_column
     for i in range(2, ws.max_row + 1):
         # reset to board (undo any earlier win paint) — bold-over-50% on the
-        # percent columns, matching predict._polish
+        # percent columns, matching the workbook style
         for j, h in enumerate(headers, start=1):
             c = ws.cell(row=i, column=j)
             c.fill = BETS_BOARD
@@ -537,7 +536,7 @@ def grade(path):
         hidx = headers_of(ws)
         run_cols = [(h, j, float(RUNS_RE.match(h).group(1)))
                     for h, j in hidx.items() if RUNS_RE.match(h)]
-        # team-total lines (H5): 'Away Runs > 3.5' grades that side's score
+        # team-total lines: 'Away Runs > 3.5' grades that side's score
         team_cols = [(h, j, TEAM_RUNS_RE.match(h).group(1).lower(),
                       float(TEAM_RUNS_RE.match(h).group(2)))
                      for h, j in hidx.items() if TEAM_RUNS_RE.match(h)]
@@ -618,8 +617,7 @@ def day_report(rows, title="Day report: per-head, backtest-style"):
     Per head (in board order, grouped by sheet): graded cells, the
     actual occurrence rate vs the stated average (gap = actual - stated),
     AUC, and logloss/Brier next to what a
-    constant base-rate forecast scores — the same per-head surface
-    evaluate_deep prints for a backtest year. Then the over-50% pick
+    constant base-rate forecast scores. Then the over-50% pick
     ledger. Mean columns have no yes/no event and never enter.
     Single-day n is small — thin heads' AUC is directional."""
     if not rows:

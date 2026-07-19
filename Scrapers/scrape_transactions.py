@@ -1,5 +1,5 @@
 """Scrape MLB injured-list transactions (statsapi, sportId=1) and pair
-them into IL STINTS — the layoff-cause data the days-rest gap features
+them into IL STINTS — the layoff-cause data a plain days-rest gap
 cannot see (an IL stint, a skipped start, and the All-Star break have very
 different return-performance profiles).
 
@@ -13,8 +13,8 @@ Two outputs:
       (activation; empty while still on the IL), StintDays, IL60 (reached
       the 60-day IL), Rehab (stint included a rehab assignment). Rebuilt
       from ALL events on every run because stints span season boundaries
-      (placed in September, activated in April). THIS is the file the
-      model consumes.
+      (placed in September, activated in April). THIS is the file
+      consumers should use.
 
 Leakage note for consumers: a transaction is announced BEFORE the game
 (roster moves precede lineups), so activation-date joins may use

@@ -8,7 +8,7 @@ boxscores, MiLB stats, umpires, linescores, transactions), USGS/OpenTopoData
 (elevations), Open-Meteo (per-game weather: humidity/pressure).
 
 Filenames are stable across seasons; multi-season files cover 2015 (the
-Statcast era — extended back from 2020 on 2026-07-09) through the current
+Statcast era) through the current
 season (`Scrapers/seasons.py` decides what "current" means, so the files
 simply grow at each annual rollover), except where the source starts later:
 arsenals 2017, homeruns/umpires 2020, bat tracking 2023 (MiLB reaches back
@@ -334,16 +334,22 @@ detail column) so future schema changes re-aggregate from disk
 | z_n / oz_n | Pitches in / out of the strike zone |
 | oz_sw | Out-of-zone swings (chases) |
 | oz_wh | Out-of-zone whiffs — with wh_n this splits whiffs by zone, so in-zone contact rate (the most stable hit-tool skill) is derivable |
-| fb95_n / fb95_sw / fb95_wh | Pitches / swings / whiffs vs 95+ mph fastballs (both files, v3) — batter: performance against elite velocity; pitcher: elite-velo usage |
-| fbmid_* / fblo_* | The graded bands below fb95 (v4): 92–95 and <92 mph FF/SI, same n/sw/wh trios — whiff splits and usage by velocity band |
-| brk_n / brk_sw / brk_wh | Breaking balls (SL/ST/SV/CU/KC/CS/SC/KN) seen or thrown / swings / whiffs (v3) — with off_* and the fastball remainder, whiff splits by pitch class |
-| off_n / off_sw / off_wh | Offspeed (CH/FS/FO/EP) counterparts (v3) |
-| edge_n | Pitches in the shadow band (0.67–1.33 of the scaled zone, plate_x/plate_z vs per-pitch sz_top/sz_bot) — edge_n/n is a command proxy (v3) |
-| fp_n / fp_sw / fp_s | 0-0-count pitches / swings at them / first-pitch strikes (v3) — fp_s/fp_n = F-strike% (pitcher), fp_sw/fp_n = first-pitch aggression (batter) |
-| ts_n / ts_sw / ts_wh | Two-strike pitches / swings / whiffs (v5) — pitcher put-away ability, batter two-strike survival |
-| f32_n / f32_z / f32_b / f32_sw / f32_wh | Full-count (3-2) pitches: total / in zone / called+blocked balls (= walks) / swings / whiffs (v5) — payoff-pitch behavior for the walk heads |
-| fb_n / fb_v / fb_v2 | Fastballs (FF+SI) with tracked velo / velo sum / velo sum-of-squares (pitcher file only; v2 enables within-pitcher velo SD, v5) |
-| rp_n / rp_x / rp_x2 / rp_z / rp_z2 | Release-point coords: count / x,z sums / sums-of-squares (pitcher file only, v5) — rebuild release scatter (mechanical repeatability) from cumulative sums |
+| fb95_n / fb95_sw / fb95_wh | Pitches / swings / whiffs vs 95+ mph fastballs (both files) — batter: performance against elite velocity; pitcher: elite-velo usage |
+| fbmid_* / fblo_* | The graded bands below fb95: 92–95 and <92 mph FF/SI, same n/sw/wh trios — whiff splits and usage by velocity band |
+| brk_n / brk_sw / brk_wh | Breaking balls (SL/ST/SV/CU/KC/CS/SC/KN) seen or thrown / swings / whiffs — with off_* and the fastball remainder, whiff splits by pitch class |
+| off_n / off_sw / off_wh | Offspeed (CH/FS/FO/EP) counterparts |
+| edge_n | Pitches in the shadow band (0.67–1.33 of the scaled zone, plate_x/plate_z vs per-pitch sz_top/sz_bot) — edge_n/n is a command proxy |
+| fp_n / fp_sw / fp_s | 0-0-count pitches / swings at them / first-pitch strikes — fp_s/fp_n = F-strike% (pitcher), fp_sw/fp_n = first-pitch aggression (batter) |
+| ts_n / ts_sw / ts_wh | Two-strike pitches / swings / whiffs — pitcher put-away ability, batter two-strike survival |
+| f32_n / f32_z / f32_b / f32_sw / f32_wh | Full-count (3-2) pitches: total / in zone / called+blocked balls (= walks) / swings / whiffs — payoff-pitch behavior for walk modeling |
+| fb_n / fb_v / fb_v2 | Fastballs (FF+SI) with tracked velo / velo sum / velo sum-of-squares (pitcher file only; fb_v2 enables within-pitcher velo SD) |
+| rp_n / rp_x / rp_x2 / rp_z / rp_z2 | Release-point coords: count / x,z sums / sums-of-squares (pitcher file only) — rebuild release scatter (mechanical repeatability) from cumulative sums |
+
+Both files also carry newer sum families in the same n/sum convention —
+sequencing and count-state (c02_, ah_/bh_, tr_), movement and release
+(ivb_, fbe_, rpf_/rpb_, brkmov_, fade_), the stretch split (fbstr_),
+two-strike cells (ts_brk_, ts_fb95_), and damage-on-contact (con_,
+per-bucket *_bip/*_xw) — documented in the scrape_pitches.py docstring.
 
 ## mlb_sprint_speed.csv — Statcast sprint speed
 One row per (Year, PlayerId), min 5 competitive runs. Consumed as
@@ -404,29 +410,30 @@ special-event venues have coordinates in scrape_weather.py.
 
 ## milb_batting.csv / milb_pitching.csv — minor-league season lines
 One row per player per season per level (2010+, AAA down to Rookie; 2020
-canceled). Feed the MiLB translation priors (`Model/pa/milb_priors.py`).
+canceled). Feed the minor-league translation priors.
 Columns mirror the MLB season files, plus `SportId`/`Level`/`League` (level
 context) and `Age` (age-at-level — the strongest translation covariate).
 
 ## mlb_umpires.csv — home-plate umpire assignments
-One row per GamePk (2020+): `HpUmpId`, `HpUmp`. As-of ump tendencies feed
-the K/walk heads; live slates without a posted ump serve neutral priors.
+One row per GamePk (2020+): `HpUmpId`, `HpUmp`. As-of ump tendencies
+support strikeout/walk modeling; live slates without a posted ump fall
+back to neutral priors.
 
 ## mlb_bat_tracking.csv — Statcast bat tracking
 One row per (Year, PlayerId), 2023+: `Swings`, `BatSpeed`, `HardSwingRate`,
-`SwingLength`, `SquaredUpPerSwing`, `BlastPerSwing`, `BatterRunValue`. The
-feature block exists but is inert until the train window reaches
-bat-tracking seasons.
+`SwingLength`, `SquaredUpPerSwing`, `BlastPerSwing`, `BatterRunValue`.
+Banked until a training window covers the tracked seasons.
 
 ## mlb_linescores.csv — inning-by-inning scores
 One row per (GamePk, Inning): `AwayRuns`, `HomeRuns`. Supports partial-game
-shapes (F5-style heads, currently parked).
+markets (e.g. First-5).
 
 ## mlb_catchers.csv / mlb_catchers_team.csv — catcher defense (Savant)
-Framing and throwing, consumed PRIOR-season. Team grain is the served
-surface (battery features + the sim's steal layer): `FrameRV`, `FrameRV_pt`,
+Framing and throwing, consumed PRIOR-season. Team grain is the serving-safe
+surface (tonight's catcher is unknowable pregame): `FrameRV`, `FrameRV_pt`,
 `SBAtt`, `CSAA`, `CSAA_att`, `PopTime`, `ArmStrength`. Player grain
-(`StrikePct`, `CSAAThrow`, `CSRate`, `Exchange`, …) is scraped but shelved.
+(`StrikePct`, `CSAAThrow`, `CSRate`, `Exchange`, …) is scraped for future
+use.
 
 ## mlb_il_events.csv / mlb_il.csv — injured-list history
 Event log (`PlayerId`, `Date`, `Kind`, `ILDays`) and stint table
@@ -434,10 +441,9 @@ Event log (`PlayerId`, `Date`, `Kind`, `ILDays`) and stint table
 transactions scrape — as-of IL status and returns for roster availability.
 
 ## mlb_odds.csv — sportsbook closing lines
-Written by `Tools/2_scrape_odds.py`; schema in `Model/odds.py`. Grading and
-model-vs-market ROI only (evaluate_deep Section 9) — **never a feature
-input** (stats-only phase rule).
+Written by `Tools/2_scrape_odds.py`. Grading and
+model-vs-market ROI only — **never a feature input**.
 
 ## mlb_weather_forecast.csv — served pre-game forecasts
 Archived by `Tools/1_get_todays_games.py` at serve time so the
-forecast-vs-actual weather gap (audit #4) stays measurable.
+forecast-vs-actual weather gap stays measurable.

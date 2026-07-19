@@ -7,18 +7,13 @@ per-swing run value. Bat speed is a direct, stable power signal — it speaks
 to the total-bases and home-run props in a way the batted-ball outcome
 stats (which only see balls put in play) do not.
 
-The model would consume these as PRIOR-season values (leakage-free, like
-sprint speed / GO-AO / OAA): a game sees the batter's previous-season
-swing profile.
+Designed for PRIOR-season consumption (leakage-free, like sprint speed /
+GO-AO / OAA): a game sees the batter's previous-season swing profile.
 
-COVERAGE CAVEAT: bat tracking only exists from 2023 on. As a prior-season
-feature that leaves every pre-2024 game without a value, so it is NOT yet
-wired into the models — under the selection suite (train <=2023) it would
-be NaN across the entire training set and thus inert / unevaluable. This
-scraper BANKS the data (and the daily job keeps it current) so the full
-history is ready the moment the training window rolls forward enough to
-make it testable (~2027+). See the queue notes; do not wire it into
-features.py until the selection suite carries covered seasons.
+COVERAGE CAVEAT: bat tracking only exists from 2023 on, so as a
+prior-season signal every pre-2024 game has no value. This scraper BANKS
+the data (and the daily job keeps it current) so the full history is
+ready once a training window covers the tracked seasons.
 
 One row per (Year, PlayerId). Completed seasons are served from the stored
 CSV; only the current season hits the network. --backfill forces a full

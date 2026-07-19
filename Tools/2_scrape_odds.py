@@ -1,6 +1,6 @@
 """Capture real sportsbook lines into Data/mlb_odds.csv (canonical schema in
-Model/odds.py), so the model can finally be graded against the market instead
-of only a naive base rate (evaluate_deep Section 9).
+Model/odds.py), so the model can be graded against the real market instead
+of only a naive base rate.
 
 Source: The Odds API (https://the-odds-api.com). Set an API key once:
 
@@ -15,9 +15,9 @@ Then run it near game time to snapshot that day's closing-ish lines:
 
 The default 'all' captures every posted player prop the model predicts plus the
 game markets (totals = over/under runs, h2h = moneyline / winner), from the
-DEFAULT_BOOKS list: the prop-posting US books plus Pinnacle, the sharp book the
-de-vig consensus prefers as its reference (see odds.sharp_fair) — same credit
-cost as the old regions=us default. Run it twice a day and it just works: player-prop markets cost 1 credit PER GAME while the
+DEFAULT_BOOKS list: the prop-posting US books plus Pinnacle, the sharp book a
+de-vig consensus prefers as its reference — same credit
+cost as the plain regions=us default. Run it twice a day and it just works: player-prop markets cost 1 credit PER GAME while the
 game markets are one flat bulk call, and a rerun near first pitch SKIPS games
 already underway (their pregame line is final), so the second run only pays for
 games not yet started. write_store de-dupes on (Date, PlayerId, Market, Line,
@@ -28,7 +28,7 @@ IMPORTANT on the free tier: it covers moneyline/totals for current & upcoming
 games, but player props ("additional markets") and historical snapshots are
 paid add-ons, so the default set needs a paid key. The honest workflow is GOING
 FORWARD capture — run this daily and you accumulate your own closing-line
-history; Section 9 lights up over the games you've collected. A purchased
+history for model-vs-market grading to use. A purchased
 historical dump or a scrape from elsewhere also works: just write rows in the
 Model/odds.py schema to the same CSV.
 
@@ -40,6 +40,7 @@ import argparse
 import csv
 import datetime as dt
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -62,22 +63,21 @@ PROP_APIS = sorted({m["api"] for m in O.PROP_MARKET.values()} |
                    {m["api"] for m in O.STARTER_MARKET.values()})
 GAME_MARKETS = ["totals", "h2h"]           # over/under total runs; moneyline
 
-# US sportsbooks don't post every market the model predicts. Confirmed empty
-# across the whole 2026-07-08 slate: batter strikeouts (pinnacle probed
-# 2026-07-09: doesn't post it either). 'props'/'all' skip these so a run never
+# US sportsbooks don't post every market the model predicts: none posts
+# batter strikeouts. 'props'/'all' skip these so a run never
 # requests an always-empty market; an explicit --markets bk still works
 # (e.g. a book that does post it).
 UNPOSTED_APIS = {"batter_strikeouts"}
 
 # Which books to pay for. The Odds API bills the bookmakers param in GROUPS OF
 # TEN (any group = one region-equivalent), so this list of 9 costs exactly what
-# regions=us did while swapping in Pinnacle — the sharp, low-hold book (eu
-# region) that odds.sharp_fair prefers as the de-vig reference. It replaces the
-# whole-region 'us' default: the 8 US books here are the only ones that posted
-# player props across 07-08/07-09; the region's other books (mybookieag,
-# lowvig, betus — soft offshore, game markets only) were dropped to keep the
+# regions=us does while swapping in Pinnacle — the sharp, low-hold book (eu
+# region) preferred as the de-vig reference. It replaces the
+# whole-region 'us' default: the 8 US books here are the ones that actually
+# post player props; the region's other books (mybookieag,
+# lowvig, betus — soft offshore, game markets only) are dropped to keep the
 # group at 9, leaving ONE free slot before every request doubles in cost.
-# Pinnacle coverage probed 2026-07-09: HR, total bases, pitcher outs/hits/ER
+# Pinnacle posts HR, total bases, pitcher outs/hits/ER
 # pregame — whatever else it posts near first pitch is captured at no extra
 # cost (per-event calls charge on markets RETURNED x book-groups).
 DEFAULT_BOOKS = ",".join((
@@ -101,8 +101,8 @@ def load_key(cli_key=None):
     """Resolve the API key from, in order: --key, a local .odds_api_key file
     (gitignored), then $ODDS_API_KEY. The FILE is checked BEFORE the env var on
     purpose: an ODDS_API_KEY set in an already-open terminal goes stale, and a
-    wrong stale key silently burns the wrong account's quota — exactly the bug
-    that bit here. The file is the deliberate, persistent source of truth; set
+    wrong stale key silently burns the wrong account's quota.
+    The file is the deliberate, persistent source of truth; set
     it once and it always wins. Use --key for a one-off override."""
     if cli_key:
         return cli_key
@@ -286,7 +286,13 @@ def fetch(url, params):
 def write_store(rows, out):
     """Append rows, then de-dupe on (Date, PlayerId, Market, Line, Book)
     keeping the latest CapturedAt — so re-running closer to first pitch
-    upgrades each line to its closing value."""
+    upgrades each line to its closing value.
+
+    The store is the one file in Data/ that cannot be re-scraped after the
+    fact (pregame lines are gone once games start), so it gets extra care:
+    the existing copy is backed up to <dir>/backups/ before the rewrite,
+    and the new file is written to a temp path then swapped in atomically —
+    a crash mid-write can never truncate the only copy."""
     out = Path(out)
     existing = []
     if out.exists():
@@ -301,11 +307,17 @@ def write_store(rows, out):
         if prev is None or str(row.get("CapturedAt")) >= str(prev.get("CapturedAt")):
             best[key] = row
     out.parent.mkdir(parents=True, exist_ok=True)
-    with open(out, "w", newline="", encoding="utf-8") as f:
+    if out.exists():
+        backup_dir = out.parent / "backups"
+        backup_dir.mkdir(exist_ok=True)
+        shutil.copy2(out, backup_dir / out.name)
+    tmp = out.with_name(out.name + ".tmp")
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=O.ODDS_COLUMNS)
         w.writeheader()
         for row in best.values():
             w.writerow({c: row.get(c, "") for c in O.ODDS_COLUMNS})
+    os.replace(tmp, out)
     return len(best)
 
 
@@ -325,10 +337,10 @@ def _slate_date(e):
     """The LOCAL calendar date an event belongs to (first pitch converted to
     this machine's timezone), or None if commence_time is unusable. MLB slates
     are named by US-local date: a 9:40 PM PT game commences after midnight
-    UTC, so bucketing by the raw UTC string put West-Coast night games on
-    TOMORROW's slate — today's --date never fetched them and by tomorrow they
-    were 'already started', i.e. never captured at all (3 of 7 pending games
-    on 2026-07-09). Local-date bucketing matches the slate the model predicts
+    UTC, so bucketing by the raw UTC string would put West-Coast night games
+    on TOMORROW's slate — today's --date would never fetch them and by
+    tomorrow they are 'already started', i.e. never captured at all.
+    Local-date bucketing matches the slate the model predicts
     and the Date the store rows carry."""
     c = _commence(e)
     return c.astimezone().date().isoformat() if c else None

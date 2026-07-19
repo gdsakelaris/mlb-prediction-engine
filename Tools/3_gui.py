@@ -24,8 +24,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Model"))
 
 # Silence known-benign pandas noise from the prediction engine (mixed-type
-# CSV column inference and fragmented-frame inserts in features.py). The
-# engine sources are fingerprint-guarded, so the suppression lives here.
+# CSV column inference and fragmented-frame inserts).
 warnings.filterwarnings("ignore", category=pd.errors.DtypeWarning)
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
 
@@ -392,8 +391,8 @@ class App(tk.Tk):
         self.sp_hum = add(4, "Humidity %", ttk.Spinbox(top, from_=0, to=100,
                                                        width=5), row=1)
         self.e_pres = add(5, "Pressure hPa", ttk.Entry(top, width=7), row=1)
-        # Precip (mm at start hour, Open-Meteo forecast; 2026-07-14): the
-        # outs/total heads' rain-shortening signal. Blank = NaN.
+        # Precip (mm at start hour, Open-Meteo forecast): the
+        # rain-shortening signal. Blank = NaN.
         self.e_precip = add(6, "Precip mm", ttk.Entry(top, width=6), row=1)
         # Editable; leave blank for a neutral-ump prediction. Known names
         # resolve to an HpUmpId in _collect_spec; an unknown name -> no id.

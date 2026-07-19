@@ -5,10 +5,10 @@ the quality of its own served numbers on the two held-out test years (2025
 selection test + 2026 holdout) — how trustworthy the probabilities are
 (calibration), how much real skill sits behind them (edge/AUC/lift), and
 whether both years agree. NO scraped odds, market prices, or de-vigged
-references enter anywhere; the true market test lives in Section 9 of
-evaluate_deep.py and stays there.
+references enter anywhere; the true model-vs-market test lives in the
+evaluation pipeline, not here.
 
-SCORE v4: the Score and the sort follow the user's ranked diagnostic
+SCORE: the Score and the sort follow ranked diagnostic
 priorities for betting, most to least significant — PER CLASS (sheet
 COLUMN order is separate: display clusters by model importance,
 LogLoss/AUC/ECE-led — see _DIAG_ORDER):
@@ -16,18 +16,17 @@ LogLoss/AUC/ECE-led — see _DIAG_ORDER):
       Brier; ECE; Bias; MAE; AUC; Top10%; LogLoss; Accuracy.
   Binary heads (11, the effective order — no Disp/Bias): Lift; Edge%;
       Slope; Intercept; Brier; ECE; AUC; Top10%; LogLoss; MAE; Accuracy.
-  Child columns (same day, user): each parent's baseline children sit
+  Child columns: each parent's baseline children sit
       beside it on the sheets — Disp = obs/cal ratio with DispCal/DispObs,
       Brier + BrierBase, MAE + MAEBase/MAEGain, LogLoss + LLBase. These
-      are the exact numbers the parents' qualities were ALREADY scored
-      against (folded), so the weights are unchanged; Base%, MeanAct,
-      MeanPred ride as UNRANKED context columns in the user's positions
-      (adjudicated 07-15: they hold sheet positions but do not score —
+      are the exact numbers the parents' qualities are scored
+      against (folded), so nothing scores twice; Base%, MeanAct,
+      MeanPred ride as UNRANKED context columns
+      (they hold sheet positions but do not score —
       base rate is a market property, MeanPred-MeanAct is Bias).
 
-  Sort   — TIER first; tiers are cut ON THE SCORE ITSELF (user: "score
-           and tier should be closely connected — tiers are separated by
-           score"), so tiers are contiguous Score bands. Within tier:
+  Sort   — TIER first; tiers are cut ON THE SCORE ITSELF,
+           so tiers are contiguous Score bands. Within tier:
            Score desc, then the ranked diagnostics as tie-breakers.
   Score  — the rank-WEIGHTED composite of the class's ranked diagnostics
            (weights linear in rank; each metric 0-1 on fixed anchors).
@@ -38,20 +37,19 @@ LogLoss/AUC/ECE-led — see _DIAG_ORDER):
            predict.count_over, negative binomial for starter K / totals).
   Stability — Score = mean(S25, S26) - 0.25*|S25 - S26|: a market that
            performs in only one year is down-ranked for exactly that.
-  Uncertainty — a weighted day-block bootstrap (the same philosophy as the
-           model's paired accept bar) gives each Score a lower bound
+  Uncertainty — a weighted day-block bootstrap gives each Score a lower
+           bound
            (Score_lo); the displayed tier reads the Score, but blue-mark
            DEPTH still caps on Score_lo — a thin market can't buy deep
            picks on a lucky point estimate.
   Tiers  — cut on Score on FROZEN semantic anchors (never re-fit to the
-           run; re-anchored for v4), and WITHIN class: probability
+           run), and WITHIN class: probability
            markets and expected-count means rank on separate ladders and
            are never compared.
 
 Inputs (all written by the standard loop — no extra steps):
   - eval_paired_select_2025.joblib / eval_paired_2026.joblib   per-row
-    (Date, p|mu, y) snapshots from `evaluate_deep.py [--confirm]
-    --set-baseline`
+    (Date, p|mu, y) snapshots written by the evaluation pipeline
   - models_bt.joblib / models.joblib   count heads (line calibrators,
     dispersions) matching each year's suite
 
@@ -59,10 +57,8 @@ Usage:
     python Tools/5_prop_rankings.py          # print + write the workbook
     python Tools/5_prop_rankings.py --out FILE
 
-(Renamed from prop_rankings.py 2026-07-15, taking the retired
-5_performance.py's slot in the game-day tool numbering. The digit-leading
-filename can't be a plain `import` statement — predict.py and
-evaluate_deep.py load it via importlib.import_module("5_prop_rankings").)
+(The digit-leading filename can't be a plain `import` statement —
+consumers load it via importlib.import_module("5_prop_rankings").)
 """
 import argparse
 import sys
@@ -110,12 +106,12 @@ BIN_NAMES = {  # Batter Props sheet, probability columns
 # O/U count columns, split by what the column IS in the workbook:
 #   PITCHER_CNT — standalone O/U markets; the model is the SOLE pricer of
 #     every line the book posts -> AUC/ECE/Edge% grade the FULL line family.
-#   BATTER_X — RETIRED from the board 2026-07-14 (G3): the H1 deep binary
-#     heads (bk3/tb3/tb4/hrr4) took the last lines the x-rows uniquely
-#     priced, so they have nothing left to grade as line families. Their
-#     MEANS still display and still grade (MEAN_MARKETS below).
-#   GAME_CNT — game totals (no binary overlap; full family) + the H5
-#     per-team total lines (2026-07-14).
+#   BATTER_X — empty: the deep binary heads (bk3/tb3/tb4/hrr4) own every
+#     line the batter x-rows would uniquely price, so they have nothing
+#     left to grade as line families. Their MEANS still display and still
+#     grade (MEAN_MARKETS below).
+#   GAME_CNT — game totals (no binary overlap; full family) + the
+#     per-team total lines.
 PITCHER_CNT = {
     "k":     "Pitcher K > x",
     "outs":  "Pitcher Outs > x",
@@ -136,8 +132,8 @@ MEAN_MARKETS = {
     "xbk":   "Batter xSO",
     "xtb":   "Batter xTB",
     "xhrr":  "Batter xHRR",
-    # H6 (2026-07-14): the rest of the expected-stat-line — means only,
-    # their banked line calibrators never ship (binaries own the lines)
+    # the rest of the expected-stat line — means only
+    # (binaries own the lines)
     "xh":    "Batter xH",
     "xrun":  "Batter xR",
     "xrbi":  "Batter xRBI",
@@ -150,17 +146,17 @@ MEAN_MARKETS = {
     "total": "Game Total Runs",
 }
 
-# Which of an x-column's lines the BINARY columns already price. After the
-# H1 heads (2026-07-14) the binaries own EVERY line the x-heads quote
+# Which of an x-column's lines the BINARY columns already price: the
+# binaries own EVERY line the x-heads quote
 # (bk/bk2/bk3 -> 0.5/1.5/2.5; tb2/tb3/tb4 -> 1.5/2.5/3.5; hrr2/3/4 ->
-# 1.5/2.5/3.5) — which is why BATTER_X retired from the line board (G3).
+# 1.5/2.5/3.5) — which is why BATTER_X is empty on the line board.
 BINARY_OWNED_LINES = {"xbk": {0.5, 1.5, 2.5}, "xtb": {1.5, 2.5, 3.5},
                       "xhrr": {1.5, 2.5, 3.5}}
 
 # ---------------------------------------------------- score construction
-# SCORE v4 (user re-ranking 2026-07-15, second same-day revision). The
-# Score is the rank-weighted average of the user's diagnostic priorities
-# for BETTING, most to least significant — now PER CLASS, because binary
+# The
+# Score is the rank-weighted average of the diagnostic priorities
+# for BETTING, most to least significant — PER CLASS, because binary
 # heads have no Dispersion/Bias so their EFFECTIVE order differs:
 #   O/U count heads (13):  1 Lift  2 Edge%  3 Slope  4 Intercept
 #     5 Dispersion  6 Brier  7 ECE  8 Bias  9 MAE  10 AUC  11 Top10%
@@ -170,29 +166,27 @@ BINARY_OWNED_LINES = {"xbk": {0.5, 1.5, 2.5}, "xtb": {1.5, 2.5, 3.5},
 # Each diagnostic maps to a 0-1 quality on FIXED anchors and the composite
 # is 100 * sum(w_i * q_i), weights linear in rank. Technicalities:
 #   - Lift (rank 1) enters in its base-rate-fair ODDS-RATIO form
-#     (ADJUDICATED 2026-07-15: read Lift, not raw Top10%, across markets;
+#     (read Lift, not raw Top10%, across markets;
 #     the raw ratio is capped at 1/base so high-base markets can't show
 #     skill through it).
-#   - raw Top10% now participates AT ITS OWN RANK (11 binary / 11 count),
-#     as ranked: it is a plain hit rate, base-inflated by construction,
-#     which is exactly why the user ranked it low.
+#   - raw Top10% participates AT ITS OWN RANK (11 binary / 11 count):
+#     it is a plain hit rate, base-inflated by construction,
+#     which is exactly why it ranks low.
 #   - standalone log loss is cross-market comparable only through its
 #     base-rate-relative form, which IS the edge — so LogLoss reads the
 #     same underlying quality as Edge% at its own (much lower) weight.
 #   - MAE: binaries score the mean |p - y| beat over the base-rate
 #     constant; O/U families the mean-count MAE beat over the no-skill
 #     constant (the same number their mean row leads with).
-#   - Bias / Dispersion (count heads only) are PROMOTED from the old
-#     unranked x0.85-1.0 trust modifier to full ranked participants.
+#   - Bias / Dispersion (count heads only) are full ranked participants.
 #   - the child columns (BrierBase, LLBase, MAEBase/MAEGain, DispCal/
 #     DispObs) DISPLAY the exact baselines those parent qualities fold
 #     in — brier_q = beat over BrierBase, ll/edge = relative gap to
 #     LLBase, mae_q = MAEGain/MAEBase, disp_q = the DispObs-vs-DispCal
-#     excess — so nothing scores twice and the weights are unchanged.
-#     Base%/MeanAct/MeanPred are UNRANKED context (user 07-15).
+#     excess — so nothing scores twice.
+#     Base%/MeanAct/MeanPred are UNRANKED context.
 # The stability haircut, day-block bootstrap lower bound, frozen-anchor
-# tiers, and blue-mark depth machinery are unchanged — they now run on
-# this composite. (v3's top-10-led single ladder is in git history.)
+# tiers, and blue-mark depth machinery all run on this composite.
 BIN_RANK_W = {           # weight ~ (12 - rank)/66, ranks 1-11
     "lift": 11 / 66, "edge": 10 / 66, "slope": 9 / 66, "int": 8 / 66,
     "brier": 7 / 66, "ece": 6 / 66, "auc": 5 / 66, "top10": 4 / 66,
@@ -205,13 +199,12 @@ CNT_RANK_W = {           # weight ~ (14 - rank)/91, ranks 1-13
     "acc": 1 / 91,
 }
 
-# Day-block bootstrap. The rest of the pipeline lives by paired day-block
-# CIs; the ranking should too. We resample DAYS (multinomial day counts =
+# Day-block bootstrap. We resample DAYS (multinomial day counts =
 # per-day weights) B times, recompute each market's whole composite Score,
 # and TIER ON THE LOWER CONFIDENCE BOUND (the SCORE_LCB_Q percentile). This
 # makes the ranking sample-size aware for free — a thin market (SB, a deep K
-# line) earns a wide CI and a demoted tier, exactly like the model's accept
-# bar treats a thin edge. The point Score is still shown (full sample); the
+# line) earns a wide CI and a demoted tier.
+# The point Score is still shown (full sample); the
 # LCB is what tiers and what caps blue depth. Weighted metrics make a
 # resample an O(n) reweight (validated == the multiplicity bootstrap).
 BOOT_B, SCORE_LCB_Q, BOOT_SEED = 400, 0.10, 20260714
@@ -220,8 +213,7 @@ BOOT_B, SCORE_LCB_Q, BOOT_SEED = 400, 0.10, 20260714
 # NOT re-fit to each run's distribution. That matters: because the Score is
 # built only from a market's OWN edge / calibration / CI, a frozen cut makes
 # a market's tier depend on ITSELF alone, never on how other markets moved
-# in a retrain. v4: applied to the SCORE ITSELF (user: "score and tier
-# should be closely connected — tiers are separated by score"), so tiers
+# in a retrain. Applied to the SCORE ITSELF, so tiers
 # are contiguous Score bands on the board; Score_lo remains the displayed
 # uncertainty and still caps blue-mark DEPTH. Probability markets (binaries,
 # O/U lines and families, winner) and MEAN markets (expected-count columns)
@@ -235,31 +227,19 @@ BOOT_B, SCORE_LCB_Q, BOOT_SEED = 400, 0.10, 20260714
 # An empty tier is honest (the means genuinely bifurcate: xK/xOuts, then a
 # cliff); anchors are NEVER nudged to make tiers look populated.
 #
-# 4 DECENT / 5 LOW CEILING replace the old single "MARGINAL" band, split at
-# that band's MIDPOINT (a semantic rule, not a fit to where this run's
-# distribution happens to break).
-#
-# The rename is not politeness, and it is NOT "these props are near their
-# ceiling" — that would name nothing, since the oracle test found EVERY batter
-# binary is near its ceiling (a leave-one-out oracle knowing each batter's TRUE
-# full-season rate scores LOWER AUC than the shipped head on all 14, elite ones
-# included). What actually separates this band is that its ceiling is LOW: the
-# event is ~4 Bernoulli trials with a compressed true-p spread, so even a
-# perfect model can only separate players a little. A thin Score on
-# hit/run/rbi/tb2/hrr is therefore a fact about the MARKET, not a defect to fix
-# — "MARGINAL" implied a fixable deficiency, LOW CEILING says the true thing.
-# (6 AVOID keeps its name: it holds markets genuinely BELOW their achievable
-# bar — winner and total sit under the ~.60-.62 market ceiling — next to the
-# thinnest binaries.)
-# RE-ANCHORED for Score v4 (a deliberate, documented, versioned decision —
-# the composite changed weights AND the cut moved from Score_lo to Score,
-# so the v3 anchors are meaningless on it). Anchors remain SEMANTIC:
+# 5 LOW CEILING names markets whose achievable ceiling is LOW (not a
+# fixable deficiency): the event is ~4 Bernoulli trials with a compressed
+# true-p spread, so even a perfect model can only separate players a
+# little. A thin Score on hit/run/rbi/tb2/hrr is a fact about the MARKET.
+# (6 AVOID holds markets genuinely BELOW their achievable bar, next to
+# the thinnest binaries.)
+# Anchors remain SEMANTIC:
 # ELITE = strong base-fair top-pick lift AND a near-ideal calibration line
 # AND a clear proper-score beat; each step down relaxes one axis. The
 # bottom of the PROB ladder is deliberately tighter than the top: the
 # DECENT / LOW CEILING / AVOID boundaries sit at the thin-spread
 # batter-event cluster and the below-market-ceiling game heads — the
-# adjudicated trust story those tiers exist to express. They are NOT
+# trust story those tiers exist to express. They are NOT
 # re-fit per run.
 PROB_TIER_CUTS = ((72.0, "1 ELITE"), (60.0, "2 STRONG"), (48.0, "3 SOLID"),
                   (44.0, "4 DECENT"), (41.0, "5 LOW CEILING"),
@@ -278,7 +258,7 @@ def tier_of(score, cuts):
 
 # ------------------------------------------------------------ diagnostics
 def ece(p, y, bins=10):
-    """Expected calibration error, equal-count bins (evaluate_deep's ece)."""
+    """Expected calibration error, equal-count bins."""
     q = pd.qcut(p, bins, duplicates="drop")
     df = pd.DataFrame({"p": p, "y": y, "q": q})
     g = df.groupby("q", observed=True)
@@ -314,7 +294,7 @@ def top10_lift(df, p_col="p", y_col="y"):
 
 def _binary_diags(p, y, lift):
     """The full ranked-diagnostic set for one binary-like unit (a prop, a
-    priced O/U line, or the winner): everything the v3 Score and the ranked
+    priced O/U line, or the winner): everything the Score and the ranked
     sort read, from the same served p/y rows."""
     base = float(y.mean())
     base_ll = log_loss(y, np.full_like(p, base))
@@ -420,7 +400,8 @@ def winner_year(snap):
     """Win Prob graded on the same internal diagnostics as a binary prop.
     Lift = the day's single most CONFIDENT game (top-10 makes no sense on a
     ~15-game slate): picked-side hit rate over the always-home hit rate.
-    None when the snapshot predates winner rows (re-run --set-baseline)."""
+    None when the snapshot predates winner rows (refresh the evaluation
+    snapshots)."""
     blob = snap.get("winner")
     if blob is None:
         return None
@@ -440,7 +421,7 @@ def count_lines(name, head, k_disp, total_disp, art=None):
     """The lines a count column prices and its P(over) pricer, mirroring
     serving: per-line calibrators via count_over (which itself prices the
     NB_PRICED_TARGETS heads, e.g. per, with the negative binomial), NB for
-    starter K and game totals; team_over for the H5 per-team lines."""
+    starter K and game totals; team_over for the per-team lines."""
     if name == "k":
         return P.K_LINES, lambda mu, ln: np.array(
             [P.nb_over(m, ln, k_disp) for m in mu])
@@ -521,7 +502,7 @@ def count_year(snap, art):
             "bias": float(mu.mean() - y.mean()),
             "disp": disp_v,
             # the folded number the Score's disp term reads: observed over
-            # what the pricing assumes, 1.0 ideal (user call 07-15: the
+            # what the pricing assumes, 1.0 ideal (the
             # parent Disp column shows this; Cal/Obs are its children)
             "disp_ratio": (disp_v / float(priced_disp)
                            if priced_disp > 0 else np.nan),
@@ -999,7 +980,7 @@ def bootstrap_lcb(snap25, snap26, art25, art26):
 # each snapshot) + the score-construction constants, so it is computed ONCE
 # per baseline (whoever runs first — this tool or the day's first predict)
 # and reused instantly after. A fingerprint miss recomputes and rewrites.
-_BOOT_VERSION = 4          # v4: per-class Lift-led rank weights (2026-07-15)
+_BOOT_VERSION = 4          # bump when the score construction changes
 _BOOT_CACHE = ART / "quality_boot.joblib"
 
 
@@ -1035,27 +1016,20 @@ def bootstrap_lcb_cached(snap25, snap26, art25, art26):
 # LCB tier allows it. predict.quality_marks then just paints the top-`depth`
 # OVER rows that also clear the informedness floor and the sharp-line veto.
 BLUE_OR_TOP, BLUE_OR_DEEP = 1.55, 2.5     # odds-ratio lift gates (on the LB)
-# base depth INTERPOLATES linearly between the gates (2026-07-15, user;
-# same-day second revision): 5 cells at an OR-lift LB of 1.55 rising to 10
-# at 2.5. The old 5-or-10 step at 2.0 doubled a column's depth on a
-# hairline LB difference (K > 8.5 at 2.01 painted 10 while K > 4.5-7.5 at
-# 1.93-1.99 painted 5 — the thinnest tail line the deepest). The first fix
-# ramped to 10 AT 2.0, which pulled every near-2.0 column toward full
-# depth and grew the board ~189->227 slots — against the validated
-# selectivity lever — so the user stretched the ceiling to 2.5: an LB
-# near 2.0 now lands mid-ramp (~7), full 10-deep is reserved for the
-# truly exceptional columns (SB/Triple/3+K/2+K-class LBs), and total
-# volume sits back where the +19% blue validation was run.
+# base depth INTERPOLATES linearly between the gates: 5 cells at an
+# OR-lift LB of 1.55 rising to 10 at 2.5 — no cliff, so a hairline LB
+# difference can never double a column's depth; an LB near 2.0 lands
+# mid-ramp (~7) and full 10-deep is reserved for truly exceptional
+# selection power.
 BLUE_N_TOP, BLUE_N_DEEP = 5, 10
 BLUE_SLOPE = (0.80, 1.20)                 # calibration-slope sanity gate
-# depth cap keyed to the frozen PROB tiers applied to the LCB (v4: the
+# depth cap keyed to the frozen PROB tiers applied to the LCB (the
 # DISPLAYED tier cuts on the point Score, but depth reads the tier the
 # row's LOWER BOUND would earn — deliberately stricter, so a thin market
 # can't buy deep picks on a lucky point estimate): STRONG+ -> 10, SOLID
-# -> 7, DECENT -> 5, LOW CEILING -> 4, AVOID -> 0 (2026-07-15, user: blue
+# -> 7, DECENT -> 5, LOW CEILING -> 4, AVOID -> 0 (blue
 # means TRULY recommended — a market whose PROVEN tier is AVOID paints
-# nothing, even though its lift gate passed; the old 2-cell floor was the
-# least-proven blue on the sheet).
+# nothing, even though its lift gate passed).
 # DERIVED from PROB_TIER_CUTS so a ladder re-anchor can never desync
 # the blue-mark depth semantics from the tiers.
 BLUE_DEPTH_CAPS = tuple(
@@ -1157,11 +1131,10 @@ def quality_playbook(snap25=None, snap26=None, art25=None, art26=None):
     return pb
 
 
-# The board SORT (user 2026-07-15, v4): TIER first, and the tier is cut on
-# the SCORE ITSELF ("score and tier should be closely connected — tiers are
-# separated by score"), so the board reads as contiguous Score bands.
+# The board SORT: TIER first, and the tier is cut on
+# the SCORE ITSELF, so the board reads as contiguous Score bands.
 # Within a tier: Score descending (the same number the tier is cut from),
-# then the ranked diagnostics as pre-declared tie-breakers in the user's
+# then the ranked diagnostics as pre-declared tie-breakers in priority
 # order (Lift, Edge%, slope closest to 1, |Int|, Disp, Brier, ECE, |Bias|,
 # MAE, AUC, raw Top10%, LogLoss, Acc). NaNs sort last on every key.
 RANK_SORT = (("Lift", False), ("Edge%", False), ("_slope_dev", True),
@@ -1174,7 +1147,7 @@ RANK_SORT = (("Lift", False), ("Edge%", False), ("_slope_dev", True),
 def _rank_and_tier(df):
     """Order rows into class blocks (probability markets, then means, then
     informational), tier WITHIN class on the frozen ladders — cut on the
-    SCORE itself (v4) so tiers are contiguous Score bands — and sort each
+    SCORE itself so tiers are contiguous Score bands — and sort each
     block by TIER, then Score, then the ranked-diagnostic tie-breakers —
     a mean Score and a binary Score are never compared."""
     crank = {"Prob": 0, "Mean": 1}
@@ -1212,17 +1185,16 @@ def _rank_and_tier(df):
 def build_table():
     snap25 = joblib.load(ART / "eval_paired_select_2025.joblib")
     snap26 = joblib.load(ART / "eval_paired_2026.joblib")
-    # audit #6 (user decision 07-15): the 2026 snapshot refreshes only on a
-    # DELIBERATE `evaluate_deep --confirm --set-baseline` (the daily job no
-    # longer touches it), so it legitimately ages between confirms.
+    # the 2026 snapshot refreshes only on a deliberate confirm run of the
+    # evaluation pipeline, so it legitimately ages between confirms.
     try:
         age = ((ART / "eval_paired_select_2025.joblib").stat().st_mtime
                - (ART / "eval_paired_2026.joblib").stat().st_mtime) / 86400.0
         if age > 2:
             print(f"note: 2026 snapshot is ~{age:.0f} day(s) older than the "
                   f"2025 one — expected under manual-confirm-only (refresh "
-                  f"via evaluate_deep --confirm --set-baseline after a "
-                  f"finished change).")
+                  f"it via the evaluation pipeline after a finished "
+                  f"change).")
     except OSError:
         pass
     art25 = joblib.load(ART / "models_bt.joblib")
@@ -1257,9 +1229,9 @@ def build_table():
 
     def _diag_cols(m25, m26):
         """The ranked-diagnostic display columns + their child/context
-        columns (user 07-15: children sit beside their parents; Base%,
+        columns (children sit beside their parents; Base%,
         MeanAct, MeanPred are unranked context), averaged over the years,
-        in the user's priority order (count-head superset; columns a row's
+        in priority order (count-head superset; columns a row's
         metrics don't carry stay empty)."""
         return {
             "Lift": _avg(m25, m26, "lift"),
@@ -1334,7 +1306,7 @@ def build_table():
                     "Score": np.nan, "Score_lo": np.nan,
                     "S25": np.nan, "S26": np.nan, **_NAN_DIAGS,
                     "Notes": "snapshot predates per-team score rows - "
-                             "re-run --set-baseline (both suites) to grade"})
+                             "refresh the evaluation snapshots to grade"})
             continue
         m25, m26 = mm25[key], mm26[key]
         bias = (m25["bias"] + m26["bias"]) / 2
@@ -1370,9 +1342,8 @@ def build_table():
         "Notes": "sum of the lineup's Batter HR probabilities - quality is "
                  "graded on the Batter HR row"})
     # winner: graded like any probability column when the snapshot carries
-    # its rows (Win Prob IS a served %). The McNemar caution — no proven
-    # SIDE-PICKING edge vs always-home — stays as usage guidance in Notes;
-    # it is a statement about moneyline betting, not probability quality.
+    # its rows (Win Prob IS a served %). The Notes carry the caution that
+    # win-percentage quality alone is not a moneyline endorsement.
     w25, w26 = winner_year(snap25), winner_year(snap26)
     if w25 is not None and w26 is not None:
         rows.append({
@@ -1382,16 +1353,16 @@ def build_table():
             "S25": binary_score(w25), "S26": binary_score(w26),
             **_diag_cols(w25, w26),
             "Notes": play_note("bin", w25, w26)
-                     + "; no proven side edge vs always-home (McNemar "
-                       "n.s.) -> win% quality, not a moneyline endorsement",
+                     + "; win% quality alone is not a moneyline "
+                       "endorsement",
         })
     else:
         rows.append({"Market": "Game Winner (Win Prob)",
                      "Key": "winner", "Class": "Prob",
                      "Score": np.nan, "Score_lo": np.nan,
                      "S25": np.nan, "S26": np.nan, **_NAN_DIAGS,
-                     "Notes": "snapshot predates winner rows — re-run "
-                              "evaluate_deep --set-baseline (both suites) "
+                     "Notes": "snapshot predates winner rows — refresh "
+                              "the evaluation snapshots (both suites) "
                               "to grade this column"})
     df = _rank_and_tier(pd.DataFrame(rows))
 
@@ -1460,14 +1431,14 @@ def build_table():
             "Sold": "mean (context)",
         })
     ldf = _rank_and_tier(pd.DataFrame(line_rows))
-    # DISPLAY order (user): most-to-least important for THIS MODEL, in
+    # DISPLAY order: most-to-least important for THIS MODEL, in
     # related clusters — (1) proper-scoring/edge: LogLoss + its base +
     # Edge% (the base-relative logloss, i.e. the edge) + Brier; (2)
     # discrimination: AUC, Lift, Top10% with Base% as their context; (3)
     # calibration: ECE, Slope, Int; (4) count accuracy: MAE family + Bias
     # + the mean context pair; (5) count dispersion; Acc last. The SCORE
-    # weights are unchanged (v4 per-class ranks) — this reorders columns
-    # only. Every column is present for every row even where empty.
+    # weights are separate — this orders display columns only.
+    # Every column is present for every row even where empty.
     _DIAG_ORDER = ["LogLoss", "LLBase", "Edge%", "Brier", "BrierBase",
                    "AUC", "Lift", "Top10%", "Base%",
                    "ECE", "Slope", "Int",
@@ -1481,9 +1452,8 @@ def build_table():
 
 
 LEGEND = [
-    ("Sort order", "TIER first, and the tier is cut on the SCORE itself "
-     "(user: 'score and tier should be closely connected - tiers are "
-     "separated by score'), so the board reads as contiguous "
+    ("Sort order", "TIER first, and the tier is cut on the SCORE itself, "
+     "so the board reads as contiguous "
      "Score bands. Within tier: Score descending, then the ranked "
      "diagnostics as pre-declared tie-breakers. COLUMN order is display "
      "grouping, not the Score ranking: metrics run most-to-least "
@@ -1508,9 +1478,9 @@ LEGEND = [
      "standalone log loss reads through its base-relative form, which IS "
      "the edge. No scraped odds anywhere. TIERS ARE CUT ON THIS COLUMN."),
     ("Score_lo", "The day-block-bootstrap LOWER bound of Score (10th "
-     "percentile over resampled days) - the SAME bootstrap philosophy as the "
-     "model's paired accept bar. A thin market (SB, a deep line) earns a wide "
-     "CI and a lower Score_lo. v4: the displayed tier follows Score, but "
+     "percentile over resampled days). "
+     "A thin market (SB, a deep line) earns a wide "
+     "CI and a lower Score_lo. The displayed tier follows Score, but "
      "BLUE-MARK PICK DEPTH still caps on this column - a thin market can't "
      "buy deep picks on a lucky point estimate."),
     ("Blue", "How many cells the prediction workbook may paint light blue "
@@ -1519,11 +1489,11 @@ LEGEND = [
      "implicit. Eligibility: the bootstrap LOWER bound of odds-ratio "
      "top-pick lift must clear 1.55 and the calibration slope must sit in "
      "0.80-1.20. Base depth then ramps LINEARLY from 5 at a lift LB of "
-     "1.55 to 10 at 2.5 (2026-07-15: no more 5-or-10 cliff at 2.0, and "
+     "1.55 to 10 at 2.5 (no cliff, and "
      "full 10-deep is reserved for truly exceptional selection power - "
      "an LB near 2.0 lands mid-ramp at ~7), and is "
      "capped by the tier Score_lo earns on the frozen ladder: STRONG+ 10, "
-     "SOLID 7, DECENT 5, LOW CEILING 4, AVOID 0 (2026-07-15: an AVOID "
+     "SOLID 7, DECENT 5, LOW CEILING 4, AVOID 0 (an AVOID "
      "lower bound paints NOTHING - blue means truly recommended, and a "
      "market that can't prove more than AVOID isn't). 0 = ineligible; "
      "blank = not a paintable column (means, game totals, winner). O/U "
@@ -1540,7 +1510,7 @@ LEGEND = [
      "noise. The gap directly reduces the final Score."),
     ("Lift", "RANKED #1 (both classes). Top10% over the base rate - the "
      "day's best picks, expressed as selection power. Scored in its "
-     "base-rate-fair odds-ratio form (ADJUDICATED 2026-07-15: read Lift, "
+     "base-rate-fair odds-ratio form (read Lift, "
      "not raw Top10%, when comparing across markets), and (with a "
      "bootstrap lower bound) it sizes blue-mark depth on the prediction "
      "sheets."),
@@ -1563,8 +1533,7 @@ LEGEND = [
      "probabilities. Its children show the two raw values: DispCal = the "
      "dispersion the pricing assumes (cal-year model), DispObs = observed "
      "error variance/mean (mean rows carry DispObs only — a mean doesn't "
-     "price tails). Promoted in v4 from an unranked trust modifier to a "
-     "full ranked term."),
+     "price tails)."),
     ("Brier", "RANKED #5 binary / #6 count. Mean squared error of the "
      "stated probability (lower better); scored via its relative beat "
      "over BrierBase, its child column = the Brier a flat base-rate "
@@ -1576,8 +1545,7 @@ LEGEND = [
      "raw value."),
     ("Bias", "RANKED #8 (O/U count heads; binaries don't have it). "
      "Predicted count minus actual, on average. Positive = model "
-     "over-predicts -> lean unders. Promoted in v4 from an unranked trust "
-     "modifier to a full ranked term."),
+     "over-predicts -> lean unders."),
     ("MAE", "RANKED #10 binary / #9 count. Mean absolute error - for "
      "binaries, of the stated probability against the 0/1 outcome; for "
      "O/U and mean rows, of the predicted count. Its children fold into "
@@ -1593,11 +1561,11 @@ LEGEND = [
     ("Top10%", "RANKED #8 binary / #11 count. The RAW daily top-10 hit "
      "rate - how often the column's ten best picks of a day actually "
      "happen. Not base-rate-fair across markets: a 61%-base market posts "
-     "a high Top10% with little skill - which is exactly why the user "
-     "ranked it low and Lift first. Pitcher/game families also draw from "
+     "a high Top10% with little skill - which is exactly why it "
+     "ranks low and Lift first. Pitcher/game families also draw from "
      "a ~30-candidate daily pool, so their top-10 is the top THIRD (vs "
-     "the top ~4% of ~270 batter slots). ADJUDICATED 2026-07-15 (user): "
-     "pick depth stays uniform; read Lift, not raw Top10%, when comparing "
+     "the top ~4% of ~270 batter slots). "
+     "Pick depth stays uniform; read Lift, not raw Top10%, when comparing "
      "across markets. O/U columns: measured on the first line the column "
      "uniquely prices."),
     ("LogLoss", "RANKED #9 binary / #12 count. The column's standalone "
@@ -1606,12 +1574,12 @@ LEGEND = [
      "at both weights. Its child LLBase = the log loss of always "
      "guessing the base rate; Edge% is exactly the relative gap between "
      "the two."),
-    ("Acc", "RANKED #11 binary / #13 count (last, per the user's "
-     "ranking). Plain accuracy of the >=50% call; scored as the beat over "
+    ("Acc", "RANKED #11 binary / #13 count (last). "
+     "Plain accuracy of the >=50% call; scored as the beat over "
      "the trivial always-majority pick - near-zero for low-base props by "
      "construction (always-no wins)."),
-    ("Base% / MeanAct / MeanPred", "UNRANKED CONTEXT columns (user call "
-     "07-15: they appear in the ranked positions but do not score). "
+    ("Base% / MeanAct / MeanPred", "UNRANKED CONTEXT columns "
+     "(they appear in the ranked positions but do not score). "
      "Base% = how often the event actually happens - the blind-bet rate "
      "Top10% must be read against (O/U rows: the flagship line's over "
      "rate). MeanAct = the mean actual outcome (binaries: identical to "
@@ -1623,13 +1591,12 @@ LEGEND = [
      "with the noted caveat. 4 DECENT: a real, playable edge - shallower, but "
      "the picks are honest. 5 LOW CEILING: not a weak model - a low ceiling. "
      "The event is ~4 coin flips with barely any spread between players, so "
-     "even a PERFECT forecaster could only separate them a little: a "
-     "leave-one-out oracle that knows each batter's true season rate scores no "
-     "better than these heads do. The thin Score is a fact about the market, "
+     "even a PERFECT forecaster could only separate them a little. "
+     "The thin Score is a fact about the market, "
      "not a defect. Play the top of the list, size for the variance. 6 AVOID: "
      "don't act - either genuinely below the achievable bar (winner, total sit "
      "under the market ceiling) or too thin to separate at all. Cut from "
-     "the SCORE itself (v4: tiers are contiguous Score bands) on FROZEN "
+     "the SCORE itself (tiers are contiguous Score bands) on FROZEN "
      "semantic anchors WITHIN each class - a market's tier depends only on "
      "its own edge/calibration, never on how other markets moved in a "
      "retrain, and probability and mean rows use separate ladders. The CI "
@@ -1681,13 +1648,13 @@ def save_excel(df, ldf, path):
 def warm_cache():
     """Compute + cache the day-block bootstrap and exit — no workbook.
 
-    The daily job calls this right after its two --set-baseline runs, which
-    rewrite the paired snapshots and therefore invalidate quality_boot.joblib
+    Meant to run right after the paired evaluation snapshots are rewritten,
+    which invalidates quality_boot.joblib
     (it is keyed by their fingerprints). Without it the FIRST predict of the
     day would pay the ~60s bootstrap before it could paint blue marks. Writing
     no Excel is deliberate: the workbook save would raise PermissionError if
     PROP_RANKINGS.xlsx happened to be open, and a perf nicety must never be
-    able to fail the nightly run."""
+    able to fail a scheduled run."""
     snap25 = joblib.load(ART / "eval_paired_select_2025.joblib")
     snap26 = joblib.load(ART / "eval_paired_2026.joblib")
     art25 = joblib.load(ART / "models_bt.joblib")
@@ -1704,9 +1671,8 @@ def main():
                     help="output Excel file "
                          "(default: Tools/PROP_RANKINGS.xlsx)")
     ap.add_argument("--warm-cache", action="store_true",
-                    help="only compute + cache the bootstrap (no workbook); "
-                         "the daily job runs this after --set-baseline so the "
-                         "first predict of the day is instant")
+                    help="only compute + cache the bootstrap (no workbook), "
+                         "so the first predict of the day is instant")
     args = ap.parse_args()
 
     if args.warm_cache:
@@ -1783,7 +1749,7 @@ def main():
           "base rate on low-base props by construction)")
     print()
     print(_fmt(df).to_string(index=False))
-    print("\n  SORT (2026-07-15, v4): TIER first — cut on the SCORE itself, "
+    print("\n  SORT: TIER first — cut on the SCORE itself, "
           "so tiers are contiguous Score bands — then Score desc, then the "
           "ranked diagnostics as tie-breakers. Column order = the ranking.")
     print("  Score = the rank-WEIGHTED composite of the class's ranked "
@@ -1792,14 +1758,14 @@ def main():
     print("  form; LogLoss reads through its base-relative form = Edge%), "
           "per year, then mean(S25, S26) - 0.25x|S25 - S26| (two-year "
           "stability haircut).")
-    print("  Score_lo is the day-block-bootstrap lower bound — it no longer "
-          "cuts the tier (v4: tiers follow Score) but still caps blue-mark "
+    print("  Score_lo is the day-block-bootstrap lower bound — it does not "
+          "cut the tier (tiers follow Score) but still caps blue-mark "
           "pick depth, so thin markets can't buy depth on luck.")
     print("  Probability rows (Prob) and expected-count means (Mean) rank "
           "on separate ladders and never share a cut (means score on their "
           "MAE-led mean-quality composite).")
     print("  No scraped odds or market prices enter this table; the "
-          "market test is Section 9 of evaluate_deep.py.")
+          "model-vs-market test lives in the evaluation pipeline.")
 
     lo = _fmt(ldf)
     print("\n=== Per-line breakout — every priced column graded on its own "

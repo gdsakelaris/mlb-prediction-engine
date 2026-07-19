@@ -2,16 +2,16 @@
 
 Every scraper rewrites its CSV in full each morning, so a silent upstream
 format change (renamed column, half-empty response, truncated download)
-would poison the daily retrain and everything downstream. This module
-declares, per file, what the MODEL actually requires — the columns
-features.py reads, the relational keys, expected row-count behavior — and
+would poison everything downstream. This module
+declares, per file, what downstream consumers require — the essential
+columns, the relational keys, expected row-count behavior — and
 checks a freshly scraped file against that spec plus the previous known-good
 copy before the pipeline accepts it.
 
 Used two ways:
   - update_all.py: after each scraper runs, its output is validated; on
-    failure the previous file is restored from Data/backups/ and the job is
-    marked FAILED (which also blocks --retrain).
+    failure the previous file is restored from Data/backups/ and the job
+    is marked FAILED (which also blocks --retrain).
   - standalone:  python Scrapers/validate_data.py            # check all files
                  python Scrapers/validate_data.py mlb_odds.csv ...
 
@@ -31,7 +31,7 @@ DATA_DIR = Path(__file__).resolve().parents[1] / "Data"
 BACKUP_DIR = DATA_DIR / "backups"
 
 # Spec fields (all optional except required_cols):
-#   required_cols   columns the model reads (scrapers may write more)
+#   required_cols   columns downstream consumers read (scrapers may write more)
 #   key             columns that should be (near-)unique per row
 #   max_dup_frac    tolerated duplicate-key fraction (statsapi has the odd
 #                   double-listed player; today's data has 1 dup in 311k rows)
@@ -156,14 +156,14 @@ SPECS = {
                        "ts_n", "ts_sw", "ts_wh",
                        "f32_n", "f32_z", "f32_b", "f32_sw", "f32_wh",
                        "fb_v2", "rp_n", "rp_x", "rp_x2", "rp_z", "rp_z2",
-                       # v6 sequencing/count-state/movement (2026-07-14)
+                       # sequencing / count-state / movement sums
                        "c02_n", "c02_w", "ah_n", "ah_brk", "ah_off",
                        "bh_n", "bh_brk", "bh_off",
                        "tr_n", "tr_same", "tr_fbbrk",
                        "ivb_n", "ivb_sum", "fade_w", "fade_num",
-                       # v7 audit wave (2026-07-14): stretch split,
-                       # perceived-velo premium, per-class release
-                       # centroids, breaking movement, 2K x breaking
+                       # stretch split, perceived-velo premium,
+                       # per-class release centroids, breaking
+                       # movement, 2K x breaking
                        "fbstr_n", "fbstr_v", "fbe_n", "fbe_sum",
                        "rpf_n", "rpf_x", "rpf_z", "rpb_n", "rpb_x", "rpb_z",
                        "brkmov_n", "brkmov_sum",
@@ -182,7 +182,7 @@ SPECS = {
                        "off_wh", "edge_n", "fp_n", "fp_sw", "fp_s",
                        "ts_n", "ts_sw", "ts_wh",
                        "f32_n", "f32_z", "f32_b", "f32_sw", "f32_wh",
-                       # v7 audit wave (2026-07-14): 2K x breaking cell
+                       # 2K x breaking cell
                        "ts_brk_n", "ts_brk_sw", "ts_brk_wh"],
         key=["PlayerId", "Date"], max_dup_frac=0.0, date_col="Date",
         fresh_days=6,
@@ -215,7 +215,7 @@ SPECS = {
         key=["Year", "PlayerId"], max_dup_frac=0.0,
         numeric=[("PlayerId", 0.0), ("BatSpeed", 0.05)],
         min_rows=400, shrink_tol=0.999, shrink_abs=15, season_col="Year"),
-    # catcher defense (2026-07-15): framing 2015+, throwing metrics 2016+
+    # catcher defense: framing 2015+, throwing metrics 2016+
     # (CSAA NaN in 2015 by design — no throwing leaderboard that year)
     "mlb_catchers.csv": dict(                   # per (Year, catcher)
         required_cols=["Year", "PlayerId", "Team", "Pitches", "FrameRV",
@@ -229,8 +229,8 @@ SPECS = {
         key=["Year", "Team"], max_dup_frac=0.0,
         numeric=[("FrameRV_pt", 0.02), ("PopTime", 0.02)],
         min_rows=300, shrink_tol=0.999, season_col="Year"),
-    # IL transactions (2026-07-15): raw events (incremental cache) and the
-    # paired stints the model consumes. Events accrue near-daily in season;
+    # IL transactions: raw events (incremental cache) and the paired
+    # stints downstream consumers use. Events accrue near-daily in season;
     # fresh_days is loose because IL announcements aren't game-guaranteed.
     "mlb_il_events.csv": dict(
         required_cols=["PlayerId", "Date", "Kind", "ILDays"],
@@ -250,7 +250,7 @@ SPECS = {
         key=["GamePk"], max_dup_frac=0.0, date_col="Date", fresh_days=6,
         numeric=[("GamePk", 0.0)],              # HpUmpId may be NaN (data gaps)
         min_rows=12000, shrink_tol=0.999, season_col="Season"),
-    # per-inning linescores (G5, 2026-07-14): F5-market grading history.
+    # per-inning linescores: partial-game (e.g. First-5) grading history.
     # LONG format — one row per (GamePk, Inning); accrues incrementally
     # like the umpire file (min_rows sized for the first full backfill).
     "mlb_linescores.csv": dict(
@@ -260,8 +260,8 @@ SPECS = {
         fresh_days=6,
         numeric=[("GamePk", 0.0), ("Inning", 0.0), ("AwayRuns", 0.02)],
         min_rows=1000, shrink_tol=0.999, season_col="Season"),
-    # MiLB season aggregates (Scrapers/scrape_milb.py; consumed by
-    # Model/milb_priors.py). No date column — season-grain files; the
+    # MiLB season aggregates (Scrapers/scrape_milb.py; for minor-league
+    # translation priors). No date column — season-grain files; the
     # season_col check is the history guard, and completed seasons come from
     # the stored cache so shrinkage means a bad current-season fetch.
     "milb_batting.csv": dict(

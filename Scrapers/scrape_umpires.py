@@ -3,8 +3,8 @@
 The home-plate umpire calls the strike zone, and umpires have measurable,
 persistent tendencies in how many strikeouts and walks their zones produce
 (a tight zone inflates walks, a generous one inflates strikeouts). This is
-the only zone-authority signal available to the model; it speaks directly
-to the strikeout and walk props (the tier-1/2 markets).
+the only zone-authority signal available; it speaks directly
+to the strikeout and walk props.
 
 Source: statsapi `/api/v1/game/{GamePk}/boxscore`, whose `officials` list
 carries each crew member and position. We keep only the Home Plate ump
@@ -17,8 +17,8 @@ cached — only new gamePks (the current season's fresh games) hit the
 network, so completed seasons never refetch and an upstream hiccup can't
 re-scrape six years of history. --backfill forces a full refetch.
 
-The model consumes this as-of and leakage-free: a game sees only the HP
-ump's tendency over his PRIOR games (features.py `_ump_asof`).
+Consumers should use this as-of and leakage-free: a game sees only the
+HP ump's tendency over his PRIOR games.
 
 Usage:
     python scrape_umpires.py [-o output.csv] [--backfill] [--limit N]

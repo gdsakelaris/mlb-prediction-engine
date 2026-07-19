@@ -20,8 +20,8 @@ via a name index built from the roster and recent game logs, so they slot
 straight into the model. Indoor/retractable-roof parks with the roof closed
 report no weather on the sources; those are set to Dome / calm / ~72 F.
 
-Writes Data/todays_games.json in exactly the format Model/predict.py
-consumes. Anything still unknown is left null; the model tolerates it.
+Writes Data/todays_games.json in the format the prediction engine
+consumes. Anything still unknown is left null; the engine tolerates it.
 
 Usage:
     python Tools/1_get_todays_games.py
@@ -195,9 +195,9 @@ def resolve(name, team, idx):
 
 
 def build_umpire_index():
-    """normalized HP-ump name -> HpUmpId, from mlb_umpires.csv (the same file
-    the model keys its ump tendency on). This bridges tonight's scraped ump
-    NAME (rotowire) to the ID the model needs. Latest id per name."""
+    """normalized HP-ump name -> HpUmpId, from mlb_umpires.csv. Bridges
+    tonight's scraped ump NAME (rotowire) to the HpUmpId used across the
+    data files. Latest id per name."""
     path = DATA_DIR / "mlb_umpires.csv"
     if not path.exists():
         return {}
@@ -317,13 +317,12 @@ def scrape_mlb():
 # ------------------------------------------------------------- open-meteo
 
 def forecast_weather(games):
-    """Fill humidity (%), surface pressure (hPa) and precipitation (mm, at
-    the start hour — the rain-shortening input wired 2026-07-14) at each
-    game's start hour from the Open-Meteo forecast (keyless). One request
-    per venue; arrays are requested in ET so start_et indexes them
-    directly. Real ambient values are reported even for roofed parks — the
-    model neutralizes weather on Condition == Dome itself, same as it does
-    for historical games."""
+    """Fill humidity (%), surface pressure (hPa) and precipitation (mm)
+    at each game's start hour from the Open-Meteo forecast (keyless). One
+    request per venue; arrays are requested in ET so start_et indexes them
+    directly. Real ambient values are reported even for roofed parks —
+    downstream weather handling neutralizes Condition == Dome itself, the
+    same as for historical games."""
     try:
         coords = venue_coords()
     except Exception as e:                          # noqa: BLE001
@@ -593,8 +592,7 @@ def main():
     # Lineup-source accounting, per TEAM-SIDE (there are 2 per game), decided
     # by comparing the pids mlb.com gave against the pids after fallbacks —
     # NOT by whether a side reached a full 9 (a fallback that fills in only a
-    # partial lineup still "relied on the fallback", and the old count missed
-    # exactly that):
+    # partial lineup still "relied on the fallback"):
     #   contributed - a fallback added/changed at least one player
     #   fully       - the whole side came from a fallback (mlb.com had none)
     #   topped      - a fallback added to a partial mlb.com lineup
@@ -632,8 +630,8 @@ def main():
             g["start_et"] = r["start_et"]
             g["day_night"] = r.get("day_night") or g["day_night"]
 
-        # home-plate umpire (rotowire name -> HpUmpId the model uses); the
-        # GUI loads hp_ump_id into the spec so ump_feats has real history
+        # home-plate umpire (rotowire name -> HpUmpId); the GUI loads
+        # hp_ump_id into the game spec
         g["hp_ump"] = r.get("umpire")
         g["hp_ump_id"] = (ump_idx.get(norm_name(g["hp_ump"]))
                           if g.get("hp_ump") else None)
@@ -679,10 +677,9 @@ def main():
 
     games.sort(key=lambda g: (g.get("start_et") or "99:99",
                               g["away_team"]))
-    # doubleheader flags (2026-07-14 #24): same matchup twice today; game 2
-    # = the later first pitch (games are start-time sorted right above).
-    # The GUI passes these through to the spec; the model's training-side
-    # flags derive identically from the games file.
+    # doubleheader flags: same matchup twice today; game 2 = the later
+    # first pitch (games are start-time sorted right above). The GUI
+    # passes these through to the spec.
     seen_dh = Counter()
     for g in games:
         key = (g["away_team"], g["home_team"])
@@ -695,12 +692,12 @@ def main():
     with open(OUT_FILE, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=1)
 
-    # Forecast archive (audit #4, 2026-07-15): training weather is the
-    # ACTUAL observed game weather, but serving feeds these FORECASTS — a
-    # structural backtest-vs-live optimism channel on weather-sensitive
-    # heads. Nothing can remove it retroactively; this append-only log
-    # makes it MEASURABLE (join to mlb_games/mlb_weather on date+matchup to
-    # quantify forecast error over the forward record).
+    # Forecast archive: the historical weather files hold the ACTUAL
+    # observed game weather, but game day serves these FORECASTS — a
+    # structural backtest-vs-live gap on weather-sensitive outputs.
+    # This append-only log makes it MEASURABLE (join to
+    # mlb_games/mlb_weather on date+matchup to quantify forecast error
+    # over the forward record).
     fc_path = DATA_DIR / "mlb_weather_forecast.csv"
     fc_new = not fc_path.exists()
     with open(fc_path, "a", newline="", encoding="utf-8") as fh:

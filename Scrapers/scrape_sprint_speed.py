@@ -6,18 +6,17 @@ skill behind stolen bases and taking the extra base, neither of which the
 box-score rates isolate from opportunity. hp_to_1b (home-to-first time, s)
 is the complementary burst measure.
 
-The model consumes these as PRIOR-season values (same leakage-free pattern
-as GO/AO): a game sees the previous season's measurement, falling back one
-more year. Sprint speed is among the most stable year-to-year skills, so
-the lag costs little.
+Designed for PRIOR-season consumption (leakage-free): a game sees the
+previous season's measurement, falling back one more year. Sprint speed
+is among the most stable year-to-year skills, so the lag costs little.
 
 Relational keys: PlayerId is the MLBAM id used everywhere; one row per
 (Year, PlayerId).
 
 Completed seasons are served from the existing output CSV (they never
 change); only the current season hits the network, and a failed
-current-season fetch falls back to the previous run's rows (the model
-only consumes prior-season values). --backfill forces a full refetch.
+current-season fetch falls back to the previous run's rows (consumers
+only use prior-season values). --backfill forces a full refetch.
 
 Usage:
     python scrape_sprint_speed.py [-o output.csv] [--backfill]

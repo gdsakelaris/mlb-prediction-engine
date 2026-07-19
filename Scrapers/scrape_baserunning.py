@@ -8,8 +8,8 @@ actually PRODUCES — the advancement component is the skill behind scoring
 runs that raw speed only proxies.
 
 The leaderboard starts in 2016 and lists qualified runners (~190/season);
-players below the opportunity floor are simply absent and the model treats
-them as league-average. The model consumes these as PRIOR-season values
+players below the opportunity floor are simply absent and consumers should
+treat them as league-average. Designed for PRIOR-season consumption
 (leakage-free, like sprint speed and OAA).
 
 One row per (Year, PlayerId).

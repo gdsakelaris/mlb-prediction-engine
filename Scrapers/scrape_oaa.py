@@ -3,9 +3,9 @@ both the TEAM leaderboard and the PLAYER (fielder) leaderboard.
 
 OAA is Statcast's range-based defense metric: outs recorded above what an
 average fielder converts from the same batted balls. It is the only direct
-defense-quality measurement available to the model — the game logs'
-unearned-run rate (opp_def_uer) is a weak proxy that misses everything a
-bad defense turns into "earned" hits.
+defense-quality measurement available here — box-score proxies (e.g.
+unearned-run rate) miss everything a bad defense turns into "earned"
+hits.
 
 Team file (mlb_oaa.csv): Savant keys teams by MLB team_id; this maps them
 to the per-season abbreviations the game logs use (statsapi teams endpoint,
@@ -14,19 +14,19 @@ per-162-game figure so the 60-game 2020 season is comparable. One row per
 (Year, Team).
 
 Player file (mlb_oaa_players.csv): one row per (Year, PlayerId) with the
-fielder's OAA, fielding runs prevented, and primary position — this is what
-lets features aggregate the ACTUAL defenders behind a pitcher (the team
+fielder's OAA, fielding runs prevented, and primary position — this lets
+a consumer aggregate the ACTUAL defenders behind a pitcher (the team
 number blends bench players and September call-ups into the everyday
 lineup). Both leaderboards start in 2016 (Statcast fielding-era floor);
 earlier requests return no rows and are skipped.
 
-The model consumes these as PRIOR-season values (leakage-free, like GO/AO
-and sprint speed): a game sees the opponent's previous-season defense.
+Designed for PRIOR-season consumption (leakage-free, like GO/AO and
+sprint speed): a game sees the opponent's previous-season defense.
 
 Completed seasons are served from the existing output CSV (they never
 change); only the current season hits the network. If the current-season
 fetch fails (Savant throttling), the previous run's rows for it are kept
-and the job still succeeds — the model only ever consumes prior-season
+and the job still succeeds — consumers only ever use prior-season
 OAA, so a one-day-stale current season costs nothing. --backfill forces
 a full refetch of every season.
 

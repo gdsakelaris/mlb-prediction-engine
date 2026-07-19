@@ -15,14 +15,14 @@ Three leaderboards, one row per (Year, PlayerId) in the player file:
 Team file (mlb_catchers_team.csv): playing-time-weighted battery quality
 per (Year, Team) — framing runs per 2000 called pitches (framing is a
 volume stat), CS-above-average per attempt, and attempt-weighted pop time.
-This is the serving-safe grain: the model cannot know tonight's starting
-catcher, but the team's weighted battery is known before the game — the
+This is the serving-safe grain: tonight's starting catcher is unknowable
+pregame, but the team's weighted battery is known before the game — the
 same dodge mlb_oaa.csv uses for team defense. Team mapping: the throwing
 leaderboard's team_name (2016+), the poptime leaderboard's team_id (2015),
 via the statsapi teams endpoint (rename-aware, like scrape_oaa).
 
-The model consumes these as PRIOR-season values (leakage-free, like OAA
-and sprint speed). Catcher framing/arm are among the most stable
+Designed for PRIOR-season consumption (leakage-free, like OAA and
+sprint speed). Catcher framing/arm are among the most stable
 year-to-year defensive skills, so the lag costs little.
 
 Completed seasons are served from the existing output CSVs; only the
