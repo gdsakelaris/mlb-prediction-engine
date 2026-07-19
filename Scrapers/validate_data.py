@@ -280,11 +280,68 @@ SPECS = {
         min_rows=90000, shrink_tol=0.999, shrink_abs=25, season_col="Year"),
     "mlb_odds.csv": dict(                       # append-only store
         required_cols=["Date", "GamePk", "PlayerId", "Market", "Line",
-                       "OverPrice", "UnderPrice", "Book", "CapturedAt"],
+                       "OverPrice", "UnderPrice", "Book", "CapturedAt",
+                       "OpenOverPrice", "OpenUnderPrice", "OpenCapturedAt"],
         date_col="Date",
         numeric=[("Line", 0.05), ("OverPrice", 0.20)],
         min_rows=1, shrink_tol=0.999),
+    # play-by-play runner movements (Scrapers/scrape_pbp.py): advancement /
+    # SB / error / earned-run training layer. One row per movement; the odd
+    # API-side duplicated movement entry is tolerated by the dup fraction.
+    "mlb_pbp.csv": dict(
+        required_cols=["GamePk", "Season", "Date", "AtBatIndex", "PlayIndex",
+                       "Inning", "Half", "PlayEvent", "PlayEventType",
+                       "BatterId", "PitcherId", "RunnerId", "StartBase",
+                       "EndBase", "IsOut", "OutBase", "OutNumber", "RBI",
+                       "Earned", "TeamUnearned", "RespPitcherId", "Event",
+                       "EventType", "MovementReason", "Credits"],
+        key=["GamePk", "AtBatIndex", "PlayIndex", "RunnerId", "StartBase"],
+        max_dup_frac=0.002, date_col="Date", fresh_days=6,
+        numeric=[("GamePk", 0.0), ("BatterId", 0.001), ("RunnerId", 0.001)],
+        min_rows=1800000, shrink_tol=0.999, season_col="Season"),
+    # fielder arm strength (Scrapers/scrape_arm_strength.py); 2020+,
+    # PRIOR-season consumption
+    "mlb_arm_strength.csv": dict(
+        required_cols=["Year", "PlayerId", "Name", "Pos", "Throws", "MaxArm",
+                       "ArmOverall", "ArmInf", "ArmOf"],
+        key=["Year", "PlayerId"], max_dup_frac=0.0,
+        numeric=[("PlayerId", 0.0), ("MaxArm", 0.05)],
+        min_rows=1500, shrink_tol=0.999, shrink_abs=20, season_col="Year"),
+    # MiLB game logs, AAA+AA 2021+ (Scrapers/scrape_milb_gamelogs.py):
+    # call-up recency. fresh_days is loose so the minors season ending in
+    # late September never trips the mid-season staleness check.
+    "milb_game_batting.csv": dict(
+        required_cols=["GamePk", "Season", "Date", "Level", "League",
+                       "PlayerId", "Name", "Team", "Opponent", "Org", "Home",
+                       "BattingOrder", "Position", "PA", "AB", "R", "H",
+                       "2B", "3B", "HR", "RBI", "BB", "SO", "HBP", "SB",
+                       "CS", "TB"],
+        key=["GamePk", "PlayerId"], max_dup_frac=0.001, date_col="Date",
+        fresh_days=10,
+        numeric=[("PlayerId", 0.0), ("PA", 0.001), ("HR", 0.001)],
+        min_rows=400000, shrink_tol=0.999, season_col="Season"),
+    "milb_game_pitching.csv": dict(
+        required_cols=["GamePk", "Season", "Date", "Level", "League",
+                       "PlayerId", "Name", "Team", "Opponent", "Org", "Home",
+                       "GS", "GF", "IP", "BF", "NP", "Strikes", "H", "R",
+                       "ER", "HR", "BB", "SO"],
+        key=["GamePk", "PlayerId"], max_dup_frac=0.001, date_col="Date",
+        fresh_days=10,
+        numeric=[("PlayerId", 0.0), ("BF", 0.001), ("SO", 0.001)],
+        min_rows=180000, shrink_tol=0.999, season_col="Season"),
 }
+
+# tracked-minors pitch aggregates (Scrapers/scrape_pitches_milb.py): the
+# MLB pitch-daily spec plus the Level column, with floors sized for the
+# smaller tracked-minors universe (FSL 2021+, every AAA park 2023+) and the
+# same loose freshness as the other minors files.
+for _side, _floor in (("pitchers", 30000), ("batters", 60000)):
+    _mlb = SPECS[f"mlb_pitch_daily_{_side}.csv"]
+    SPECS[f"milb_pitch_daily_{_side}.csv"] = dict(
+        _mlb,
+        required_cols=_mlb["required_cols"] + ["Level"],
+        key=["PlayerId", "Date", "Level"],
+        min_rows=_floor, fresh_days=10)
 
 
 def validate_file(path, prev_path=None, spec=None):

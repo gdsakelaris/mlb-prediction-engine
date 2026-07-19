@@ -22,6 +22,18 @@ report no weather on the sources; those are set to Dome / calm / ~72 F.
 
 Writes Data/todays_games.json in the format the prediction engine
 consumes. Anything still unknown is left null; the engine tolerates it.
+Each game also carries per-side lineup provenance (away/home_lineup_src:
+mlb = the official site posted it, full/top = a fallback sourced or
+topped it up, none = still empty) and each club's next scheduled off-day
+(away/home_next_offday, from the StatsAPI forward schedule — bullpen-
+availability context: relievers are managed differently ahead of a rest
+day).
+
+Every run also archives the exact as-served payload to
+Data/slates/slate_<timestamp>.json — todays_games.json itself is
+overwritten daily, and honest as-of-day replays need the lineups,
+starters and umpire precisely as they were served pregame (the lineup
+counterpart of the mlb_weather_forecast.csv archive).
 
 Usage:
     python Tools/1_get_todays_games.py
@@ -372,6 +384,46 @@ def forecast_weather(games):
     return filled
 
 
+# ------------------------------------------------------- forward schedule
+
+def team_play_dates(after_date, days=10):
+    """Team abbrev -> set of ISO dates the club is scheduled to play over
+    the `days` days after `after_date`, from one bulk StatsAPI schedule
+    call. Feeds the per-club next-off-day fields."""
+    d0 = dt.date.fromisoformat(after_date) + dt.timedelta(days=1)
+    d1 = d0 + dt.timedelta(days=days - 1)
+    r = requests.get("https://statsapi.mlb.com/api/v1/schedule",
+                     params={"sportId": 1, "startDate": d0.isoformat(),
+                             "endDate": d1.isoformat()},
+                     headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    tr = requests.get("https://statsapi.mlb.com/api/v1/teams",
+                      params={"sportId": 1, "season": d0.year},
+                      headers=HEADERS, timeout=30)
+    tr.raise_for_status()
+    ab = {t["id"]: ABBREV_ALIASES.get(t.get("abbreviation"),
+                                      t.get("abbreviation"))
+          for t in tr.json().get("teams", [])}
+    play = {}
+    for day in r.json().get("dates", []):
+        for g in day.get("games", []):
+            for side in ("away", "home"):
+                team = ab.get(g["teams"][side]["team"]["id"])
+                if team:
+                    play.setdefault(team, set()).add(day.get("date"))
+    return play, d0, days
+
+
+def next_offday(play, team, d0, days):
+    """First scheduled off-day (ISO date) for `team` in the window, or None
+    when every day has a game (i.e. 10+ straight)."""
+    for i in range(days):
+        d = (d0 + dt.timedelta(days=i)).isoformat()
+        if d not in play.get(team, set()):
+            return d
+    return None
+
+
 # ------------------------------------------------------------- fantasypros
 
 def scrape_fantasypros():
@@ -671,9 +723,32 @@ def main():
             lineup_src["topped"] += topped
             lineup_src["completed"] += completed
         sources.append(src_tags)
+        # provenance rides into the JSON so the model/GUI can weigh how
+        # much to trust each posted side (mlb / full / top / none)
+        g["away_lineup_src"] = src_tags["away"]
+        g["home_lineup_src"] = src_tags["home"]
 
     print("fetching open-meteo forecast (humidity, pressure) ...")
     filled["hum"] = forecast_weather(games)
+
+    if games:
+        print("fetching forward schedule (next off-day per club) ...")
+        try:
+            play, off0, offn = team_play_dates(games[0]["date"])
+            for g in games:
+                for side in ("away", "home"):
+                    g[f"{side}_next_offday"] = next_offday(
+                        play, g[f"{side}_team"], off0, offn)
+            n_off = sum(1 for g in games for s in ("away", "home")
+                        if g[f"{s}_next_offday"])
+            print(f"  next off-day within {offn} days for "
+                  f"{n_off}/{2 * len(games)} team-sides")
+        except Exception as e:                      # noqa: BLE001
+            print(f"  forward schedule failed ({e}); next_offday left null",
+                  file=sys.stderr)
+            for g in games:
+                g.setdefault("away_next_offday", None)
+                g.setdefault("home_next_offday", None)
 
     games.sort(key=lambda g: (g.get("start_et") or "99:99",
                               g["away_team"]))
@@ -691,6 +766,16 @@ def main():
                "games": games}
     with open(OUT_FILE, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=1)
+
+    # as-served archive: every run keeps its own timestamped snapshot (the
+    # working file above is overwritten daily; replays need what was
+    # actually served pregame, per run)
+    slate_dir = DATA_DIR / "slates"
+    slate_dir.mkdir(exist_ok=True)
+    stamp = payload["scraped_at"].replace(":", "").replace("T", "_")
+    with open(slate_dir / f"slate_{stamp}.json", "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=1)
+    print(f"  slate archived -> slates/slate_{stamp}.json")
 
     # Forecast archive: the historical weather files hold the ACTUAL
     # observed game weather, but game day serves these FORECASTS — a

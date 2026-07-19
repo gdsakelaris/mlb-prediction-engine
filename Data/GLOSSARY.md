@@ -40,8 +40,13 @@ to 2010 for translation history).
 | mlb_linescores.csv | scrape_linescores.py |
 | mlb_catchers.csv / mlb_catchers_team.csv | scrape_catchers.py (one run writes both) |
 | mlb_il_events.csv / mlb_il.csv | scrape_transactions.py (one run writes both) |
+| mlb_pbp.csv | scrape_pbp.py (`--backfill` once; daily runs are incremental) |
+| mlb_arm_strength.csv | scrape_arm_strength.py |
+| milb_game_batting.csv / milb_game_pitching.csv | scrape_milb_gamelogs.py (one run writes both) |
+| milb_pitch_daily_pitchers.csv / milb_pitch_daily_batters.csv | scrape_pitches_milb.py (writes both; `--backfill` once) |
 | mlb_odds.csv | Tools/2_scrape_odds.py (near game time — never in the 6 AM job) |
 | mlb_weather_forecast.csv | Tools/1_get_todays_games.py (archives each served forecast) |
+| slates/ (JSON archive) | Tools/1_get_todays_games.py (archives each served slate) |
 
 All scrapers write into `Data/` by default. `Scrapers/update_all.py` runs every
 scraper (everything except build_ballparks.py) for a one-command daily
@@ -440,10 +445,82 @@ Event log (`PlayerId`, `Date`, `Kind`, `ILDays`) and stint table
 (`PlaceDate`, `ActDate`, `StintDays`, `IL60`, `Rehab`) from the
 transactions scrape — as-of IL status and returns for roster availability.
 
-## mlb_odds.csv — sportsbook closing lines
-Written by `Tools/2_scrape_odds.py`. Grading and
-model-vs-market ROI only — **never a feature input**.
+## mlb_pbp.csv — play-by-play runner movements
+One row per runner movement per play (batter included: a strikeout is the
+batter's out movement, a homer his own trip to H). The labeled layer the
+raw pitch archive lacks: runner advancement, stolen bases, wild pitches /
+passed balls / pickoffs / balks as their own events, RBI and earned-run
+flags on every scoring movement, and fielding credits. Trains runner
+advancement, SB attempt/success, DP/sac-fly conversion, and the
+earned/unearned split behind ER props.
+
+| Column | Meaning |
+|---|---|
+| GamePk, Season, Date | Game keys (universe = mlb_games.csv) |
+| AtBatIndex | Play (plate appearance) index, 0-based; join to the raw pitch archive on `at_bat_number = AtBatIndex + 1` |
+| PlayIndex | Index of the event WITHIN the play that caused this movement — mid-PA actions (steals, wild pitches) get their own rows |
+| Inning / Half | Inning number, `top`/`bottom` |
+| PlayEvent / PlayEventType | The PA's final result (e.g. `Single` / `single`) |
+| BatterId / PitcherId | The matchup (MLB IDs) |
+| RunnerId | Who moved (the batter on his own play) |
+| StartBase / EndBase | `1B`/`2B`/`3B`; blank start = batter's box, `H` = scored |
+| IsOut / OutBase / OutNumber | Out on the movement, where, and which out of the inning |
+| RBI / Earned / TeamUnearned | Attribution flags on the movement (`Earned` = charged to the pitcher; `TeamUnearned` = earned for the pitcher, unearned for the team) |
+| RespPitcherId | Pitcher charged with this (inherited) runner, when it differs from the pitcher of record |
+| Event / EventType | The CAUSING event (`Stolen Base 2B` / `stolen_base_2b`, `Wild Pitch`, …) — differs from PlayEvent on mid-PA actions |
+| MovementReason | API movement reason code (`r_adv_play`, `r_stolen_base_2b`, …) |
+| Credits | Fielders on the play: `credit:position:playerId` triplets joined by `;` (`putout:C:543376;assist:RF:501983`) — errors, ROE and outfield-arm outcomes live here |
+
+## mlb_arm_strength.csv — Statcast fielder arm strength
+One row per (Year, PlayerId), 2020+ (min 20 tracked throws). The
+outfield/infield arm input for runner-advancement modeling (the catcher
+files cover throws on steals). Consumed as PRIOR-season values.
+
+| Column | Meaning |
+|---|---|
+| Year, PlayerId, Name | Keys |
+| Pos | Primary position code (2=C … 9=RF, 10=DH) |
+| Throws | Tracked competitive throws |
+| MaxArm | Hardest throw (mph) |
+| ArmOverall | Average arm strength (mph), all positions |
+| ArmInf / ArmOf | Averages across infield / outfield throws |
+| Arm1B…ArmRF | Averages by position thrown from (NaN where unplayed) |
+
+## milb_game_batting.csv / milb_game_pitching.csv — MiLB game logs (AAA + AA)
+One row per player per game, 2014+ — one lookback season before the MLB
+files' 2015 start, so every call-up in the training window has as-of form
+(2020 canceled; deeper history stays the season-aggregate files' job).
+Game grain is what "hot month at Triple-A right before the call-up"
+needs. Columns mirror the MLB game files plus `Level` (AAA/AA), `League`
+(park and environment context) and `Org` — the MLB parent club's
+abbreviation. `PlayerId` joins every other file.
+
+## milb_pitch_daily_pitchers.csv / milb_pitch_daily_batters.csv — tracked-minors pitch aggregates
+The scrape_pitches.py daily sufficient statistics computed over the
+minors games Statcast actually tracks: every AAA park since 2023 and the
+Florida State League (Single-A) since 2021, plus a `Level` column
+(AAA/A). Same columns as the MLB pitch-daily files, measured by the same
+system — a call-up's whiff/chase/velo profile with real sample size
+before his MLB numbers exist. `--backfill` archives raw pitches to
+`Data/raw_pitches_milb/pitches_{year}.parquet` (re-aggregate offline via
+`--from-raw`).
+
+## mlb_odds.csv — sportsbook lines (open + close)
+Written by `Tools/2_scrape_odds.py`. One row per (Date, PlayerId, Market,
+Line, Book): `OverPrice`/`UnderPrice`/`CapturedAt` hold the LATEST capture
+(the closing side), `OpenOverPrice`/`OpenUnderPrice`/`OpenCapturedAt` the
+EARLIEST — so line movement between the first and last capture of each
+line stays measurable. Grading and model-vs-market ROI only — **never a
+feature input**.
 
 ## mlb_weather_forecast.csv — served pre-game forecasts
 Archived by `Tools/1_get_todays_games.py` at serve time so the
 forecast-vs-actual weather gap stays measurable.
+
+## Data/slates/ — as-served slate archive
+`slate_<date>_<time>.json` snapshots written by
+`Tools/1_get_todays_games.py` on every run: the exact lineups, starters,
+umpire, weather, per-side lineup provenance (`*_lineup_src`: mlb / full /
+top / none) and next scheduled off-days served pregame. todays_games.json
+itself is overwritten daily; this archive is what honest as-of-day
+replays load.

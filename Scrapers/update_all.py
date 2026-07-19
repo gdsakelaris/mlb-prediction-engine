@@ -57,6 +57,7 @@ EXCLUDE = {"scrape_odds.py", "2_scrape_odds.py"}
 
 # which Data/ files each job owns (backed up before the run, validated after)
 JOB_FILES = {
+    "scrape_arm_strength.py": ["mlb_arm_strength.csv"],
     "scrape_batting_stats.py": ["mlb_batting_stats.csv"],
     "scrape_gamelogs.py": ["mlb_games.csv",
                               "mlb_game_batting.csv",
@@ -70,9 +71,14 @@ JOB_FILES = {
     "scrape_pitching_stats.py": ["mlb_pitching_stats.csv"],
     "scrape_rosters.py": ["mlb_rosters.csv"],
     "scrape_milb.py": ["milb_batting.csv", "milb_pitching.csv"],
+    "scrape_milb_gamelogs.py": ["milb_game_batting.csv",
+                                "milb_game_pitching.csv"],
+    "scrape_pbp.py": ["mlb_pbp.csv"],
     "scrape_statcast.py": ["mlb_statcast_bip.csv"],
     "scrape_pitches.py": ["mlb_pitch_daily_pitchers.csv",
                           "mlb_pitch_daily_batters.csv"],
+    "scrape_pitches_milb.py": ["milb_pitch_daily_pitchers.csv",
+                               "milb_pitch_daily_batters.csv"],
     "scrape_sprint_speed.py": ["mlb_sprint_speed.csv"],
     "scrape_oaa.py": ["mlb_oaa.csv", "mlb_oaa_players.csv"],
     "scrape_baserunning.py": ["mlb_baserunning.csv"],

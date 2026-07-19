@@ -20,9 +20,11 @@ de-vig consensus prefers as its reference — same credit
 cost as the plain regions=us default. Run it twice a day and it just works: player-prop markets cost 1 credit PER GAME while the
 game markets are one flat bulk call, and a rerun near first pitch SKIPS games
 already underway (their pregame line is final), so the second run only pays for
-games not yet started. write_store de-dupes on (Date, PlayerId, Market, Line,
-Book) keeping the latest capture, so re-running never duplicates rows — it
-upgrades each line toward its closing value.
+games not yet started. write_store keeps one row per (Date, PlayerId, Market,
+Line, Book) holding BOTH ends of the capture history — the earliest capture in
+the Open* columns and the latest in OverPrice/UnderPrice — so a morning run
+pins the opening price, a rerun near first pitch tightens the closing one, and
+the move between them (steam, line value) stays measurable forever.
 
 IMPORTANT on the free tier: it covers moneyline/totals for current & upcoming
 games, but player props ("additional markets") and historical snapshots are
@@ -284,9 +286,14 @@ def fetch(url, params):
 
 
 def write_store(rows, out):
-    """Append rows, then de-dupe on (Date, PlayerId, Market, Line, Book)
-    keeping the latest CapturedAt — so re-running closer to first pitch
-    upgrades each line to its closing value.
+    """Append rows, then collapse to one row per (Date, PlayerId, Market,
+    Line, Book) keeping BOTH ends of the capture history: OverPrice/
+    UnderPrice/CapturedAt hold the LATEST capture (the closing side) and
+    OpenOverPrice/OpenUnderPrice/OpenCapturedAt the EARLIEST — so a
+    morning run pins the open, a rerun near first pitch tightens the
+    close, and the price move between them stays measurable forever.
+    Rows written before the Open columns existed backfill their open from
+    the one capture they hold.
 
     The store is the one file in Data/ that cannot be re-scraped after the
     fact (pregame lines are gone once games start), so it gets extra care:
@@ -298,14 +305,22 @@ def write_store(rows, out):
     if out.exists():
         with open(out, newline="", encoding="utf-8") as f:
             existing = list(csv.DictReader(f))
-    combined = existing + rows
-    best = {}
-    for row in combined:
+    best = {}  # key -> [open (ts, over, under), close (ts, row)]
+    for row in existing + rows:
         key = (str(row.get("Date")), str(row.get("PlayerId")),
                row.get("Market"), str(row.get("Line")), row.get("Book"))
+        close_ts = str(row.get("CapturedAt") or "")
+        open_ = (str(row.get("OpenCapturedAt") or close_ts),
+                 row.get("OpenOverPrice") or row.get("OverPrice"),
+                 row.get("OpenUnderPrice") or row.get("UnderPrice"))
         prev = best.get(key)
-        if prev is None or str(row.get("CapturedAt")) >= str(prev.get("CapturedAt")):
-            best[key] = row
+        if prev is None:
+            best[key] = [open_, (close_ts, row)]
+            continue
+        if open_[0] < prev[0][0]:
+            prev[0] = open_
+        if close_ts >= prev[1][0]:
+            prev[1] = (close_ts, row)
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists():
         backup_dir = out.parent / "backups"
@@ -315,8 +330,12 @@ def write_store(rows, out):
     with open(tmp, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=O.ODDS_COLUMNS)
         w.writeheader()
-        for row in best.values():
-            w.writerow({c: row.get(c, "") for c in O.ODDS_COLUMNS})
+        for open_, (_, row) in best.values():
+            merged = {c: row.get(c, "") for c in O.ODDS_COLUMNS}
+            merged["OpenCapturedAt"] = open_[0]
+            merged["OpenOverPrice"] = "" if open_[1] is None else open_[1]
+            merged["OpenUnderPrice"] = "" if open_[2] is None else open_[2]
+            w.writerow(merged)
     os.replace(tmp, out)
     return len(best)
 

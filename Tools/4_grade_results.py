@@ -2,39 +2,37 @@
 
 Re-colors the workbook IN PLACE once games are final, using the project's
 own scraped per-player box scores (Data/mlb_game_batting.csv /
-mlb_game_pitching.csv / mlb_games.csv) joined on the workbook's ID column —
-PlayerId-exact, so no third-party box-score scraping or name matching:
+mlb_game_pitching.csv / mlb_games.csv) joined on the workbook's ID column
+— PlayerId-exact, so no third-party box-score scraping or name matching.
 
-  stat occurred + cell was plain (white / red tint)  -> yellow
-  stat occurred + cell was a light-blue quality pick -> darker blue
-  stat occurred + cell was a light-green +EV bet     -> darker green
-  stat occurred + cell was light purple (blue + green) -> dark purple
-
-On the Bets sheet, every WINNING bet has its whole row painted solid dark
-green (#00B050); losing / not-yet-settled rows keep the light board. Under
-bets settle too (the row carries its Side). Re-running is idempotent.
-
-Every graded cell answers the same literal question: DID THE STAT OCCUR.
+One rule, three sheets: on Batter Props, Pitching Props and Games, every
+gradeable cell whose event ACTUALLY OCCURRED is painted solid green
+(#00B050); text stays regular black like every other cell, and
+everything else keeps its served look. Every
+graded cell answers the same literal question: DID THE STAT OCCUR.
 Binary batter columns light up if the event happened (the HR cell if he
 homered); O/U line columns light up if the OVER hit (K > 8.5 only if he
 actually struck out 9+); the Winner cell (and its Win Prob) if the named
 team won. Mean columns (xK, xTB, Away/Home Score, ...) have no yes/no
 event and are left untouched.
 
-Re-running is safe and REPAIRS earlier grades: pass 1 reverts every
-occurred-color cell back to its base color (magenta/yellow -> plain, dark blue/
-green/purple -> the light pick shade), then pass 2 grades fresh.
+On the Bets sheet, every WINNING bet has its whole row painted the same
+green; losing / not-yet-settled rows keep the light board. Unders settle
+too (the row carries its Side).
 
-Doubleheaders: workbooks carry a G# column, so
-every batter/pitcher row grades against ITS OWN game's box line (the
-tag's G#-th final, schedule order) — a game-1 prediction is never credited
-with a game-2 stat. Legacy pre-G# workbooks fall back to the old
-day-summed read (which inflated DH-day hit rates; noted, not repaired).
+Re-running is safe and idempotent: pass 1 strips every green cell back
+to the plain board (it also strips the retired reddish headline tint
+from workbooks served before that tint was removed), then pass 2 grades
+fresh.
+
+Doubleheaders: prop rows carry a G# column, so every batter/pitcher row
+grades against ITS OWN game's box line (the tag's G#-th final, schedule
+order) — a game-1 prediction is never credited with a game-2 stat.
 Games-sheet rows are matched per game: the tag's i-th row grades against
 the day's i-th final for that matchup (schedule order); if only one of
 the two games is final the tag's rows are skipped until both are in.
-Bets rows carry no G#, so on a multi-final day they stay unsettled rather
-than misgraded.
+Bets rows carry no G#, so on a multi-final day they stay unsettled
+rather than misgraded.
 
 If some games are missing (they weren't final at the last scrape), their
 rows are skipped and counted — run  python Scrapers/scrape_gamelogs.py
@@ -42,30 +40,22 @@ to pull the late finals, then grade again.
 
 After painting, prints a backtest-style day report: per head,
 n / actual vs stated rate / AUC / logloss / Brier against the day's base
-rate — plus the over-50%
-pick ledger. One day is a small sample: treat thin-head AUC as directional
-and use --all for the across-days accumulation of the identical cell
-surface.
-
-The summary above that report also scores the blue picks: how many of the
-light-blue rank-quality cells actually hit (with the purple ones — a
-quality pick that is ALSO a +EV bet — broken out as a subset), so the
-quality flag's daily hit rate is visible, not just its per-cell recolor.
+rate — plus the over-50% pick ledger. One day is a small sample: treat
+thin-head AUC as directional and use --all for the across-days
+accumulation of the identical cell surface.
 
 Usage:
     python Tools/4_grade_results.py                  # newest in Predictions/
     python Tools/4_grade_results.py path\\to\\file.xlsx
     python Tools/4_grade_results.py --all            # grade EVERY workbook
 
---all paints EVERY dated
-workbook in Predictions/ in place — the same recolor as the single-file
-mode, idempotent on already-graded books — then pools every day's cell
-surface into one cumulative backtest-style report (same per-head table +
-pick ledger), PLUS the pooled blue-pick and Bets tallies the old
-read-only accumulation could never see (a values-only load reads no
-fills; the painting pass reads every fill anyway). A workbook that can't
-be graded yet (today's slate before finals) is skipped with a note; one
-that is open in Excel still counts in the report but keeps its old paint.
+--all paints EVERY dated workbook in Predictions/ in place — the same
+recolor as the single-file mode, idempotent on already-graded books —
+then pools every day's cell surface into one cumulative backtest-style
+report (same per-head table + pick ledger) plus the pooled Bets tally.
+A workbook that can't be graded yet (today's slate before finals) is
+skipped with a note; one that is open in Excel still counts in the
+report but keeps its old paint.
 """
 import argparse
 import re
@@ -81,52 +71,20 @@ from openpyxl.styles import Font, PatternFill
 DATA_DIR = Path(__file__).resolve().parent.parent / "Data"
 PRED_DIR = Path(__file__).resolve().parent.parent / "Predictions"
 
-# The visual grammar: LIGHT color = pick pending, DARK fill + white bold =
-# pick HIT, pale-gray fill + gray italic = pick MISSED, yellow = a stat
-# occurred with no pick on it, white = nothing predicted, nothing happened.
-BLUE, GREEN, PURPLE = "00B0F0", "92D050", "B1A0C7"
-# earlier palettes, still recognized when repairing old workbooks
-OLD_BASES = {"9DC3E6": "00B0F0", "C6E0B4": "92D050",
-             "C6EFCE": "92D050", "CCC0DA": "B1A0C7"}
-# fill + text color; per-cell font weight follows the bold-over-50% rule
-# (a HIT is never bolded unless its stated probability was above 50%)
-OCCURRED = {
-    BLUE:   (PatternFill("solid", fgColor="0070C0"), "FFFFFF"),  # dark blue
-    GREEN:  (PatternFill("solid", fgColor="00B050"), "FFFFFF"),  # dark green
-    PURPLE: (PatternFill("solid", fgColor="7030A0"), "FFFFFF"),  # dark purple
-    None:   (PatternFill("solid", fgColor="FFFF00"), "000000"),  # yellow
-}
-# a pick that did NOT hit: grayed out (each fill keeps a faint machine-
-# readable hue so re-grading can restore the base color; to the eye they
-# all read "gray = miss"). Font is per-cell: probabilities over 50% stay
-# bold even in a miss.
-MISSED = {
-    BLUE:   PatternFill("solid", fgColor="B8CCE4"),
-    GREEN:  PatternFill("solid", fgColor="C4D79B"),
-    PURPLE: PatternFill("solid", fgColor="D2C8DE"),
-}
+# the one grading color: solid green = the stat occurred
+GREEN = "00B050"
+HIT_FILL = PatternFill("solid", fgColor=GREEN)
+NO_FILL = PatternFill(fill_type=None)
+# reddish headline tints from retired board layouts — stripped on sight
+RETIRED_TINTS = {"FBE3E9", "F5DBE2"}
 
-# Bets sheet: a WINNING bet paints its whole row solid dark green; a losing
-# or not-yet-settled row shows the light-green board. #00B050 is the same
-# dark green a HIT +EV cell gets on the prop grids — one "good outcome" hue.
-BETS_WIN = PatternFill("solid", fgColor="00B050")      # winning bet row
-BETS_BOARD = PatternFill("solid", fgColor="E7F3E2")    # the light-green board
-BET_PCT_COLS = {"Model %", "Mkt %", "Edge", "EV%"}     # bold over 50%
-# Bets 'Prop' label (odds.PROP_MARKET / STARTER_MARKET) -> how to settle it.
-# Batter labels map to the BAT_EVENTS check above; pitcher labels prefix a
-# "... o<line>" string and settle off the row's own Line column.
-BET_LABEL_TO_BATCOL = {
-    "1+ HR": "HR", "1+ hit": "Hit", "2+ hits": "2+ Hits",
-    "2+ total bases": "2+ TB", "run scored": "Run", "1+ RBI": "RBI",
-    "1+ walk": "BB", "stolen base": "SB", "1+ single": "Single",
-    "1+ double": "Double", "1+ batter K": "K", "2+ batter K": "2+ K",
-    "2+ H+R+RBI": "H+R+RBI 2+", "3+ H+R+RBI": "H+R+RBI 3+",
-}
-BET_PIT_STAT = {"pitcher strikeouts": "SO", "pitcher outs": "outs",
-                "pitcher hits allowed": "H", "pitcher walks": "BB",
-                "pitcher earned runs": "ER"}
+# Bets sheet: a WINNING bet paints its whole row the same solid green; a
+# losing or not-yet-settled row shows the light-green board it was
+# served with.
+BETS_WIN = PatternFill("solid", fgColor=GREEN)
+BETS_BOARD = PatternFill("solid", fgColor="E7F3E2")
 
-# batter columns -> did the event happen, from the summed line
+# batter columns -> did the event happen, from one box line
 BAT_EVENTS = {
     "HR":          lambda s: s["HR"] >= 1,
     "Hit":         lambda s: s["H"] >= 1,
@@ -160,6 +118,11 @@ RUNS_RE = re.compile(r"^Runs > (\d+(?:\.\d+)?)$")
 # per-team run lines on the Games sheet
 TEAM_RUNS_RE = re.compile(r"^(Away|Home) Runs > (\d+(?:\.\d+)?)$")
 
+# Bets 'pitcher <word> o<line>' -> the actual-stat key (prefix-matched
+# after stripping 'pitcher '; no label is a prefix of another)
+BET_PIT_STAT = {"strikeouts": "SO", "outs": "outs", "hits allowed": "H",
+                "walks": "BB", "earned runs": "ER"}
+
 
 def ip_to_outs(ip):
     """'5.2' -> 17 outs (MLB notation: .1/.2 = thirds)."""
@@ -175,14 +138,13 @@ def load_actuals(date):
     logs. The games lists keep mlb_games.csv row order (the schedule's
     game order), so a doubleheader's game 1 is entry 0 and game 2 entry 1.
 
-    The per-GAME dicts are the primary grading
-    source — workbooks with a G# column grade each row against ITS game's
-    box line. The day-summed dicts remain only as the legacy fallback for
-    pre-G# workbooks (where a DH day inflated hit rates: P(HR in game)
-    graded as 'did he homer today')."""
+    The per-GAME dicts are the primary grading source — rows with a G#
+    grade against their own game's box line. The day-summed dicts remain
+    only as the fallback for rows without one."""
     gb = pd.read_csv(DATA_DIR / "mlb_game_batting.csv", encoding="utf-8-sig",
                      low_memory=False)
-    gb = gb[gb["Date"] == date]
+    gb = gb[gb["Date"] == date].copy()
+    gb[BAT_SUM_COLS] = gb[BAT_SUM_COLS].apply(pd.to_numeric, errors="coerce")
     batters = {int(pid): grp[BAT_SUM_COLS].sum()
                for pid, grp in gb.groupby("PlayerId")}
     batters_game = {(int(pid), int(gpk)): grp[BAT_SUM_COLS].sum()
@@ -198,7 +160,7 @@ def load_actuals(date):
                 "BB": float(r["BB"]), "ER": float(r["ER"]),
                 "outs": ip_to_outs(r["IP"])}
         starters_game[(int(pid), int(gpk))] = line
-        starters.setdefault(int(pid), line)   # first start = legacy value
+        starters.setdefault(int(pid), line)   # first start = fallback value
 
     g = pd.read_csv(DATA_DIR / "mlb_games.csv", encoding="utf-8-sig")
     g = g[g["Date"] == date].dropna(subset=["AwayScore", "HomeScore"])
@@ -213,10 +175,10 @@ def load_actuals(date):
 
 
 def _row_stats(per_game, day_dict, games, pid, tag, gnum):
-    """Actual stats for one workbook row: with a Game tag and a
-    G# the row grades against its OWN game's line (None until that game is
-    final); without them (legacy workbook / single-game book) fall back to
-    the day sum. Returns None when unresolvable."""
+    """Actual stats for one workbook row: with a Game tag and a G# the
+    row grades against its OWN game's line (None until that game is
+    final); without them fall back to the day sum. Returns None when
+    unresolvable."""
     try:
         pid = int(pid)
     except (TypeError, ValueError):
@@ -230,102 +192,41 @@ def _row_stats(per_game, day_dict, games, pid, tag, gnum):
     return day_dict.get(pid)
 
 
-# graded-color -> the base to restore on re-grade (yellow was plain).
-# Covers tonight's palette AND the earlier one, so previously graded
-# workbooks repair cleanly.
-UNGRADE = {"0070C0": BLUE, "2E75B6": BLUE,          # hits (new, old)
-           "00B050": GREEN, "538135": GREEN, "548235": GREEN,
-           "7030A0": PURPLE,
-           "FFFF00": None, "CB21C3": None, "FFD966": None, "FFE699": None,
-           "B8CCE4": BLUE, "DCE6F1": BLUE, "D8E4BC": GREEN, "C4D79B": GREEN,
-           "D2C8DE": PURPLE,
-           "E8EDF3": BLUE, "EAF0E4": GREEN, "EDE8F3": PURPLE,
-           "9DC3E6": BLUE, "C6E0B4": GREEN,          # old bases
-           "C6EFCE": GREEN, "CCC0DA": PURPLE,
-           "F5DBE2": None}   # a legacy red column tint -> plain white
-# base fill + its tinted text color (None = plain cell, default font)
-BASE_FILL = {
-    BLUE:   (PatternFill("solid", fgColor=BLUE), "0B2E4F"),
-    GREEN:  (PatternFill("solid", fgColor=GREEN), "1E4620"),
-    PURPLE: (PatternFill("solid", fgColor=PURPLE), "3B2151"),
-    None:   (PatternFill(fill_type=None), None),
-}
-
-
 def _ungrade(ws):
-    """Revert every occurred-color cell to its base color so grading is
-    idempotent (and repairs workbooks graded by the old side-of-the-line
-    logic)."""
+    """Strip every green graded cell back to the plain board (regular
+    weight, default color), and drop any retired reddish headline tint,
+    so grading is idempotent and old books repair cleanly."""
     for row in ws.iter_rows(min_row=2):
         for cell in row:
             try:
                 rgb = cell.fill.start_color.rgb
             except AttributeError:
                 continue
-            if isinstance(rgb, str) and rgb[-6:].upper() in UNGRADE:
-                base = UNGRADE[rgb[-6:].upper()]
-                fill, color = BASE_FILL[base]
-                cell.fill = fill
-                # probabilities follow the bold-over-50% rule everywhere;
-                # text cells on a pick fill (e.g. Winner) stay bold
-                num = isinstance(cell.value, (int, float))
-                bold = (cell.value > 0.5) if num else (base is not None)
-                cell.font = (Font(bold=bold, color=color) if color
-                             else Font(bold=bold))
+            if not isinstance(rgb, str):
+                continue
+            tail = rgb[-6:].upper()
+            if tail == GREEN:
+                cell.fill = NO_FILL
+                cell.font = Font()
+            elif tail in RETIRED_TINTS:
+                cell.fill = NO_FILL
 
 
-def _base_color(cell):
-    """The pick color a cell was painted with, or None for plain."""
-    try:
-        rgb = cell.fill.start_color.rgb
-    except AttributeError:
-        return None
-    if not isinstance(rgb, str):
-        return None
-    tail = rgb[-6:].upper()
-    tail = OLD_BASES.get(tail, tail)
-    return tail if tail in (BLUE, GREEN, PURPLE) else None
-
-
-def _mark(cell, occurred, tally=None):
-    """HIT -> the dark fill; MISS on a pick -> grayed out; MISS on a
-    plain cell -> untouched. Font weight follows the bold-over-50% rule
-    in EVERY case (hit or miss); text cells (e.g. Winner) stay bold on
-    fills for contrast.
-
-    If `tally` is given, every blue rank-quality pick is counted into it
-    (blue_picks / blue_hit), with the purple subset — quality picks that
-    are ALSO +EV bets — tracked separately (purple_picks / purple_hit) so
-    the blue-pick hit rate can be reported after grading. The base color is
-    read BEFORE repainting, so re-grading a workbook counts the same picks
-    it counted the first time."""
-    base = _base_color(cell)
-    if tally is not None and base in (BLUE, PURPLE):
-        tally["blue_picks"] = tally.get("blue_picks", 0) + 1
-        tally["blue_hit"] = tally.get("blue_hit", 0) + bool(occurred)
-        if base == PURPLE:
-            tally["purple_picks"] = tally.get("purple_picks", 0) + 1
-            tally["purple_hit"] = tally.get("purple_hit", 0) + bool(occurred)
-    num = isinstance(cell.value, (int, float))
-    bold = bool(cell.value > 0.5) if num else True
-    if occurred:
-        fill, color = OCCURRED[base]
-        cell.fill = fill
-        cell.font = Font(bold=bold, color=color)
+def _mark(cell, occurred):
+    """Paint one gradeable cell's fill green if its event occurred;
+    leave it untouched otherwise. The font is never changed — _ungrade
+    already reset any previously graded cell to the plain board, so
+    text stays regular black everywhere."""
+    if not occurred:
         return
-    if base is None:
-        return
-    cell.fill = MISSED[base]
-    cell.font = Font(italic=True, color="7F7F7F", bold=num and bold)
-
-
+    cell.fill = HIT_FILL
 
 
 def _name_pid(ws):
-    """{Name: pid} and {(Game, Name): pid} from a graded prop sheet, so a
-    Bets row (which carries the player NAME, not the ID) can be settled off
-    the same PlayerId-keyed actuals the prop grids use. (Game, Name) wins
-    when present; plain Name is the single-game fallback."""
+    """{Name: pid} and {(Game, Name): pid} from a prop sheet, so a Bets
+    row (which carries the player NAME, not the ID) can be settled off
+    the same PlayerId-keyed actuals the prop grids use. (Game, Name)
+    wins when present; plain Name is the single-game fallback."""
     hidx = {str(c.value): j for j, c in enumerate(ws[1], start=1)}
     byname, bygame = {}, {}
     if "Name" not in hidx or "ID" not in hidx:
@@ -342,12 +243,38 @@ def _name_pid(ws):
     return byname, bygame
 
 
-def _settle_bet(row, batters, starters, games, bat_pid, pit_pid,
-                bg=None, sg=None):
+def _bat_actual(s, prop):
+    """The count a Bets batter-prop label prices, from one box line.
+    Keyword order matters: 'H+R+RBI' before 'RBI', the specific hit
+    types before 'hit'."""
+    if "H+R+RBI" in prop:
+        return s["H"] + s["R"] + s["RBI"]
+    if "total bases" in prop:
+        return s["TB"]
+    if "HR" in prop:
+        return s["HR"]
+    if "RBI" in prop:
+        return s["RBI"]
+    if "single" in prop:
+        return s["H"] - s["2B"] - s["3B"] - s["HR"]
+    if "double" in prop:
+        return s["2B"]
+    if "hit" in prop:
+        return s["H"]
+    if "run" in prop:
+        return s["R"]
+    if "walk" in prop:
+        return s["BB"]
+    if "stolen base" in prop:
+        return s["SB"]
+    return None
+
+
+def _settle_bet(row, batters, starters, games, bat_pid, pit_pid, bg, sg):
     """Did this Bets row win? True / False / None (can't settle yet: no
-    final, unmatched player, or a doubleheader day we can't pin to one game
-    — Bets rows carry no G#, so any multi-final matchup is unsettleable
-    rather than misgraded against a day sum). `row` is
+    final, unmatched player, or a doubleheader day we can't pin to one
+    game — Bets rows carry no G#, so any multi-final matchup is
+    unsettleable rather than misgraded against a day sum). `row` is
     {header: value}; `bat_pid` / `pit_pid` resolve a (game, name) to a
     PlayerId."""
     game, prop = str(row.get("Game", "")), str(row.get("Prop", ""))
@@ -372,47 +299,50 @@ def _settle_bet(row, batters, starters, games, bat_pid, pit_pid,
             return None
         occ = f["total"] > ln
         return occ if side == "Over" else not occ
-    if prop in BET_LABEL_TO_BATCOL:
-        pid = bat_pid(game, row.get("Player"))
-        f = _one_final()
-        if pid is None or f is None:
-            return None
-        s = (bg or {}).get((int(pid), f["gamepk"]))
-        if s is None:
-            s = batters.get(pid)
-        if s is None:
-            return None
-        occ = bool(BAT_EVENTS[BET_LABEL_TO_BATCOL[prop]](s))
-        return occ if side == "Over" else not occ
-    for lbl, stat in BET_PIT_STAT.items():      # "pitcher strikeouts o6.5"
-        if prop.startswith(lbl):
-            pid = pit_pid(game, row.get("Player"))
-            f = _one_final()
-            ln = _line()
-            if pid is None or f is None or ln is None:
-                return None
-            a = (sg or {}).get((int(pid), f["gamepk"]))
-            if a is None:
-                a = starters.get(pid)
-            if a is None:
-                return None
-            occ = a[stat] > ln
-            return occ if side == "Over" else not occ
-    return None
+    if prop.startswith("pitcher "):             # "pitcher strikeouts o6.5"
+        rest = prop[len("pitcher "):]
+        for lbl, stat in BET_PIT_STAT.items():
+            if rest.startswith(lbl):
+                pid = pit_pid(game, row.get("Player"))
+                f, ln = _one_final(), _line()
+                if pid is None or f is None or ln is None:
+                    return None
+                a = (sg or {}).get((int(pid), f["gamepk"]))
+                if a is None:
+                    a = starters.get(int(pid))
+                if a is None:
+                    return None
+                occ = a[stat] > ln
+                return occ if side == "Over" else not occ
+        return None
+    pid = bat_pid(game, row.get("Player"))      # batter prop
+    f, ln = _one_final(), _line()
+    if pid is None or f is None or ln is None:
+        return None
+    s = (bg or {}).get((int(pid), f["gamepk"]))
+    if s is None:
+        s = batters.get(int(pid))
+    if s is None:
+        return None
+    actual = _bat_actual(s, prop)
+    if actual is None:
+        return None
+    occ = actual > ln
+    return occ if side == "Over" else not occ
 
 
-def _grade_bets(wb, batters, starters, games, stats, bg=None, sg=None):
-    """Paint every WINNING bet row solid #00B050; reset the rest to the
+def _grade_bets(wb, batters, starters, games, stats, bg, sg):
+    """Paint every WINNING bet row solid green; reset the rest to the
     light board first, so re-running is idempotent (the Bets sheet is
-    skipped by _ungrade for exactly this reason). No-op on the 'no bets'
-    note sheet (it has no Game/Prop/Side columns)."""
+    skipped by _ungrade for exactly this reason). No-op rows without a
+    Prop (the 'no captured odds' note) are left alone."""
     if "Bets" not in wb.sheetnames:
         return
     ws = wb["Bets"]
     headers = [str(c.value) for c in ws[1]]
     hidx = {h: j for j, h in enumerate(headers, start=1)}
     if not {"Game", "Prop", "Side"} <= set(hidx):
-        return                                  # the "No bets to show." note
+        return
     bp_name, bp_game = (_name_pid(wb["Batter Props"])
                         if "Batter Props" in wb.sheetnames else ({}, {}))
     pp_name, pp_game = (_name_pid(wb["Pitching Props"])
@@ -428,24 +358,21 @@ def _grade_bets(wb, batters, starters, games, stats, bg=None, sg=None):
 
     ncol = ws.max_column
     for i in range(2, ws.max_row + 1):
-        # reset to board (undo any earlier win paint) — bold-over-50% on the
-        # percent columns, matching the workbook style
-        for j, h in enumerate(headers, start=1):
+        row = {h: ws.cell(row=i, column=hidx[h]).value for h in headers}
+        if row.get("Prop") in (None, ""):
+            continue                            # the "no captured odds" note
+        # reset to board (undo any earlier win paint)
+        for j in range(1, len(headers) + 1):
             c = ws.cell(row=i, column=j)
             c.fill = BETS_BOARD
-            v = c.value
-            c.font = Font(bold=(h in BET_PCT_COLS
-                                and isinstance(v, (int, float)) and v > 0.5))
-        row = {h: ws.cell(row=i, column=hidx[h]).value for h in headers}
+            c.font = Font()
         won = _settle_bet(row, batters, starters, games, bat_pid, pit_pid,
-                          bg=bg, sg=sg)
+                          bg, sg)
         stats["bets"] = stats.get("bets", 0) + 1
         if won:
             stats["bets_won"] = stats.get("bets_won", 0) + 1
             for j in range(1, ncol + 1):
-                c = ws.cell(row=i, column=j)
-                c.fill = BETS_WIN
-                c.font = Font(bold=True, color="FFFFFF")
+                ws.cell(row=i, column=j).fill = BETS_WIN
 
 
 class GradeError(RuntimeError):
@@ -471,16 +398,14 @@ def grade(path):
         if ws.title == "Bets":
             continue          # graded by _grade_bets (whole-row), not _ungrade
         _ungrade(ws)
-    stats = {"cells": 0, "hit": 0, "missing_rows": 0,
-             "blue_picks": 0, "blue_hit": 0,
-             "purple_picks": 0, "purple_hit": 0}
+    stats = {"cells": 0, "hit": 0, "missing_rows": 0}
     rows = []                 # (sheet, head, stated_p, occurred) per cell
 
     def headers_of(ws):
         return {str(c.value): j for j, c in enumerate(ws[1], start=1)}
 
     def _tag_gnum(ws, hidx, i):
-        """(Game tag, G#) of a grid row, or (None, None) on a legacy book."""
+        """(Game tag, G#) of a grid row, or (None, None) without them."""
         g_j, gn_j = hidx.get("Game"), hidx.get("G#")
         if g_j is None or gn_j is None:
             return None, None
@@ -508,7 +433,7 @@ def grade(path):
                 cell = ws.cell(row=i, column=j)
                 if isinstance(cell.value, (int, float)) and 0 <= cell.value <= 1:
                     rows.append(("Batter Props", h, float(cell.value), occ))
-                _mark(cell, occ, stats)
+                _mark(cell, occ)
 
     if "Pitching Props" in wb.sheetnames:
         ws = wb["Pitching Props"]
@@ -529,7 +454,7 @@ def grade(path):
                 cell = ws.cell(row=i, column=j)
                 if isinstance(cell.value, (int, float)) and 0 <= cell.value <= 1:
                     rows.append(("Pitching Props", h, float(cell.value), occ))
-                _mark(cell, occ, stats)
+                _mark(cell, occ)
 
     if "Games" in wb.sheetnames:
         ws = wb["Games"]
@@ -542,10 +467,10 @@ def grade(path):
                      for h, j in hidx.items() if TEAM_RUNS_RE.match(h)]
         # Doubleheaders: the same "AWY@HOM" tag appears once per game, in
         # start-time order, and the finals list keeps the schedule's game
-        # order — so match the sheet's i-th row for a tag to the i-th final.
-        # If the finals don't yet cover every predicted game of the tag
-        # (game 2 not final at the last scrape), skip the tag's rows rather
-        # than grade two predictions against one game.
+        # order — so match the sheet's i-th row for a tag to the i-th
+        # final. If the finals don't yet cover every predicted game of
+        # the tag (game 2 not final at the last scrape), skip the tag's
+        # rows rather than grade two predictions against one game.
         need = Counter(str(ws.cell(row=i, column=hidx["Game"]).value)
                        for i in range(2, ws.max_row + 1))
         seen = Counter()
@@ -563,13 +488,13 @@ def grade(path):
                 stats["cells"] += 1
                 occ = str(cell.value) == g["winner"]
                 stats["hit"] += occ
-                _mark(cell, occ, stats)
+                _mark(cell, occ)
                 # Win Prob belongs to the named winner -> same outcome
                 if "Win Prob" in hidx:
                     wp = ws.cell(row=i, column=hidx["Win Prob"])
                     if isinstance(wp.value, (int, float)) and 0 <= wp.value <= 1:
                         rows.append(("Games", "Winner", float(wp.value), occ))
-                    _mark(wp, occ, stats)
+                    _mark(wp, occ)
             for h, j, line in run_cols:
                 stats["cells"] += 1
                 occ = bool(g["total"] > line)
@@ -577,7 +502,7 @@ def grade(path):
                 cell = ws.cell(row=i, column=j)
                 if isinstance(cell.value, (int, float)) and 0 <= cell.value <= 1:
                     rows.append(("Games", h, float(cell.value), occ))
-                _mark(cell, occ, stats)
+                _mark(cell, occ)
             for h, j, side, line in team_cols:
                 stats["cells"] += 1
                 occ = bool(g[side] > line)
@@ -585,9 +510,9 @@ def grade(path):
                 cell = ws.cell(row=i, column=j)
                 if isinstance(cell.value, (int, float)) and 0 <= cell.value <= 1:
                     rows.append(("Games", h, float(cell.value), occ))
-                _mark(cell, occ, stats)
+                _mark(cell, occ)
 
-    _grade_bets(wb, batters, starters, games, stats, bg=bg, sg=sg)
+    _grade_bets(wb, batters, starters, games, stats, bg, sg)
 
     # everything above is computed either way; a failed save only means the
     # paint didn't land (file open in Excel) — the stats/rows stay usable,
@@ -616,10 +541,10 @@ def day_report(rows, title="Day report: per-head, backtest-style"):
 
     Per head (in board order, grouped by sheet): graded cells, the
     actual occurrence rate vs the stated average (gap = actual - stated),
-    AUC, and logloss/Brier next to what a
-    constant base-rate forecast scores. Then the over-50% pick
-    ledger. Mean columns have no yes/no event and never enter.
-    Single-day n is small — thin heads' AUC is directional."""
+    AUC, and logloss/Brier next to what a constant base-rate forecast
+    scores. Then the over-50% pick ledger. Mean columns have no yes/no
+    event and never enter. Single-day n is small — thin heads' AUC is
+    directional."""
     if not rows:
         return
     eps = 1e-6
@@ -681,7 +606,7 @@ def main():
                     help="grade (paint) EVERY dated workbook in "
                          "Predictions/ in place, then pool all days into "
                          "one cumulative backtest-style report — incl. the "
-                         "pooled blue-pick and Bets tallies")
+                         "pooled Bets tally")
     args = ap.parse_args()
 
     if args.all:
@@ -701,8 +626,6 @@ def main():
             for k, v in s.items():
                 tot[k] = tot.get(k, 0) + v
             line = f"  {p.name}: {s['cells']:,} cells, {s['hit']:,} occurred"
-            if s.get("blue_picks"):
-                line += f"; blue {s['blue_hit']}/{s['blue_picks']}"
             if s.get("bets"):
                 line += f"; bets won {s.get('bets_won', 0)}/{s['bets']}"
             if s.get("missing_rows"):
@@ -716,15 +639,6 @@ def main():
                      "scores.")
         print(f"\ngraded {days} workbook(s): {tot.get('cells', 0):,} cells "
               f"checked, {tot.get('hit', 0):,} stats occurred")
-        if tot.get("blue_picks"):
-            bp, bh = tot["blue_picks"], tot["blue_hit"]
-            pp, ph = tot.get("purple_picks", 0), tot.get("purple_hit", 0)
-            msg = (f"Blue quality picks (all days): {bh} of {bp} hit "
-                   f"({bh / bp:.1%})")
-            if pp:                     # split out the also-+EV (purple) subset
-                msg += (f"  [blue-only {bh - ph} of {bp - pp}, "
-                        f"+EV purple {ph} of {pp}]")
-            print(msg)
         if tot.get("bets"):
             print(f"Bets (all days): {tot.get('bets_won', 0)} of "
                   f"{tot['bets']} bet(s) won")
@@ -753,16 +667,9 @@ def main():
         sys.exit(f"{path} is open in Excel (it holds the file lock) — "
                  f"close it there, then run this again.")
     print(f"graded {path}")
+    print("")
     print(f"  {date}: {s['cells']:,} cells checked, {s['hit']:,} stats "
-          f"occurred (now yellow / dark blue / dark green / dark purple)")
-    if s.get("blue_picks"):
-        bp, bh = s["blue_picks"], s["blue_hit"]
-        pp, ph = s.get("purple_picks", 0), s.get("purple_hit", 0)
-        msg = f"  Blue quality picks: {bh} of {bp} hit ({bh / bp:.1%})"
-        if pp:                         # split out the also-+EV (purple) subset
-            msg += (f"  [blue-only {bh - ph} of {bp - pp}, "
-                    f"+EV purple {ph} of {pp}]")
-        print(msg)
+          f"occurred (now solid green)")
     if s.get("bets"):
         print(f"  Bets sheet: {s.get('bets_won', 0)} of {s['bets']} bet(s) "
               f"won -> row highlighted solid green")
