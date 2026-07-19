@@ -33,6 +33,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import features as F     # noqa: E402
 import sim               # noqa: E402
 import odds as O         # noqa: E402
+import team_context as TC  # noqa: E402
+
+# canonical context-feature names for the residual heads; heads.py
+# aliases this list, so train-time and serve-time can never diverge
+HEAD_CTX = ["elo", "rest", "b2b", "travel_km", "tz_shift",
+            "day_after_night", "w10", "rf10", "ra10", "pyth", "gp",
+            "pen_era", "pen_np3", "st_outs", "bsr_luck"]
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "Data"
@@ -191,6 +198,27 @@ class Predictor:
         # map per market FAMILY; fit by evaluate.py --fit-calibrators)
         cal_path = ART / "output_calibrators.joblib"
         self.calib = joblib.load(cal_path) if cal_path.exists() else {}
+        # residual heads (heads.py --train): per-family shallow-GBM
+        # logit corrections applied on top of the Platt output. Only
+        # heads that kept trees load; to serve Platt-only, move
+        # residual_heads.joblib aside.
+        self.heads = {}
+        hp = ART / "residual_heads.joblib"
+        if hp.exists():
+            import lightgbm as lgb
+            for fam, h in joblib.load(hp).items():
+                if h.get("best_iter", 0) > 0:
+                    self.heads[fam] = dict(
+                        bst=lgb.Booster(model_str=h["booster_str"]),
+                        features=h["features"],
+                        best_iter=int(h["best_iter"]))
+        self._defense = {}
+        dp = F.STORES / "defense_team.parquet"
+        if dp.exists():
+            dt_ = pd.read_parquet(dp)
+            self._defense = {
+                (int(y), str(t)): (o, fr) for y, t, o, fr in zip(
+                    dt_.Year, dt_.Team, dt_.def_oaa, dt_.FrameRV_pt)}
         tick("computing bullpen availability...")
         self._relief_exit = self._reliever_exit_table()
         tick("ready")
@@ -225,15 +253,21 @@ class Predictor:
         """Available relievers with usage weights: roster bullpen minus
         arms that threw on both of the last two days (or 25+ pitches
         yesterday)."""
-        gp = self.stores.raw["gp"]
+        cache = getattr(self, "_gp_team_cache", None)
+        if cache is None:
+            gp_all = self.stores.raw["gp"]
+            cache = {t: sub.sort_values("Date")
+                     for t, sub in gp_all.groupby("Team")}
+            self._gp_team_cache = cache
+        gp = cache.get(team_abbrev,
+                       self.stores.raw["gp"].iloc[0:0])
         ros = self.stores.raw["rosters"]
         full = self._full_of.get(team_abbrev)
         pen_ids = ros.loc[(ros.Team == full)
                           & (ros.Position == "Bullpen"), "PlayerId"]
         pen_ids = [int(p) for p in pen_ids]
         d = pd.Timestamp(date)
-        recent = gp[(gp.Team == team_abbrev)
-                    & (gp.Date >= d - pd.Timedelta(days=30))
+        recent = gp[(gp.Date >= d - pd.Timedelta(days=30))
                     & (gp.Date < d)
                     & (pd.to_numeric(gp.GS, errors="coerce") == 0)]
         y1 = recent[recent.Date == d - pd.Timedelta(days=1)]
@@ -408,11 +442,25 @@ class Predictor:
         return prep, meta
 
     def _rest(self, ppid, date):
-        gp = self.stores.raw["gp"]
-        rows = gp[(gp.PlayerId == ppid) & (gp.Date < date)]
-        if rows.empty:
+        # per-player sorted date arrays, built once: the same strictly-
+        # before lookup without a 2M-row scan per call
+        cache = getattr(self, "_pid_dates", None)
+        if cache is None:
+            gp = self.stores.raw["gp"]
+            cache = {int(p): np.sort(g["Date"].values)
+                     for p, g in gp.groupby("PlayerId")}
+            self._pid_dates = cache
+        try:
+            arr = cache.get(int(ppid))
+        except (TypeError, ValueError):
+            arr = None
+        if arr is None or arr.size == 0:
             return np.nan
-        return float((date - rows.Date.max()).days)
+        d = pd.Timestamp(date)
+        i = int(np.searchsorted(arr, np.datetime64(d), side="left"))
+        if i == 0:
+            return np.nan
+        return float((d - pd.Timestamp(arr[i - 1])).days)
 
     def _hazard_grid(self, ppid, date, season):
         leash = self.fstores.get("panel_leash")
@@ -429,6 +477,39 @@ class Predictor:
                   if lz is not None else np.nan)
         ppb = (np_avg / bf_avg) if np_avg and bf_avg and bf_avg > 0 \
             else 3.9
+        # start-length dispersion from the leash panel's squared sums
+        # (decay factors cancel in the ratio)
+        outs_sd = np.nan
+        if (lz is not None and "outs2_sum_d" in lz.index
+                and starts == starts and starts >= 5):
+            mu_o = float(lz["outs_sum_d"]) / max(starts, 1e-9)
+            var_o = (float(lz["outs2_sum_d"]) / max(starts, 1e-9)
+                     - mu_o ** 2)
+            outs_sd = float(np.sqrt(max(var_o, 0.0)))
+        # previous-start regime (ramp-up / opener-short) + IL recency
+        d = pd.Timestamp(date)
+        gp = self.stores.raw["gp"]
+        prev = gp[(gp.PlayerId == ppid)
+                  & (pd.to_numeric(gp.GS, errors="coerce") == 1)
+                  & (gp.Date < d)]
+        gap_days, ramp, prev_short = np.nan, 0.0, 0.0
+        if len(prev):
+            last = prev.sort_values("Date").iloc[-1]
+            gap_days = float((d - last.Date).days)
+            np_last = pd.to_numeric(last.NP, errors="coerce")
+            if pd.notna(np_last):
+                ramp = float(np_last < F.RAMP_NP)
+            ip_last = pd.to_numeric(last.IP, errors="coerce")
+            if pd.notna(ip_last):
+                outs_last = int(ip_last) * 3 + round((ip_last % 1) * 10)
+                prev_short = float(outs_last <= F.SHORT_START_OUTS)
+        il_ret30 = 0.0
+        il = self.fstores.get("il_stints")
+        if il is not None:
+            mine = il[(il.PlayerId == ppid) & (il.Date <= d)]
+            if len(mine):
+                act = mine.sort_values("Date").iloc[-1]["act_date"]
+                il_ret30 = float((d - act).days <= 30)
         bf = np.arange(41)
         runs = np.arange(11)
         B, R = np.meshgrid(bf, runs, indexing="ij")
@@ -440,7 +521,9 @@ class Predictor:
             br_so_far=(B * 0.30).ravel(), runs_so_far=R.ravel(),
             rest_p=self._rest(ppid, pd.Timestamp(date)),
             leash_np=np_avg, leash_bf=bf_avg, leash_starts=starts,
-            season_idx=season - 2015))
+            season_idx=season - 2015,
+            gap_days=gap_days, ramp=ramp, prev_short=prev_short,
+            il_ret30=il_ret30, outs_sd=outs_sd))
         Xh = rows[self.hz["features"]].astype(np.float32)
         p = self.hz["iso"].predict(
             self.hz["model"].predict_proba(Xh)[:, 1])
@@ -454,16 +537,24 @@ class Predictor:
         spd = dict(zip(
             sprint.loc[sprint.Year == yr, "PlayerId"],
             sprint.loc[sprint.Year == yr, "SprintSpeed"]))
-        ps = pd.read_csv(DATA / "mlb_pitching_stats.csv",
-                         encoding="utf-8-sig",
-                         usecols=["Year", "PlayerId", "SB", "CS", "PK",
-                                  "TBF"])
-        ps = ps[pd.to_numeric(ps.Year, errors="coerce") == season - 1]
-        for c in ("SB", "CS", "PK", "TBF"):
-            ps[c] = pd.to_numeric(ps[c], errors="coerce").fillna(0)
-        sbr = dict(zip(ps.PlayerId, ps.SB / ps.TBF.clip(lower=50)))
-        csr = dict(zip(ps.PlayerId, (ps.CS + ps.PK)
-                       / (ps.SB + ps.CS + ps.PK).clip(lower=3)))
+        sb_cache = getattr(self, "_sb_rate_cache", None)
+        if sb_cache is None:
+            sb_cache = {}
+            self._sb_rate_cache = sb_cache
+        if season not in sb_cache:
+            ps = pd.read_csv(DATA / "mlb_pitching_stats.csv",
+                             encoding="utf-8-sig",
+                             usecols=["Year", "PlayerId", "SB", "CS",
+                                      "PK", "TBF"])
+            ps = ps[pd.to_numeric(ps.Year, errors="coerce")
+                    == season - 1]
+            for c in ("SB", "CS", "PK", "TBF"):
+                ps[c] = pd.to_numeric(ps[c], errors="coerce").fillna(0)
+            sb_cache[season] = (
+                dict(zip(ps.PlayerId, ps.SB / ps.TBF.clip(lower=50))),
+                dict(zip(ps.PlayerId, (ps.CS + ps.PK)
+                         / (ps.SB + ps.CS + ps.PK).clip(lower=3))))
+        sbr, csr = sb_cache[season]
         deft = self.fstores["defense_team"]
         drow = {t: deft[(deft.Team == t) & (deft.Year == season)]
                 for t in (away, home)}
@@ -518,6 +609,14 @@ class Predictor:
 
     def predict_slate(self, specs, n_sims=N_SIMS, progress=None):
         tick = progress or (lambda m: None)
+        hctx = None
+        if self.heads:
+            tick("building slate context for residual heads...")
+            try:
+                hctx = TC.slate_context(specs)
+            except Exception as e:              # noqa: BLE001
+                print(f"heads: slate context unavailable ({e}); "
+                      f"serving Platt-only", flush=True)
         out = []
         for gi, spec in enumerate(specs):
             tick(f"game {gi + 1}/{len(specs)}: preparing...")
@@ -531,6 +630,10 @@ class Predictor:
             res["meta"] = meta
             res["spec"] = spec
             res["calib"] = self.calib
+            if hctx is not None:
+                res["heads"] = self.heads
+                res["hctx"] = hctx[gi]
+                res["hdef"] = self._defense
             out.append(res)
         return out
 
@@ -578,6 +681,98 @@ def _dec(american):
     if not np.isfinite(a) or a == 0:
         return None
     return 1 + (a / 100.0 if a > 0 else 100.0 / -a)
+
+
+def _line_of(market):
+    """Numeric line of a 'X > n.5'-style market name (NaN otherwise) —
+    shared with heads.py so train and serve tokenize identically."""
+    try:
+        return float(str(market).split(">")[-1])
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def _apply_heads(heads, ctx, deft, season, bat_rows, pit_rows, grow,
+                 away, home):
+    """Residual-head corrections, applied AFTER the family calibrators:
+    per market family, a shallow-GBM logit adjustment from team context
+    (heads.py --train). Feature construction must mirror
+    heads._features exactly — the saved feature list orders the frame,
+    so a missing column fails loudly rather than silently misaligning.
+    "ml" is never adjusted here (min-rows skipped at train time; its
+    trained market string "home ML" has no workbook column)."""
+    jobs = {}
+
+    def add(cont, col, fam, home_flag):
+        h = heads.get(fam)
+        p = cont.get(col)
+        if h is None or p is None:
+            return
+        jobs.setdefault(fam, []).append((cont, col, home_flag, float(p)))
+
+    for br in bat_rows:
+        hf = int(br["Team"] == home)
+        for col, fam in COL_FAM.items():
+            add(br, col, fam, hf)
+    for pr_ in pit_rows:
+        hf = int(pr_["Team"] == home)
+        for col in list(pr_):
+            for pref, fam in PIT_FAM.items():
+                if str(col).startswith(pref):
+                    add(pr_, col, fam, hf)
+    for x in TEAM_TOTAL_LINES:
+        add(grow, f"Away Runs > {x}", "tt", 0)
+        add(grow, f"Home Runs > {x}", "tt", 1)
+    for x in TOTAL_LINES:
+        add(grow, f"Runs > {x}", "tot", 1)
+
+    for fam, items in jobs.items():
+        h = heads[fam]
+        feats = []
+        for _cont, col, hf, p in items:
+            own, opp = ("home", "away") if hf else ("away", "home")
+            own_t, opp_t = (home, away) if hf else (away, home)
+            f = {}
+            for c in HEAD_CTX:
+                f[f"own_{c}"] = ctx.get(f"{own}_{c}", np.nan)
+                f[f"opp_{c}"] = ctx.get(f"{opp}_{c}", np.nan)
+            f["elo_diff"] = ctx.get("elo_diff", np.nan)
+            f["own_def_oaa"], f["own_frame"] = deft.get(
+                (season, own_t), (np.nan, np.nan))
+            f["opp_def_oaa"], f["opp_frame"] = deft.get(
+                (season, opp_t), (np.nan, np.nan))
+            f["home"] = float(hf)
+            f["line"] = _line_of(col)
+            f["p_dist"] = abs(p - 0.5)
+            feats.append(f)
+        X = pd.DataFrame(feats)[h["features"]]
+        raw = h["bst"].predict(X, num_iteration=h["best_iter"],
+                               raw_score=True)
+        for (cont, col, hf, p), r in zip(items, raw):
+            pc = min(max(p, 1e-6), 1 - 1e-6)
+            z = np.log(pc / (1 - pc)) + float(r)
+            cont[col] = float(np.clip(1.0 / (1.0 + np.exp(-z)),
+                                      1e-6, 1 - 1e-6))
+
+    # cross-line coherence guard: within one row's ladder (same
+    # container, family, side) the workbook authors columns in
+    # ascending line/count order, so probabilities must be
+    # non-increasing — per-line head adjustments may not cross them
+    # (the family calibrators are shared monotone maps for exactly
+    # this reason; the heads must not undo that invariant)
+    ladders = {}
+    for fam, items in jobs.items():
+        for cont, col, hf, _p in items:
+            ladders.setdefault((id(cont), fam, hf),
+                               []).append((cont, col))
+    for lad in ladders.values():
+        lo = None
+        for cont, col in lad:
+            v = cont[col]
+            if lo is not None and v > lo:
+                v = lo
+                cont[col] = v
+            lo = v
 
 
 def game_frame(res):
@@ -694,6 +889,10 @@ def game_frame(res):
     grow["Lineup HRs"] = round(lineup_hr, 2)
     grow["_home_wp"] = home_wp
     grow["_nrfi"] = float((res["runs_i1"].sum(axis=1) == 0).mean())
+    if res.get("heads") and res.get("hctx") is not None:
+        _apply_heads(res["heads"], res["hctx"], res.get("hdef") or {},
+                     int(meta["season"]), bat_rows, pit_rows, grow,
+                     away, home)
     return dict(bat=bat_rows, pit=pit_rows, game=grow)
 
 

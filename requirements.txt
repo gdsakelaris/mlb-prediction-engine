@@ -17,3 +17,6 @@ openpyxl==3.1.5
 scikit-learn==1.7.1
 joblib==1.5.2
 Pillow==11.3.0
+lightgbm==4.6.0
+xgboost==3.0.5
+cupy-cuda12x==13.6.0

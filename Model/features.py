@@ -81,6 +81,36 @@ K_PARK = 2000            # PA of shrinkage toward 1 for park factors
 K_UMP = 1500             # PA of shrinkage toward 1 for ump factors
 MIN_MLB_PA_FOR_OWN = 400  # below this decayed PA, MiLB prior blends in
 
+# mechanical-consistency / regime / matchup-profile knobs
+PULL_HL = 365.0          # pull tendency is stable; slow half-life
+HRPT_HL = 730.0          # HR-by-pitch-class profile: two-year half-life
+CONSIST_MIN_FB = 100     # tracked fastballs before velo SD means much
+CONSIST_MIN_RP = 100     # release points before scatter means much
+STRETCH_MIN_N = 30       # per-split fastballs before the delta counts
+RELSEP_MIN_N = 50        # per-class release points before separation
+PULL_DEG = 15.0          # spray beyond this = pulled (Savant convention)
+PULL_K = 100.0           # air balls of shrinkage for pull share
+HRPT_K = 15.0            # HRs of shrinkage for the HR pitch-class mix
+RAMP_NP = 60             # last start under 60 pitches = ramping up
+SHORT_START_OUTS = 12    # <= 12 outs = short start (opener / quick hook)
+CARRY_CF_W = 0.7         # CF wind helps both pull sides at this weight
+CARRY_OPP_W = 0.2        # opposite-field wind still helps a little
+PITCH_CLASS = {          # arsenal codes -> fast / breaking / offspeed
+    "FF": "fast", "SI": "fast", "FC": "fast",
+    "SL": "brk", "ST": "brk", "CU": "brk", "KC": "brk", "SV": "brk",
+    "KN": "brk", "CS": "brk", "SC": "brk",
+    "CH": "off", "FS": "off", "FO": "off", "EP": "off"}
+
+# wind direction -> (field it blows toward/from, out=+1/in=-1); both the
+# boxscore casing ("Out To CF") and the live-slate casing ("Out To Cf")
+_WIND_FIELD, _WIND_SIGN = {}, {}
+for _d, _f, _s in (("Out To LF", "L", 1.0), ("In From LF", "L", -1.0),
+                   ("Out To CF", "C", 1.0), ("In From CF", "C", -1.0),
+                   ("Out To RF", "R", 1.0), ("In From RF", "R", -1.0)):
+    for _k in (_d, _d.title()):
+        _WIND_FIELD[_k] = _f
+        _WIND_SIGN[_k] = _s
+
 CLASSES = ["K", "BB", "HBP", "1B", "2B", "3B", "HR", "IPO"]
 EVENT_TO_CLASS = {
     "strikeout": "K", "strikeout_double_play": "K",
@@ -285,11 +315,13 @@ def decayed_panel(daily, entity_cols, stat_cols, hl=DECAY_HL):
     tp = (df["Date"] - t0).dt.days.astype(float)
     up = np.power(2.0, tp / hl)             # d^-t' with d = 2^(-1/hl)
     down = np.power(2.0, -tp / hl)
+    dec = {}
     for c in stat_cols:
         cum = (df[c].astype(float) * up).groupby(
             [df[k] for k in entity_cols]).cumsum()
-        df[c + "_d"] = cum * down
-    return df[entity_cols + ["Date"] + [c + "_d" for c in stat_cols]]
+        dec[c + "_d"] = cum * down
+    return pd.concat([df[entity_cols + ["Date"]], pd.DataFrame(dec)],
+                     axis=1)
 
 
 def merge_asof_panel(rows, panel, entity_cols, stat_cols, prefix,
@@ -308,9 +340,8 @@ def merge_asof_panel(rows, panel, entity_cols, stat_cols, prefix,
                            by=entity_cols, direction="backward")
     gap = (merged["Date"] - merged["_pdate"]).dt.days.astype(float)
     decay = np.power(2.0, -gap / hl)
-    out = pd.DataFrame(index=merged.index)
-    for c in stat_cols:
-        out[prefix + c] = merged[c + "_d"] * decay
+    out = pd.DataFrame({prefix + c: merged[c + "_d"] * decay
+                        for c in stat_cols})
     out["_ord"] = merged["_ord"].values
     out = out.sort_values("_ord").drop(columns="_ord").reset_index(drop=True)
     return out
@@ -332,11 +363,19 @@ def build_outcome_panels(pa):
     specs = [
         ("panel_bat_out", "BatterId", None),
         ("panel_bat_out_hand", "BatterId", "p_throws"),
+        ("panel_bat_out_loc", "BatterId", "home_bat"),
         ("panel_pit_out", "PitcherId", None),
         ("panel_pit_out_hand", "PitcherId", "stand"),
+        ("panel_pit_out_tto", "PitcherId", "tto"),
     ]
     for name, ent, hand in specs:
         sub = pa.dropna(subset=[ent])
+        if hand == "tto":
+            # per-times-through-order pitcher rates: the sim's TTO axis
+            # gets pitcher-specific susceptibility instead of the
+            # league-average TTO effect alone
+            sub = sub.assign(tto=_num(sub["tto"]).clip(1, 3)
+                             .astype("int64"))
         daily = _daily_class_counts(sub, ent, hand)
         ents = [ent] + ([hand] if hand else [])
         panel = decayed_panel(daily, ents, ["pa"] + CLASSES)
@@ -347,7 +386,8 @@ def build_outcome_panels(pa):
 def build_bip_panels():
     bip = read_csv("mlb_statcast_bip.csv",
                    usecols=["Date", "BatterId", "PitcherId", "BBType",
-                            "ExitVelo", "LSA"])
+                            "ExitVelo", "LSA", "Events", "xBA",
+                            "xwOBA"])
     bip["Date"] = pd.to_datetime(bip["Date"])
     bip["ev"] = _num(bip["ExitVelo"])
     bip["hard"] = (bip["ev"] >= 95).astype(float)
@@ -356,8 +396,19 @@ def build_bip_panels():
     bip["air"] = bip["BBType"].isin(["fly_ball", "line_drive"]).astype(float)
     bip["ev_n"] = bip["ev"].notna().astype(float)
     bip["ev_sum"] = bip["ev"].fillna(0.0)
+    # realized-vs-expected on contact: the luck-regression pair
+    bip["hit"] = bip["Events"].isin(["single", "double", "triple",
+                                     "home_run"]).astype(float)
+    xba = _num(bip["xBA"])
+    bip["xba_n"] = xba.notna().astype(float)
+    bip["xba_sum"] = xba.fillna(0.0)
+    xw = _num(bip["xwOBA"])
+    bip["xw_n"] = xw.notna().astype(float)
+    bip["xw_sum"] = xw.fillna(0.0)
+    bip["hr"] = (bip["Events"] == "home_run").astype(float)
     bip["bip"] = 1.0
-    stats = ["bip", "ev_n", "ev_sum", "hard", "barrel", "gb", "air"]
+    stats = ["bip", "ev_n", "ev_sum", "hard", "barrel", "gb", "air",
+             "hit", "xba_n", "xba_sum", "xw_n", "xw_sum", "hr"]
     for name, ent in (("panel_bat_bip", "BatterId"),
                       ("panel_pit_bip", "PitcherId")):
         daily = bip.groupby([ent, "Date"], sort=False)[stats].sum(
@@ -365,6 +416,18 @@ def build_bip_panels():
         panel = decayed_panel(daily, [ent], stats)
         panel.to_parquet(STORES / f"{name}.parquet", index=False)
         print(f"{name}: {len(panel):,} entity-days", flush=True)
+    # batter-vs-pitcher direct history: pairwise contact quality, slow
+    # half-life, consumed as heavily-shrunk residuals off the batter's
+    # own baseline (bvp_n carries the evidence mass)
+    bip = bip.dropna(subset=["BatterId", "PitcherId"]).copy()
+    bip["BatterId"] = _num(bip["BatterId"]).astype("int64")
+    bip["PitcherId"] = _num(bip["PitcherId"]).astype("int64")
+    pair = bip.groupby(["BatterId", "PitcherId", "Date"], sort=False)[
+        ["bip", "xw_n", "xw_sum", "hr"]].sum().reset_index()
+    bvp = decayed_panel(pair, ["BatterId", "PitcherId"],
+                        ["bip", "xw_n", "xw_sum", "hr"], hl=HRPT_HL)
+    bvp.to_parquet(STORES / "panel_bvp.parquet", index=False)
+    print(f"panel_bvp: {len(bvp):,} pair-days", flush=True)
 
 
 def build_pitchmetric_panels():
@@ -372,7 +435,15 @@ def build_pitchmetric_panels():
                  usecols=["PlayerId", "Date", "n", "sw_n", "wh_n", "oz_n",
                           "oz_sw", "oz_wh", "z_n", "cs_n",
                           "fb95_n", "fb95_sw", "fb95_wh",
-                          "brk_n", "brk_sw", "brk_wh"])
+                          "fbmid_n", "fbmid_sw", "fbmid_wh",
+                          "fblo_n", "fblo_sw", "fblo_wh",
+                          "brk_n", "brk_sw", "brk_wh",
+                          "off_n", "off_sw", "off_wh",
+                          "ts_n", "ts_sw", "ts_wh",
+                          "f32_n", "f32_b", "fp_n", "fp_sw",
+                          "con_n", "con_xw",
+                          "fb95_bip", "fb95_xw", "fbmid_bip", "fbmid_xw",
+                          "brk_bip", "brk_xw", "off_bip", "off_xw"])
     b["Date"] = pd.to_datetime(b["Date"])
     stats_b = [c for c in b.columns if c not in ("PlayerId", "Date")]
     panel = decayed_panel(b, ["PlayerId"], stats_b)
@@ -381,8 +452,21 @@ def build_pitchmetric_panels():
 
     p = read_csv("mlb_pitch_daily_pitchers.csv",
                  usecols=["PlayerId", "Date", "n", "sw_n", "wh_n", "oz_n",
-                          "oz_sw", "z_n", "cs_n", "edge_n",
-                          "fb_n", "fb_v", "fp_n", "fp_s"])
+                          "oz_sw", "oz_wh", "z_n", "cs_n", "edge_n",
+                          "fb_n", "fb_v", "fp_n", "fp_s",
+                          "fb95_n", "fbmid_n", "fblo_n",
+                          "brk_n", "brk_sw", "brk_wh",
+                          "off_n", "off_sw", "off_wh",
+                          "ts_n", "ts_sw", "ts_wh",
+                          "f32_n", "f32_z", "f32_b",
+                          "c02_n", "c02_w",
+                          "ah_n", "ah_brk", "ah_off",
+                          "bh_n", "bh_brk", "bh_off",
+                          "tr_n", "tr_same",
+                          "ivb_n", "ivb_sum", "fbe_n", "fbe_sum",
+                          "brkmov_n", "brkmov_sum", "fade_w", "fade_num",
+                          "con_n", "con_xw",
+                          "fb95_bip", "fb95_xw", "brk_bip", "brk_xw"])
     p["Date"] = pd.to_datetime(p["Date"])
     stats_p = [c for c in p.columns if c not in ("PlayerId", "Date")]
     slow = decayed_panel(p, ["PlayerId"], stats_p)
@@ -406,12 +490,164 @@ def build_leash_panel():
     gp["bf_sum"] = _num(gp["BF"]).fillna(0)
     ip = _num(gp["IP"]).fillna(0)
     gp["outs_sum"] = (ip.astype(int) * 3 + round((ip % 1) * 10)).astype(float)
+    gp["outs2_sum"] = gp["outs_sum"] ** 2
     daily = gp.groupby(["PlayerId", "Date"], sort=False)[
-        ["starts", "np_sum", "bf_sum", "outs_sum"]].sum().reset_index()
+        ["starts", "np_sum", "bf_sum", "outs_sum", "outs2_sum"]].sum(
+        ).reset_index()
     panel = decayed_panel(daily, ["PlayerId"],
-                          ["starts", "np_sum", "bf_sum", "outs_sum"])
+                          ["starts", "np_sum", "bf_sum", "outs_sum",
+                           "outs2_sum"])
     panel.to_parquet(STORES / "panel_leash.parquet", index=False)
     print(f"panel_leash: {len(panel):,} starter-days", flush=True)
+
+
+def build_consistency_panels():
+    """Pitcher mechanical-consistency sufficient statistics, decayed:
+    fastball velo variance (fb_v2), release-point scatter (rp_*2), the
+    windup-vs-stretch velo split (fbstr_*), and the fastball-vs-breaking
+    release centroids (rpf_/rpb_) whose distance is a deception tell.
+    All pre-summed by scrape_pitches.py; the panel decays them so
+    assemble_features can form as-of ratios."""
+    cols = ["PlayerId", "Date", "fb_n", "fb_v", "fb_v2",
+            "rp_n", "rp_x", "rp_x2", "rp_z", "rp_z2",
+            "fbstr_n", "fbstr_v",
+            "rpf_n", "rpf_x", "rpf_z", "rpb_n", "rpb_x", "rpb_z"]
+    p = read_csv("mlb_pitch_daily_pitchers.csv", usecols=cols)
+    p["Date"] = pd.to_datetime(p["Date"])
+    stats = [c for c in cols if c not in ("PlayerId", "Date")]
+    for c in stats:
+        p[c] = _num(p[c]).fillna(0.0)
+    panel = decayed_panel(p, ["PlayerId"], stats)
+    panel.to_parquet(STORES / "panel_pit_consist.parquet", index=False)
+    print(f"panel_pit_consist: {len(panel):,} pitcher-days", flush=True)
+
+
+def build_il_table():
+    """IL stint history -> one row per ACTIVATION (return to the
+    roster), carrying stint length, rehab flag, IL60, and cumulative IL
+    days within the activation season. Activation is public before that
+    day's games, so an as-of backward join on Date is leakage-free."""
+    il = read_csv("mlb_il.csv")
+    il["PlayerId"] = _num(il["PlayerId"])
+    il["Date"] = pd.to_datetime(il["ActDate"], errors="coerce")
+    il = il.dropna(subset=["PlayerId", "Date"]).copy()
+    il["last_len"] = _num(il["StintDays"]).fillna(0.0)
+    il["rehab"] = _num(il["Rehab"]).fillna(0.0)
+    il["il60"] = _num(il["IL60"]).fillna(0.0)
+    il["act_season"] = il["Date"].dt.year
+    il = il.sort_values(["PlayerId", "Date"])
+    il["szn_days"] = il.groupby(["PlayerId", "act_season"])[
+        "last_len"].cumsum()
+    il["act_date"] = il["Date"]
+    out = il[["PlayerId", "Date", "act_date", "act_season", "last_len",
+              "rehab", "il60", "szn_days"]]
+    out.to_parquet(STORES / "il_stints.parquet", index=False)
+    print(f"il_stints: {len(out):,} activations", flush=True)
+
+
+def build_bat_tracking_table():
+    """Statcast bat tracking (2023+), consumed PRIOR-season like every
+    other season-grain table. NaN before the tracked era — HGBT handles
+    missing natively."""
+    bt = read_csv("mlb_bat_tracking.csv",
+                  usecols=["Year", "PlayerId", "Swings", "BatSpeed",
+                           "HardSwingRate", "SwingLength",
+                           "SquaredUpPerSwing"])
+    for c in bt.columns:
+        bt[c] = _num(bt[c])
+    bt = bt[bt["Swings"].fillna(0) >= 50].copy()
+    bt["Year"] = bt["Year"] + 1              # serve year = prior + 1
+    bt = bt.rename(columns={"BatSpeed": "bt_speed",
+                            "SwingLength": "bt_swlen",
+                            "HardSwingRate": "bt_hardsw",
+                            "SquaredUpPerSwing": "bt_squp"})
+    bt[["Year", "PlayerId", "bt_speed", "bt_swlen", "bt_hardsw",
+        "bt_squp"]].to_parquet(STORES / "bat_tracking.parquet",
+                               index=False)
+    print(f"bat_tracking: {len(bt):,} player-years", flush=True)
+
+
+def build_pull_table():
+    """Batter pull tendency on AIR contact (fly/line), from the raw
+    pitch archive's hit coordinates. Spray angle in the Savant frame
+    (plate at (125.42, 198.27); negative = LF side); pulled = beyond
+    PULL_DEG toward the batter's pull field. Slow half-life — pull is a
+    stable trait that powers the wind-carry interaction."""
+    import pyarrow.parquet as pq
+    frames = []
+    for f in sorted(RAW.glob("pitches_*.parquet")):
+        t = pq.read_table(f, columns=["game_date", "batter", "stand",
+                                      "bb_type", "hc_x", "hc_y"])
+        d = t.to_pandas()
+        d = d[d["bb_type"].isin(["fly_ball", "line_drive"])]
+        frames.append(d.dropna(subset=["hc_x", "hc_y"]))
+    bip = pd.concat(frames, ignore_index=True)
+    ang = np.degrees(np.arctan2(_num(bip["hc_x"]) - 125.42,
+                                198.27 - _num(bip["hc_y"])))
+    right = bip["stand"].astype(str) == "R"
+    bip["pull"] = np.where(right, ang < -PULL_DEG,
+                           ang > PULL_DEG).astype(float)
+    bip["air"] = 1.0
+    bip["Date"] = pd.to_datetime(bip["game_date"])
+    bip["BatterId"] = _num(bip["batter"]).astype("int64")
+    daily = bip.groupby(["BatterId", "Date"], sort=False)[
+        ["air", "pull"]].sum().reset_index()
+    panel = decayed_panel(daily, ["BatterId"], ["air", "pull"],
+                          hl=PULL_HL)
+    panel.to_parquet(STORES / "panel_bat_pull.parquet", index=False)
+    print(f"panel_bat_pull: {len(panel):,} batter-days "
+          f"(league air-pull {bip['pull'].mean():.3f})", flush=True)
+
+
+def build_hrpt_tables():
+    """Batter HR mix by pitch class (fast/breaking/offspeed) as a slow
+    panel, plus each pitcher's arsenal usage in the same classes: the
+    serve-time dot product (batter class share vs league, weighted by
+    what THIS pitcher throws) is the HR-matchup feature the generic
+    run-value matchup can't see."""
+    ars = read_csv("mlb_pitch_arsenals.csv",
+                   usecols=["Year", "PlayerId", "PitchType", "Pitch",
+                            "%"])
+    disp2cls = {}
+    for _, r in ars.drop_duplicates("Pitch").iterrows():
+        cls = PITCH_CLASS.get(str(r["PitchType"]))
+        if cls:
+            disp2cls[str(r["Pitch"])] = cls
+    hr = read_csv("mlb_homeruns.csv",
+                  usecols=["BatterId", "Date", "Pitch"])
+    hr["Date"] = pd.to_datetime(hr["Date"], errors="coerce")
+    hr["BatterId"] = _num(hr["BatterId"])
+    hr = hr.dropna(subset=["BatterId", "Date"]).copy()
+    hr["BatterId"] = hr["BatterId"].astype("int64")
+    hr["cls"] = hr["Pitch"].astype(str).map(disp2cls)
+    hr = hr.dropna(subset=["cls"])
+    for cls in ("fast", "brk", "off"):
+        hr[f"hr_{cls}"] = (hr["cls"] == cls).astype(float)
+    hr["hr_n"] = 1.0
+    daily = hr.groupby(["BatterId", "Date"], sort=False)[
+        ["hr_n", "hr_fast", "hr_brk", "hr_off"]].sum().reset_index()
+    panel = decayed_panel(daily, ["BatterId"],
+                          ["hr_n", "hr_fast", "hr_brk", "hr_off"],
+                          hl=HRPT_HL)
+    panel.to_parquet(STORES / "panel_bat_hrmix.parquet", index=False)
+    lg = {c: float(hr[f"hr_{c}"].mean()) for c in ("fast", "brk", "off")}
+    (STORES / "hrmix_league.json").write_text(json.dumps(lg, indent=1))
+    ars["Year"] = _num(ars["Year"]) + 1      # serve year = prior + 1
+    ars["usage"] = _num(ars["%"]) / 100.0
+    ars["cls"] = ars["PitchType"].astype(str).map(PITCH_CLASS)
+    cu = (ars.dropna(subset=["cls"])
+          .groupby(["Year", "PlayerId", "cls"])["usage"].sum()
+          .unstack(fill_value=0.0).reset_index())
+    for c in ("fast", "brk", "off"):
+        if c not in cu.columns:
+            cu[c] = 0.0
+    cu = cu.rename(columns={"fast": "u_fast", "brk": "u_brk",
+                            "off": "u_off"})
+    cu[["Year", "PlayerId", "u_fast", "u_brk", "u_off"]].to_parquet(
+        STORES / "arsenal_class_usage.parquet", index=False)
+    print(f"hrmix: {len(panel):,} batter-days; usage: {len(cu):,} "
+          f"pitcher-years; league mix "
+          f"{ {k: round(v, 3) for k, v in lg.items()} }", flush=True)
 
 
 # --------------------------------------- season-grain effect tables
@@ -452,7 +688,42 @@ def build_park_factors(pa):
         rows.append(agg[["Venue", "Year"] + [f"pf_{c}" for c in CLASSES]])
     out = pd.concat(rows, ignore_index=True)
     out.to_parquet(STORES / "park_factors.parquet", index=False)
-    print(f"park_factors: {len(out):,} venue-years", flush=True)
+
+    # handed HR factors: same windows split by batter stand — the porch
+    # asymmetry the pooled factor can't see; half the shrink mass since
+    # per-hand samples are half the size
+    ratesh = pa.groupby(["Venue", "Season", "stand"], sort=False).agg(
+        pa_n=("label", "size"),
+        HR=("label", lambda s: (s == "HR").sum())).reset_index()
+    lgh_ = pa.groupby(["Season", "stand"]).agg(
+        n=("label", "size"),
+        HR=("label", lambda s: (s == "HR").sum())).reset_index()
+    lgh_["rate"] = lgh_["HR"] / lgh_["n"].clip(lower=1)
+    rows_h = []
+    for year in range(int(pa.Season.min()) + 1,
+                      int(pa.Season.max()) + 2):
+        in_win = ((ratesh.Season >= year - PRIOR_SEASONS_PARK)
+                  & ((ratesh.Season < year)
+                     | ((ratesh.Season == year) & (year == cur))))
+        window = ratesh[in_win]
+        if window.empty:
+            continue
+        agg = window.groupby(["Venue", "stand"])[["pa_n", "HR"]].sum(
+            ).reset_index()
+        lw = lgh_[(lgh_.Season >= year - PRIOR_SEASONS_PARK)
+                  & ((lgh_.Season < year)
+                     | ((lgh_.Season == year) & (year == cur)))]
+        lr = lw.groupby("stand")["rate"].mean()
+        obs = agg["HR"] / agg["pa_n"].clip(lower=1)
+        f = obs / agg["stand"].map(lr).clip(lower=1e-9)
+        w = agg["pa_n"] / (agg["pa_n"] + K_PARK / 2)
+        agg["pf_HR_h"] = 1.0 + w * (f - 1.0)
+        agg["Year"] = year
+        rows_h.append(agg[["Venue", "Year", "stand", "pf_HR_h"]])
+    outh = pd.concat(rows_h, ignore_index=True)
+    outh.to_parquet(STORES / "park_hand.parquet", index=False)
+    print(f"park_factors: {len(out):,} venue-years "
+          f"(+{len(outh):,} handed HR rows)", flush=True)
 
 
 def build_ump_factors(pa):
@@ -530,8 +801,33 @@ def build_arsenal_tables():
     arb["n"] = _num(arb["Pitches"])
     arb[["Year", "PlayerId", "PitchType", "rv100", "n"]].to_parquet(
         STORES / "arsenal_batter.parquet", index=False)
+    # arsenal dynamics: usage entropy (repertoire breadth) and the
+    # usage-weighted whiff trend vs the pitcher's own prior season
+    full = read_csv("mlb_pitch_arsenals.csv",
+                    usecols=["Year", "PlayerId", "PitchType", "%",
+                             "Whiff %"])
+    full["Year"] = _num(full["Year"])
+    full["usage"] = _num(full["%"]) / 100.0
+    full["whiff"] = _num(full["Whiff %"])
+    meta = full.groupby(["Year", "PlayerId"]).apply(
+        lambda d: pd.Series({
+            "ars_entropy": float(-np.nansum(np.where(
+                d.usage > 0, d.usage * np.log(d.usage), 0.0))),
+            "ars_whiff": float(
+                np.nansum(d.usage * d.whiff)
+                / max(np.nansum(d.usage * d.whiff.notna()), 1e-9)),
+        }), include_groups=False).reset_index()
+    prev = meta[["Year", "PlayerId", "ars_whiff"]].rename(
+        columns={"ars_whiff": "pw"})
+    prev["Year"] = prev["Year"] + 1
+    meta = meta.merge(prev, on=["Year", "PlayerId"], how="left")
+    meta["ars_whiff_trend"] = meta["ars_whiff"] - meta["pw"]
+    meta["Year"] = meta["Year"] + 1          # serve year = prior + 1
+    meta[["Year", "PlayerId", "ars_entropy", "ars_whiff_trend"]
+         ].to_parquet(STORES / "arsenal_meta.parquet", index=False)
     print(f"arsenal tables: {ars.PlayerId.nunique():,} pitchers, "
-          f"{arb.PlayerId.nunique():,} batters", flush=True)
+          f"{arb.PlayerId.nunique():,} batters "
+          f"(+meta {len(meta):,} pitcher-years)", flush=True)
 
 
 # ------------------------------------------------- priors & shrinkage
@@ -628,6 +924,125 @@ def build_milb_priors():
     (STORES / "milb_level_factors.json").write_text(
         json.dumps(factors, indent=1))
     print(f"milb_priors: {len(out):,} player-entry-years; factors: "
+          f"{ {l: {k: round(v, 2) for k, v in f.items()} for l, f in factors.items()} }",
+          flush=True)
+
+
+def build_bat_sched_panel():
+    """Batter appearance schedule: cumulative games through each active
+    date, for rest-days and games-in-last-N-days fatigue features.
+    (Benched by the OLD model for its direct prop heads; retried here
+    because this architecture is a different estimator — the A/B replay
+    is the judge, not the old model's notes.)"""
+    gb = read_csv("mlb_game_batting.csv",
+                  usecols=["PlayerId", "Date", "PA"])
+    gb = gb[_num(gb["PA"]).fillna(0) > 0].copy()
+    gb["Date"] = pd.to_datetime(gb["Date"])
+    gb["PlayerId"] = _num(gb["PlayerId"]).astype("int64")
+    daily = (gb.groupby(["PlayerId", "Date"], sort=False).size()
+             .rename("g").reset_index())
+    daily = daily.sort_values(["PlayerId", "Date"])
+    daily["cum_g"] = daily.groupby("PlayerId")["g"].cumsum().astype(
+        float)
+    daily["last_d"] = daily["Date"]
+    daily = daily.rename(columns={"PlayerId": "BatterId"})
+    daily[["BatterId", "Date", "cum_g", "last_d"]].to_parquet(
+        STORES / "panel_bat_sched.parquet", index=False)
+    print(f"panel_bat_sched: {len(daily):,} batter-days", flush=True)
+
+
+def build_league_env(pa):
+    """Daily cumulative league totals -> trailing-30-day environment
+    rates at assemble time: the in-season offense drift (cold April,
+    summer HR surge, September callups) that era flags and per-game
+    weather cannot see."""
+    d = pa.groupby("Date").agg(
+        pa_n=("label", "size"),
+        k=("label", lambda s: (s == "K").sum()),
+        bb=("label", lambda s: (s == "BB").sum()),
+        hr=("label", lambda s: (s == "HR").sum())).reset_index()
+    d = d.sort_values("Date")
+    for c in ("pa_n", "k", "bb", "hr"):
+        d[c + "_c"] = d[c].cumsum().astype(float)
+    g = read_csv("mlb_games.csv",
+                 usecols=["Date", "AwayScore", "HomeScore"])
+    g["Date"] = pd.to_datetime(g["Date"])
+    gd = pd.DataFrame({
+        "Date": g["Date"],
+        "runs": _num(g["AwayScore"]).fillna(0)
+        + _num(g["HomeScore"]).fillna(0),
+        "g": 1.0})
+    gd = gd.groupby("Date")[["runs", "g"]].sum().reset_index()
+    gd = gd.sort_values("Date")
+    gd["runs_c"] = gd["runs"].cumsum()
+    gd["g_c"] = gd["g"].cumsum()
+    env = d[["Date", "pa_n_c", "k_c", "bb_c", "hr_c"]].merge(
+        gd[["Date", "runs_c", "g_c"]], on="Date",
+        how="outer").sort_values("Date")
+    env = env.ffill().fillna(0.0)
+    env.to_parquet(STORES / "league_env_daily.parquet", index=False)
+    print(f"league_env_daily: {len(env):,} dates", flush=True)
+
+
+def build_milb_priors_pit():
+    """MiLB-translated class-rate priors for PITCHERS (debut and callup
+    starters otherwise serve on pure league priors). Translation factors
+    are fit on AAA/AA pitchers with a real MLB season the following
+    year; the season MLB file lacks 2B/3B allowed, so the hit classes
+    share the pooled H factor (composition assumed to survive the
+    jump)."""
+    milb = read_csv("milb_pitching.csv")
+    milb = milb[milb["Level"].isin(["AAA", "AA"])].copy()
+    for c in ("TBF", "H", "2B", "3B", "HR", "BB", "SO"):
+        milb[c] = _num(milb[c]).fillna(0)
+    milb["Year"] = _num(milb["Year"])
+    milb["PlayerId"] = _num(milb["PlayerId"])
+    milb = milb[milb.TBF >= 150]
+    milb["1B"] = milb["H"] - milb["2B"] - milb["3B"] - milb["HR"]
+    mlb = read_csv("mlb_pitching_stats.csv",
+                   usecols=["Year", "PlayerId", "TBF", "H", "HR", "BB",
+                            "SO"])
+    for c in ("TBF", "H", "HR", "BB", "SO"):
+        mlb[c] = _num(mlb[c]).fillna(0)
+    mlb["Year"] = _num(mlb["Year"])
+    mlb = mlb[mlb.TBF >= 200]
+
+    pairs = milb.merge(mlb, on="PlayerId", suffixes=("_m", "_M"))
+    pairs = pairs[pairs["Year_M"] == pairs["Year_m"] + 1]
+    fac_cols = {"K": "SO", "BB": "BB", "HR": "HR", "H": "H"}
+    factors = {}
+    for lvl in ("AAA", "AA"):
+        sub = pairs[pairs.Level == lvl]
+        f = {}
+        for cls, col in fac_cols.items():
+            r_m = sub[f"{col}_m"].sum() / max(sub["TBF_m"].sum(), 1)
+            r_M = sub[f"{col}_M"].sum() / max(sub["TBF_M"].sum(), 1)
+            f[cls] = float(np.clip(r_M / max(r_m, 1e-6), 0.1, 3.0))
+        factors[lvl] = f
+
+    rate_cols = {"K": "SO", "BB": "BB", "HR": "HR", "1B": "1B",
+                 "2B": "2B", "3B": "3B"}
+    rows = []
+    for pid, g in milb.groupby("PlayerId"):
+        g = g.sort_values("Year")
+        for entry_year in g.Year.unique() + 1:
+            past = g[g.Year < entry_year].tail(2)
+            if past.empty:
+                continue
+            w = past.TBF.values
+            row = {"PlayerId": int(pid), "Year": int(entry_year)}
+            for cls, col in rate_cols.items():
+                fkey = cls if cls in fac_cols else "H"
+                tr = [(r[col] / r.TBF) * factors[r.Level][fkey]
+                      for _, r in past.iterrows()]
+                row[f"prior_{cls}"] = float(np.average(tr, weights=w))
+            row["prior_pa"] = float(past.TBF.sum())
+            rows.append(row)
+    out = pd.DataFrame(rows)
+    out.to_parquet(STORES / "milb_priors_pit.parquet", index=False)
+    (STORES / "milb_level_factors_pit.json").write_text(
+        json.dumps(factors, indent=1))
+    print(f"milb_priors_pit: {len(out):,} pitcher-entry-years; factors "
           f"{ {l: {k: round(v, 2) for k, v in f.items()} for l, f in factors.items()} }",
           flush=True)
 
@@ -862,9 +1277,45 @@ def build_hazard_table(pa):
                 & (sub["at_bat_number"].values
                    == sub["team_last_ab"].values))
     sub = sub[~censored]
+    # start-level regime context: previous start's date/pitch-count/
+    # length (ramp-up and opener/quick-hook regimes), and IL-return
+    # recency — the variance-wideners the leash averages can't see
+    gpf = read_csv("mlb_game_pitching.csv",
+                   usecols=["GamePk", "PlayerId", "GS", "Date", "NP",
+                            "IP"])
+    st = gpf[_num(gpf["GS"]) == 1].copy()
+    st["Date"] = pd.to_datetime(st["Date"])
+    ipf = _num(st["IP"]).fillna(0)
+    st["outs_g"] = (ipf.astype(int) * 3
+                    + round((ipf % 1) * 10)).astype(float)
+    st["np_g"] = _num(st["NP"])
+    st = st.sort_values(["PlayerId", "Date"])
+    g2 = st.groupby("PlayerId")
+    st["gap_days"] = (st["Date"] - g2["Date"].shift(1)).dt.days
+    st["ramp"] = (g2["np_g"].shift(1) < RAMP_NP).astype(float)
+    st["prev_short"] = (g2["outs_g"].shift(1)
+                        <= SHORT_START_OUTS).astype(float)
+    reg = st[["GamePk", "PlayerId", "Date", "gap_days", "ramp",
+              "prev_short"]].copy()
+    reg["GamePk"] = _num(reg["GamePk"])
+    il = pd.read_parquet(STORES / "il_stints.parquet")
+    ilr = reg.sort_values("Date").rename(columns={"Date": "d_"})
+    ilj = pd.merge_asof(
+        ilr, il[["PlayerId", "Date", "act_date"]].sort_values("Date"),
+        left_on="d_", right_on="Date", by="PlayerId",
+        direction="backward")
+    ilj["il_ret30"] = ((ilj["d_"] - ilj["act_date"]).dt.days
+                       <= 30).fillna(False).astype(float)
+    reg = ilj[["GamePk", "PlayerId", "gap_days", "ramp", "prev_short",
+               "il_ret30"]]
+    reg.columns = ["game_pk", "PitcherId", "gap_days", "ramp",
+                   "prev_short", "il_ret30"]
+    sub = sub.merge(reg, on=["game_pk", "PitcherId"], how="left")
+
     keep = ["game_pk", "Date", "Season", "PitcherId", "at_bat_number",
             "bf", "cum_pitches", "tto", "inning", "outs", "score_diff",
-            "k_so_far", "br_so_far", "runs_so_far", "rest_p", "removed"]
+            "k_so_far", "br_so_far", "runs_so_far", "rest_p", "removed",
+            "gap_days", "ramp", "prev_short", "il_ret30"]
     sub[keep].to_parquet(STORES / "hazard_table.parquet", index=False)
     print(f"hazard_table: {len(sub):,} starter-BF rows, removal rate "
           f"{sub.removed.mean():.3%}", flush=True)
@@ -1002,9 +1453,17 @@ def load_stores():
                  "panel_pit_velo_fast", "panel_leash", "park_factors",
                  "ump_factors", "defense_team", "arsenal_pitcher",
                  "arsenal_batter", "league_rates", "league_rates_hand",
-                 "league_rates_stand", "milb_priors"):
+                 "league_rates_stand", "milb_priors",
+                 "panel_pit_consist", "il_stints", "bat_tracking",
+                 "panel_bat_pull", "panel_bat_hrmix",
+                 "arsenal_class_usage", "arsenal_meta",
+                 "milb_priors_pit", "panel_bat_out_loc", "park_hand",
+                 "panel_pit_out_tto", "panel_bvp", "panel_bat_sched",
+                 "league_env_daily"):
         s[name] = pd.read_parquet(STORES / f"{name}.parquet")
     s["eb_k"] = json.loads((STORES / "eb_k.json").read_text())
+    s["hrmix_league"] = json.loads(
+        (STORES / "hrmix_league.json").read_text())
     ros = read_csv("mlb_rosters.csv", usecols=["PlayerId", "DOB"])
     ros["dob"] = pd.to_datetime(ros["DOB"], format="%m/%d/%Y",
                                 errors="coerce")
@@ -1023,27 +1482,30 @@ def assemble_features(rows, stores):
     Returns (X, feature_names) aligned to rows. Shared by training and
     serving — the one code path."""
     n = len(rows)
-    out = rows[["Date", "Season"]].copy().reset_index(drop=True)
     rows = rows.reset_index(drop=True)
+    # columns accumulate in a dict and the frame is built once at the
+    # end: inserting hundreds of columns one-by-one fragments the block
+    # manager (pandas PerformanceWarning) and copies it repeatedly
+    out = {"Date": rows["Date"], "Season": rows["Season"]}
 
     # ---- decayed outcome panels: batter overall + vs pitcher hand
     m = merge_asof_panel(rows, stores["panel_bat_out"], ["BatterId"],
                          ["pa"] + CLASSES, "b_")
-    out = pd.concat([out, m], axis=1)
+    out.update({c: m[c] for c in m.columns})
     rows_h = rows.rename(columns={"p_throws": "p_throws_key"})
     ph = stores["panel_bat_out_hand"].rename(
         columns={"p_throws": "p_throws_key"})
     m = merge_asof_panel(rows_h, ph, ["BatterId", "p_throws_key"],
                          ["pa"] + CLASSES, "bh_")
-    out = pd.concat([out, m], axis=1)
+    out.update({c: m[c] for c in m.columns})
     m = merge_asof_panel(rows, stores["panel_pit_out"], ["PitcherId"],
                          ["pa"] + CLASSES, "p_")
-    out = pd.concat([out, m], axis=1)
+    out.update({c: m[c] for c in m.columns})
     rows_s = rows.rename(columns={"stand": "stand_key"})
     ps = stores["panel_pit_out_hand"].rename(columns={"stand": "stand_key"})
     m = merge_asof_panel(rows_s, ps, ["PitcherId", "stand_key"],
                          ["pa"] + CLASSES, "ph_")
-    out = pd.concat([out, m], axis=1)
+    out.update({c: m[c] for c in m.columns})
 
     # ---- EB-shrunk rates with league (and MiLB) priors
     lg = stores["league_rates"].pivot(index="Season", columns="label",
@@ -1079,16 +1541,41 @@ def assemble_features(rows, stores):
     pri_bh = pri_b
     out = _shrunk_rates(out, "bh_", "bh_pa", BAT_RATES, pri_bh,
                         stores["eb_k"], milb=mm)
+    milb_p = stores["milb_priors_pit"].sort_values(["PlayerId", "Year"])
+    prow = rows[["PitcherId", "Season"]].copy()
+    prow["Season"] = prow["Season"].astype("int64")
+    prow["PitcherId"] = prow["PitcherId"].astype("int64")
+    prow["_ord"] = np.arange(n)
+    pr_ = milb_p.rename(columns={"PlayerId": "PitcherId",
+                                 "Year": "Season"})
+    pr_["Season"] = pr_["Season"].astype("int64")
+    pr_["PitcherId"] = pr_["PitcherId"].astype("int64")
+    pmm = pd.merge_asof(
+        prow.sort_values("Season"), pr_.sort_values("Season"),
+        on="Season", by="PitcherId", direction="backward")
+    pmm = pmm.sort_values("_ord").reset_index(drop=True)
     pri_p = {c: lgv(lgs, [prior_seas, rows["stand"]], c) for c in CLASSES}
     out = _shrunk_rates(out, "p_", "p_pa", PIT_RATES, pri_p,
-                        stores["eb_k"])
+                        stores["eb_k"], milb=pmm)
     out = _shrunk_rates(out, "ph_", "ph_pa", PIT_RATES, pri_p,
+                        stores["eb_k"], milb=pmm)
+    # per-TTO pitcher rates: this row's times-through-order slice
+    rows_t = rows[["PitcherId", "Date", "tto"]].copy()
+    rows_t["tto_key"] = (_num(rows_t["tto"]).fillna(1).clip(1, 3)
+                         .astype("int64"))
+    pt = stores["panel_pit_out_tto"].rename(columns={"tto": "tto_key"})
+    pt["tto_key"] = _num(pt["tto_key"]).astype("int64")
+    m = merge_asof_panel(rows_t, pt, ["PitcherId", "tto_key"],
+                         ["pa"] + CLASSES, "pt_")
+    out.update({c: m[c] for c in m.columns})
+    out = _shrunk_rates(out, "pt_", "pt_pa", PIT_RATES, pri_p,
                         stores["eb_k"])
 
     # ---- batted-ball quality and pitch-level discipline
     for panel, ent, pref in (("panel_bat_bip", "BatterId", "bq_"),
                              ("panel_pit_bip", "PitcherId", "pq_")):
-        cols = ["bip", "ev_n", "ev_sum", "hard", "barrel", "gb", "air"]
+        cols = ["bip", "ev_n", "ev_sum", "hard", "barrel", "gb", "air",
+                "hit", "xba_n", "xba_sum", "xw_n", "xw_sum", "hr"]
         m = merge_asof_panel(rows, stores[panel], [ent], cols, pref)
         out[pref + "ev"] = m[pref + "ev_sum"] / m[pref + "ev_n"].clip(
             lower=1e-9)
@@ -1098,10 +1585,23 @@ def assemble_features(rows, stores):
             lower=1e-9)
         out[pref + "gb"] = m[pref + "gb"] / m[pref + "bip"].clip(
             lower=1e-9)
+        # realized hits minus expected on the same recent contact:
+        # positive = running hot (mean-reversion signal)
+        out[pref + "luck"] = ((m[pref + "hit"] - m[pref + "xba_sum"])
+                              / m[pref + "bip"].clip(lower=1e-9))
+        out[pref + "xw"] = (m[pref + "xw_sum"]
+                            / m[pref + "xw_n"].clip(lower=1e-9))
+        out[pref + "hr_bip"] = (m[pref + "hr"]
+                                / m[pref + "bip"].clip(lower=1e-9))
         out[pref + "log_bip"] = np.log1p(m[pref + "bip"])
     bcols = ["n", "sw_n", "wh_n", "oz_n", "oz_sw", "oz_wh", "z_n",
-             "cs_n", "fb95_n", "fb95_sw", "fb95_wh", "brk_n", "brk_sw",
-             "brk_wh"]
+             "cs_n", "fb95_n", "fb95_sw", "fb95_wh",
+             "fbmid_sw", "fbmid_wh", "fblo_sw", "fblo_wh",
+             "brk_n", "brk_sw", "brk_wh", "off_sw", "off_wh",
+             "ts_sw", "ts_wh", "f32_n", "f32_b", "fp_n", "fp_sw",
+             "con_n", "con_xw", "fb95_bip", "fb95_xw",
+             "fbmid_bip", "fbmid_xw", "brk_bip", "brk_xw",
+             "off_bip", "off_xw"]
     m = merge_asof_panel(rows.rename(columns={"BatterId": "PlayerId"}),
                          stores["panel_bat_pitchmet"], ["PlayerId"],
                          bcols, "bm_")
@@ -1113,8 +1613,37 @@ def assemble_features(rows, stores):
     out["bm_fb95_whiff"] = m["bm_fb95_wh"] / m["bm_fb95_sw"].clip(
         lower=1e-9)
     out["bm_brk_whiff"] = m["bm_brk_wh"] / m["bm_brk_sw"].clip(lower=1e-9)
-    pcols = ["n", "sw_n", "wh_n", "oz_n", "oz_sw", "z_n", "cs_n",
-             "edge_n", "fb_n", "fb_v", "fp_n", "fp_s"]
+    # wave 2: passivity, count leverage, banded whiff + damage axes
+    out["bm_zsw"] = ((m["bm_sw_n"] - m["bm_oz_sw"])
+                     / m["bm_z_n"].clip(lower=1e-9))
+    out["bm_ts_wh"] = m["bm_ts_wh"] / m["bm_ts_sw"].clip(lower=1e-9)
+    out["bm_f32_take"] = m["bm_f32_b"] / m["bm_f32_n"].clip(lower=1e-9)
+    out["bm_fp_aggr"] = m["bm_fp_sw"] / m["bm_fp_n"].clip(lower=1e-9)
+    out["bm_fbmid_whiff"] = (m["bm_fbmid_wh"]
+                             / m["bm_fbmid_sw"].clip(lower=1e-9))
+    out["bm_fblo_whiff"] = (m["bm_fblo_wh"]
+                            / m["bm_fblo_sw"].clip(lower=1e-9))
+    out["bm_off_whiff"] = m["bm_off_wh"] / m["bm_off_sw"].clip(lower=1e-9)
+    fb_sw_b = m["bm_sw_n"] - m["bm_brk_sw"] - m["bm_off_sw"]
+    fb_wh_b = m["bm_wh_n"] - m["bm_brk_wh"] - m["bm_off_wh"]
+    out["bm_fb_whiff"] = fb_wh_b / fb_sw_b.clip(lower=1e-9)
+    out["bm_con_xw"] = m["bm_con_xw"] / m["bm_con_n"].clip(lower=1e-9)
+    out["bm_fb95_xw"] = m["bm_fb95_xw"] / m["bm_fb95_bip"].clip(
+        lower=1e-9)
+    out["bm_fbmid_xw"] = m["bm_fbmid_xw"] / m["bm_fbmid_bip"].clip(
+        lower=1e-9)
+    out["bm_brk_xw"] = m["bm_brk_xw"] / m["bm_brk_bip"].clip(lower=1e-9)
+    out["bm_off_xw"] = m["bm_off_xw"] / m["bm_off_bip"].clip(lower=1e-9)
+    pcols = ["n", "sw_n", "wh_n", "oz_n", "oz_sw", "oz_wh", "z_n",
+             "cs_n", "edge_n", "fb_n", "fb_v", "fp_n", "fp_s",
+             "fb95_n", "fbmid_n", "fblo_n", "brk_n", "brk_sw", "brk_wh",
+             "off_n", "off_sw", "off_wh", "ts_sw", "ts_wh",
+             "f32_n", "f32_z", "f32_b", "c02_n", "c02_w",
+             "ah_n", "ah_brk", "ah_off", "bh_n", "bh_brk", "bh_off",
+             "tr_n", "tr_same", "ivb_n", "ivb_sum", "fbe_n", "fbe_sum",
+             "brkmov_n", "brkmov_sum", "fade_w", "fade_num",
+             "con_n", "con_xw", "fb95_bip", "fb95_xw", "brk_bip",
+             "brk_xw"]
     m = merge_asof_panel(rows.rename(columns={"PitcherId": "PlayerId"}),
                          stores["panel_pit_pitchmet"], ["PlayerId"],
                          pcols, "pm_")
@@ -1124,12 +1653,55 @@ def assemble_features(rows, stores):
     out["pm_edge"] = m["pm_edge_n"] / m["pm_n"].clip(lower=1e-9)
     out["pm_fstrike"] = m["pm_fp_s"] / m["pm_fp_n"].clip(lower=1e-9)
     out["pm_velo"] = m["pm_fb_v"] / m["pm_fb_n"].clip(lower=1e-9)
+    # wave 2: stuff shape, count leverage, sequencing, usage mix
+    out["pm_zwsw"] = ((m["pm_wh_n"] - m["pm_oz_wh"])
+                      / (m["pm_sw_n"] - m["pm_oz_sw"]).clip(lower=1e-9))
+    out["pm_putaway"] = m["pm_ts_wh"] / m["pm_ts_sw"].clip(lower=1e-9)
+    out["pm_f32_zone"] = m["pm_f32_z"] / m["pm_f32_n"].clip(lower=1e-9)
+    out["pm_f32_ball"] = m["pm_f32_b"] / m["pm_f32_n"].clip(lower=1e-9)
+    out["pm_c02_waste"] = m["pm_c02_w"] / m["pm_c02_n"].clip(lower=1e-9)
+    out["pm_ah_shift"] = ((m["pm_ah_brk"] + m["pm_ah_off"])
+                          / m["pm_ah_n"].clip(lower=1e-9)
+                          - (m["pm_bh_brk"] + m["pm_bh_off"])
+                          / m["pm_bh_n"].clip(lower=1e-9))
+    out["pm_tr_same"] = m["pm_tr_same"] / m["pm_tr_n"].clip(lower=1e-9)
+    out["pm_ivb"] = m["pm_ivb_sum"] / m["pm_ivb_n"].clip(lower=1e-9)
+    out["pm_ext"] = m["pm_fbe_sum"] / m["pm_fbe_n"].clip(lower=1e-9)
+    out["pm_brkmov"] = (m["pm_brkmov_sum"]
+                        / m["pm_brkmov_n"].clip(lower=1e-9))
+    out["pm_fade"] = m["pm_fade_num"] / m["pm_fade_w"].clip(lower=1e-9)
+    nn = m["pm_n"].clip(lower=1e-9)
+    out["pm_fb95_u"] = m["pm_fb95_n"] / nn
+    out["pm_fbmid_u"] = m["pm_fbmid_n"] / nn
+    out["pm_fblo_u"] = m["pm_fblo_n"] / nn
+    out["pm_brk_u"] = m["pm_brk_n"] / nn
+    out["pm_off_u"] = m["pm_off_n"] / nn
+    out["pm_brk_whiff"] = m["pm_brk_wh"] / m["pm_brk_sw"].clip(lower=1e-9)
+    out["pm_off_whiff"] = m["pm_off_wh"] / m["pm_off_sw"].clip(lower=1e-9)
+    out["pm_con_xw"] = m["pm_con_xw"] / m["pm_con_n"].clip(lower=1e-9)
+    out["pm_fb95_xw"] = m["pm_fb95_xw"] / m["pm_fb95_bip"].clip(
+        lower=1e-9)
+    out["pm_brk_xw"] = m["pm_brk_xw"] / m["pm_brk_bip"].clip(lower=1e-9)
     mf = merge_asof_panel(rows.rename(columns={"PitcherId": "PlayerId"}),
                           stores["panel_pit_velo_fast"], ["PlayerId"],
                           ["fb_n_fast", "fb_v_fast"], "pv_",
                           hl=VELO_HL_FAST)
     velo_fast = mf["pv_fb_v_fast"] / mf["pv_fb_n_fast"].clip(lower=1e-9)
     out["pm_velo_trend"] = velo_fast - out["pm_velo"]
+    # style-collision products: trees cannot multiply, so the strongest
+    # log5-style matchups are materialized explicitly
+    fb_u = (1.0 - out["pm_brk_u"] - out["pm_off_u"]).clip(lower=0.0)
+    out["mx_band_whiff"] = (out["bm_fblo_whiff"] * out["pm_fblo_u"]
+                            + out["bm_fbmid_whiff"] * out["pm_fbmid_u"]
+                            + out["bm_fb95_whiff"] * out["pm_fb95_u"])
+    out["mx_class_whiff"] = (out["bm_fb_whiff"] * fb_u
+                             + out["bm_brk_whiff"] * out["pm_brk_u"]
+                             + out["bm_off_whiff"] * out["pm_off_u"])
+    out["mx_ts"] = out["pm_putaway"] * out["bm_ts_wh"]
+    out["mx_ride"] = out["pm_ivb"] * out["bm_fb_whiff"]
+    out["mx_class_dmg"] = (out["bm_fb95_xw"] * out["pm_fb95_u"]
+                           + out["bm_brk_xw"] * out["pm_brk_u"]
+                           + out["bm_off_xw"] * out["pm_off_u"])
 
     # ---- arsenal matchup: sum over pitch types of prior-season pitcher
     # usage x batter run value per 100 vs that type
@@ -1200,11 +1772,215 @@ def assemble_features(rows, stores):
     out["era_shiftban"] = (rows["Season"] >= 2023).astype(float)
     out["era_abs"] = (rows["Season"] >= 2026).astype(float)
 
-    drop = ([c for c in out.columns
-             if any(c == f"{p}{cl}" for p in ("b_", "bh_", "p_", "ph_")
-                    for cl in CLASSES + ["pa", "HBP", "IPO"])]
-            + ["Date", "Season"])
-    X = out.drop(columns=[c for c in drop if c in out.columns])
+    # ---- batter-vs-pitcher direct history (heavily shrunk residuals
+    # off the batter's own contact baseline; bvp_log_n = evidence mass)
+    m = merge_asof_panel(rows, stores["panel_bvp"],
+                         ["BatterId", "PitcherId"],
+                         ["bip", "xw_n", "xw_sum", "hr"], "bvp_",
+                         hl=HRPT_HL)
+    bvp_n = m["bvp_bip"].fillna(0.0)
+    bvp_xw = m["bvp_xw_sum"] / m["bvp_xw_n"].clip(lower=1e-9)
+    out["bvp_log_n"] = np.log1p(bvp_n)
+    w_xw = bvp_n / (bvp_n + 30.0)
+    out["bvp_xw_resid"] = (w_xw * (bvp_xw - out["bq_xw"])).fillna(0.0)
+    w_hr = bvp_n / (bvp_n + 50.0)
+    out["bvp_hr_resid"] = (w_hr * (m["bvp_hr"]
+                                   / bvp_n.clip(lower=1e-9)
+                                   - out["bq_hr_bip"])).fillna(0.0)
+
+    # ---- classic log5 outcome collisions + remaining style products
+    out["mx_k5"] = out["b_K_rate"] * out["p_K_rate"]
+    out["mx_bb5"] = out["b_BB_rate"] * out["p_BB_rate"]
+    out["mx_hr5"] = out["b_HR_rate"] * out["p_HR_rate"]
+    b_hit = (out["b_1B_rate"] + out["b_2B_rate"] + out["b_3B_rate"]
+             + out["b_HR_rate"])
+    p_hit = (out["p_1B_rate"] + out["p_2B_rate"] + out["p_3B_rate"]
+             + out["p_HR_rate"])
+    out["mx_hit5"] = b_hit * p_hit
+    out["mx_chase"] = out["bm_chase"] * out["pm_chase"]
+    out["mx_zone_con"] = out["pm_zone"] * (1.0 - out["bm_zcon"])
+    out["mx_calledk"] = (1.0 - out["bm_zsw"]) * out["pm_edge"]
+
+    # ---- IL recency (batter and pitcher)
+    il = stores["il_stints"]
+    for idc, pref in (("BatterId", "b_il_"), ("PitcherId", "p_il_")):
+        left = rows[[idc, "Date"]].copy()
+        left["_ord"] = np.arange(n)
+        left["_id"] = _num(left[idc]).fillna(-1).astype("int64")
+        r = il.copy()
+        r["_id"] = _num(r["PlayerId"]).astype("int64")
+        m = pd.merge_asof(
+            left.sort_values("Date"),
+            r[["_id", "Date", "act_date", "act_season", "last_len",
+               "rehab", "szn_days"]].sort_values("Date"),
+            on="Date", by="_id", direction="backward")
+        m = m.sort_values("_ord").reset_index(drop=True)
+        ret = (m["Date"] - m["act_date"]).dt.days.astype(float)
+        out[pref + "ret_days"] = np.clip(ret, 0, 400)
+        out[pref + "ret21"] = (ret <= 21).astype(float)
+        out[pref + "last_len"] = m["last_len"]
+        same_season = m["act_season"] == m["Date"].dt.year
+        out[pref + "szn_days"] = np.where(same_season,
+                                          m["szn_days"], 0.0)
+        out[pref + "rehab"] = m["rehab"].fillna(0.0)
+
+    # ---- pitcher mechanical consistency (velo SD, release scatter,
+    # windup-vs-stretch velo delta, fastball-vs-breaking release sep)
+    ccols = ["fb_n", "fb_v", "fb_v2", "rp_n", "rp_x", "rp_x2", "rp_z",
+             "rp_z2", "fbstr_n", "fbstr_v", "rpf_n", "rpf_x", "rpf_z",
+             "rpb_n", "rpb_x", "rpb_z"]
+    m = merge_asof_panel(rows.rename(columns={"PitcherId": "PlayerId"}),
+                         stores["panel_pit_consist"], ["PlayerId"],
+                         ccols, "cz_")
+    fbn = m["cz_fb_n"]
+    mu_v = m["cz_fb_v"] / fbn.clip(lower=1e-9)
+    var_v = m["cz_fb_v2"] / fbn.clip(lower=1e-9) - mu_v ** 2
+    out["pm_velo_sd"] = np.where(fbn >= CONSIST_MIN_FB,
+                                 np.sqrt(np.clip(var_v, 0, None)),
+                                 np.nan)
+    rpn = m["cz_rp_n"]
+    vx = (m["cz_rp_x2"] / rpn.clip(lower=1e-9)
+          - (m["cz_rp_x"] / rpn.clip(lower=1e-9)) ** 2)
+    vz = (m["cz_rp_z2"] / rpn.clip(lower=1e-9)
+          - (m["cz_rp_z"] / rpn.clip(lower=1e-9)) ** 2)
+    out["pm_rel_scatter"] = np.where(
+        rpn >= CONSIST_MIN_RP,
+        np.sqrt(np.clip(vx, 0, None) + np.clip(vz, 0, None)), np.nan)
+    stn = m["cz_fbstr_n"]
+    wun = fbn - stn
+    v_st = m["cz_fbstr_v"] / stn.clip(lower=1e-9)
+    v_wu = (m["cz_fb_v"] - m["cz_fbstr_v"]) / wun.clip(lower=1e-9)
+    out["pm_stretch_delta"] = np.where(
+        (stn >= STRETCH_MIN_N) & (wun >= STRETCH_MIN_N),
+        v_wu - v_st, np.nan)
+    fn_, bn_ = m["cz_rpf_n"], m["cz_rpb_n"]
+    sep = np.hypot(
+        m["cz_rpf_x"] / fn_.clip(lower=1e-9)
+        - m["cz_rpb_x"] / bn_.clip(lower=1e-9),
+        m["cz_rpf_z"] / fn_.clip(lower=1e-9)
+        - m["cz_rpb_z"] / bn_.clip(lower=1e-9))
+    out["pm_rel_sep"] = np.where(
+        (fn_ >= RELSEP_MIN_N) & (bn_ >= RELSEP_MIN_N), sep, np.nan)
+
+    # ---- arsenal dynamics (prior-season entropy + whiff trend)
+    am = stores["arsenal_meta"]
+    j = rows[["PitcherId", "Season"]].merge(
+        am, left_on=["PitcherId", "Season"],
+        right_on=["PlayerId", "Year"], how="left")
+    out["pars_entropy"] = j["ars_entropy"].values
+    out["pars_whiff_trend"] = j["ars_whiff_trend"].values
+
+    # ---- bat tracking (prior season, 2024+ serve years)
+    bt = stores["bat_tracking"]
+    j = rows[["BatterId", "Season"]].merge(
+        bt, left_on=["BatterId", "Season"],
+        right_on=["PlayerId", "Year"], how="left")
+    for c in ("bt_speed", "bt_swlen", "bt_hardsw", "bt_squp"):
+        out[c] = j[c].values
+
+    # ---- pull tendency + wind-carry-to-pull-side interaction
+    m = merge_asof_panel(rows, stores["panel_bat_pull"], ["BatterId"],
+                         ["air", "pull"], "pl_", hl=PULL_HL)
+    LG_PULL = 0.30
+    pull_share = ((m["pl_pull"].fillna(0.0) + PULL_K * LG_PULL)
+                  / (m["pl_air"].fillna(0.0) + PULL_K))
+    out["b_pull"] = pull_share
+    wf = rows["WindDir"].map(_WIND_FIELD)
+    ws_ = rows["WindDir"].map(_WIND_SIGN)
+    pull_field = np.where(rows["stand"].astype(str) == "R", "L", "R")
+    wgt = np.where(wf == pull_field, 1.0,
+                   np.where(wf == "C", CARRY_CF_W,
+                            np.where(wf.notna(), CARRY_OPP_W, 0.0)))
+    out["wind_pull"] = np.where(
+        dome, 0.0,
+        _num(rows["WindSpeed"]).fillna(0.0) * ws_.fillna(0.0) * wgt
+        * pull_share)
+
+    # ---- HR pitch-class matchup: batter HR mix vs THIS arsenal
+    m = merge_asof_panel(rows, stores["panel_bat_hrmix"], ["BatterId"],
+                         ["hr_n", "hr_fast", "hr_brk", "hr_off"],
+                         "hm_", hl=HRPT_HL)
+    lgmix = stores["hrmix_league"]
+    cu = stores["arsenal_class_usage"]
+    j = rows[["PitcherId", "Season"]].merge(
+        cu, left_on=["PitcherId", "Season"],
+        right_on=["PlayerId", "Year"], how="left")
+    hrn = m["hm_hr_n"].fillna(0.0)
+    hrpt = np.zeros(n)
+    for cls in ("fast", "brk", "off"):
+        share = ((m[f"hm_hr_{cls}"].fillna(0.0) + HRPT_K * lgmix[cls])
+                 / (hrn + HRPT_K))
+        usage = j[f"u_{cls}"].fillna(float(cu[f"u_{cls}"].mean())).values
+        hrpt += (share.values - lgmix[cls]) * usage
+    out["hrpt_score"] = hrpt
+
+    # ---- batter home/away split rates (venue-affinity axis)
+    rows_l = rows[["BatterId", "Date", "home_bat"]].copy()
+    rows_l["hb_key"] = _num(rows_l["home_bat"]).fillna(0).astype("int64")
+    pl_ = stores["panel_bat_out_loc"].copy()
+    pl_["hb_key"] = _num(pl_["home_bat"]).astype("int64")
+    m = merge_asof_panel(rows_l, pl_, ["BatterId", "hb_key"],
+                         ["pa"] + CLASSES, "bl_")
+    out.update({c: m[c] for c in m.columns})
+    out = _shrunk_rates(out, "bl_", "bl_pa", BAT_RATES, pri_b,
+                        stores["eb_k"])
+
+    # ---- park x handedness HR factor (porch asymmetry)
+    phh = stores["park_hand"]
+    j = rows[["Venue", "Season", "stand"]].merge(
+        phh, left_on=["Venue", "Season", "stand"],
+        right_on=["Venue", "Year", "stand"], how="left")
+    out["pf_HR_hand"] = j["pf_HR_h"].fillna(1.0).values
+
+    # ---- batter schedule fatigue (rest days, games last 7/14 days)
+    sch = stores["panel_bat_sched"].sort_values("Date")
+    base_dates = rows["Date"].reset_index(drop=True)
+    bid64 = rows["BatterId"].astype("int64").values
+
+    def _sched_at(offset_days):
+        at = base_dates - pd.Timedelta(days=offset_days)
+        l2 = pd.DataFrame({"BatterId": bid64, "_ord": np.arange(n),
+                           "_at": at.values}).sort_values("_at")
+        mm2 = pd.merge_asof(l2, sch, left_on="_at", right_on="Date",
+                            by="BatterId", direction="backward",
+                            allow_exact_matches=False)
+        return mm2.sort_values("_ord").reset_index(drop=True)
+
+    m0, m7, m14 = _sched_at(0), _sched_at(7), _sched_at(14)
+    out["b_rest"] = ((base_dates - m0["last_d"]).dt.days
+                     .clip(upper=30).values)
+    cum0 = m0["cum_g"].fillna(0.0)
+    out["b_g_l7d"] = (cum0 - m7["cum_g"].fillna(0.0)).values
+    out["b_g_l14d"] = (cum0 - m14["cum_g"].fillna(0.0)).values
+
+    # ---- trailing-30-day league environment (in-season drift)
+    env = stores["league_env_daily"].sort_values("Date")
+
+    def _env_at(offset_days):
+        at = base_dates - pd.Timedelta(days=offset_days)
+        l2 = pd.DataFrame({"_ord": np.arange(n),
+                           "_at": at.values}).sort_values("_at")
+        mm2 = pd.merge_asof(l2, env, left_on="_at", right_on="Date",
+                            direction="backward",
+                            allow_exact_matches=False)
+        return mm2.sort_values("_ord").reset_index(drop=True)
+
+    e0, e30 = _env_at(0), _env_at(30)
+    dpa = (e0["pa_n_c"] - e30["pa_n_c"]).clip(lower=1.0)
+    out["lg_k30"] = ((e0["k_c"] - e30["k_c"]) / dpa).values
+    out["lg_bb30"] = ((e0["bb_c"] - e30["bb_c"]) / dpa).values
+    out["lg_hr30"] = ((e0["hr_c"] - e30["hr_c"]) / dpa).values
+    dg = (e0["g_c"] - e30["g_c"]).clip(lower=1.0)
+    out["lg_rpg30"] = ((e0["runs_c"] - e30["runs_c"]) / dg).values
+    thin = (dpa < 5000).values
+    for c in ("lg_k30", "lg_bb30", "lg_hr30"):
+        out[c] = np.where(thin, np.nan, out[c])
+    out["lg_rpg30"] = np.where((dg < 50).values, np.nan, out["lg_rpg30"])
+
+    drop = {f"{p}{cl}"
+            for p in ("b_", "bh_", "bl_", "p_", "ph_", "pt_")
+            for cl in CLASSES + ["pa", "HBP", "IPO"]} | {"Date", "Season"}
+    X = pd.DataFrame({c: v for c, v in out.items() if c not in drop})
     return X, list(X.columns)
 
 
@@ -1215,14 +1991,14 @@ def main():
     ap.add_argument("--build", action="store_true",
                     help="build every store")
     ap.add_argument("--only", default="",
-                    help="comma list: pa,panels,effects,priors,pbp,"
-                         "hazard,forecast")
+                    help="comma list: pa,panels,context,effects,priors,"
+                         "pbp,hazard,part,forecast")
     args = ap.parse_args()
     if not (args.build or args.only):
         ap.error("nothing to do: pass --build or --only ...")
     steps = set(args.only.split(",")) if args.only else {
-        "pa", "panels", "effects", "priors", "pbp", "hazard", "part",
-        "forecast"}
+        "pa", "panels", "context", "effects", "priors", "pbp", "hazard",
+        "part", "forecast"}
 
     STORES.mkdir(parents=True, exist_ok=True)
     pa = None
@@ -1236,6 +2012,14 @@ def main():
         build_bip_panels()
         build_pitchmetric_panels()
         build_leash_panel()
+    if "context" in steps:
+        build_consistency_panels()
+        build_il_table()
+        build_bat_tracking_table()
+        build_pull_table()
+        build_hrpt_tables()
+        build_bat_sched_panel()
+        build_league_env(pa)
     if "effects" in steps:
         build_park_factors(pa)
         build_ump_factors(pa)
@@ -1245,6 +2029,7 @@ def main():
         build_league_rates(pa)
         build_eb_k(pa)
         build_milb_priors()
+        build_milb_priors_pit()
     if "pbp" in steps:
         build_pattern_table(pa)
         build_sb_table(pa)

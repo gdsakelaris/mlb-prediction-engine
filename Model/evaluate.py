@@ -118,69 +118,159 @@ def replay_rows(start, end, n_sims=4000, max_games=None, progress=True):
             continue
         out = P.predict_slate([spec], n_sims=n_sims)
         f = PR.game_frame(out[0])
-        pk = g.GamePk
-        date = str(pd.Timestamp(g.Date).date())
-
-        act = gb[gb.GamePk == pk].set_index("PlayerId")
-        for br in f["bat"]:
-            if br["ID"] not in act.index:
-                continue
-            ar = act.loc[br["ID"]]
-            if isinstance(ar, pd.DataFrame):
-                ar = ar.iloc[0]
-            if not (ar.PA > 0):
-                continue
-            for mkt, fn in BAT_ACTUAL.items():
-                rows.append((pk, date, PR.COL_FAM[mkt], mkt,
-                             float(br[mkt]), int(bool(fn(ar)))))
-        pact = gp[(gp.GamePk == pk)
+        act = gb[gb.GamePk == g.GamePk].set_index("PlayerId")
+        pact = gp[(gp.GamePk == g.GamePk)
                   & (gp.GS == 1)].set_index("PlayerId")
-        for pr_ in f["pit"]:
-            if pr_["ID"] not in pact.index:
-                continue
-            ar = pact.loc[pr_["ID"]]
-            if isinstance(ar, pd.DataFrame):
-                ar = ar.iloc[0]
-            for x in PR.K_LINES:
-                rows.append((pk, date, "pk", f"K > {x}",
-                             float(pr_[f"K > {x}"]), int(ar.SO > x)))
-            for x in PR.OUT_LINES:
-                rows.append((pk, date, "pout", f"Outs > {x}",
-                             float(pr_[f"Outs > {x}"]),
-                             int(ar.OUTS > x)))
-            for x in PR.PHA_LINES:
-                rows.append((pk, date, "pha", f"Hits > {x}",
-                             float(pr_[f"Hits > {x}"]), int(ar.H > x)))
-            for x in PR.PBB_LINES:
-                rows.append((pk, date, "pbb", f"BB > {x}",
-                             float(pr_[f"BB > {x}"]), int(ar.BB > x)))
-            for x in PR.PER_LINES:
-                rows.append((pk, date, "per", f"ER > {x}",
-                             float(pr_[f"ER > {x}"]), int(ar.ER > x)))
-        tot = (pd.to_numeric(g.AwayScore, errors="coerce")
-               + pd.to_numeric(g.HomeScore, errors="coerce"))
-        hw = int(pd.to_numeric(g.HomeScore, errors="coerce")
-                 > pd.to_numeric(g.AwayScore, errors="coerce"))
-        rows.append((pk, date, "ml", "home ML",
-                     float(f["game"]["_home_wp"]), hw))
-        for x in PR.TOTAL_LINES:
-            rows.append((pk, date, "tot", f"Runs > {x}",
-                         float(f["game"][f"Runs > {x}"]),
-                         int(tot > x)))
-        for x in PR.TEAM_TOTAL_LINES:
-            rows.append((pk, date, "tt", f"Away Runs > {x}",
-                         float(f["game"][f"Away Runs > {x}"]),
-                         int(pd.to_numeric(g.AwayScore,
-                                           errors="coerce") > x)))
-            rows.append((pk, date, "tt", f"Home Runs > {x}",
-                         float(f["game"][f"Home Runs > {x}"]),
-                         int(pd.to_numeric(g.HomeScore,
-                                           errors="coerce") > x)))
+        _emit_game_rows(rows, g, f, act, pact)
         n_done += 1
         if progress and n_done % 25 == 0:
             print(f"  replayed {n_done} games...", flush=True)
-    return pd.DataFrame(rows, columns=["GamePk", "Date", "family",
-                                       "market", "p", "y"])
+    return pd.DataFrame(rows, columns=ROW_COLS)
+
+
+ROW_COLS = ["GamePk", "Date", "family", "market", "p", "y", "PlayerId",
+            "Team", "Home"]
+
+
+def _emit_game_rows(rows, g, f, act, pact):
+    """Grade one simulated game frame against its box score and append
+    the ledger rows — shared by the classic and batched replay paths."""
+    pk = g.GamePk
+    date = str(pd.Timestamp(g.Date).date())
+    home_ab, away_ab = str(g.HomeTeam), str(g.AwayTeam)
+
+    for br in f["bat"]:
+        if br["ID"] not in act.index:
+            continue
+        ar = act.loc[br["ID"]]
+        if isinstance(ar, pd.DataFrame):
+            ar = ar.iloc[0]
+        if not (ar.PA > 0):
+            continue
+        bid, bteam = int(br["ID"]), str(br["Team"])
+        bhome = int(bteam == home_ab)
+        for mkt, fn in BAT_ACTUAL.items():
+            rows.append((pk, date, PR.COL_FAM[mkt], mkt,
+                         float(br[mkt]), int(bool(fn(ar))),
+                         bid, bteam, bhome))
+    for pr_ in f["pit"]:
+        if pr_["ID"] not in pact.index:
+            continue
+        ar = pact.loc[pr_["ID"]]
+        if isinstance(ar, pd.DataFrame):
+            ar = ar.iloc[0]
+        pid_, pteam = int(pr_["ID"]), str(pr_["Team"])
+        phome = int(pteam == home_ab)
+        for x in PR.K_LINES:
+            rows.append((pk, date, "pk", f"K > {x}",
+                         float(pr_[f"K > {x}"]), int(ar.SO > x),
+                         pid_, pteam, phome))
+        for x in PR.OUT_LINES:
+            rows.append((pk, date, "pout", f"Outs > {x}",
+                         float(pr_[f"Outs > {x}"]),
+                         int(ar.OUTS > x), pid_, pteam, phome))
+        for x in PR.PHA_LINES:
+            rows.append((pk, date, "pha", f"Hits > {x}",
+                         float(pr_[f"Hits > {x}"]), int(ar.H > x),
+                         pid_, pteam, phome))
+        for x in PR.PBB_LINES:
+            rows.append((pk, date, "pbb", f"BB > {x}",
+                         float(pr_[f"BB > {x}"]), int(ar.BB > x),
+                         pid_, pteam, phome))
+        for x in PR.PER_LINES:
+            rows.append((pk, date, "per", f"ER > {x}",
+                         float(pr_[f"ER > {x}"]), int(ar.ER > x),
+                         pid_, pteam, phome))
+    tot = (pd.to_numeric(g.AwayScore, errors="coerce")
+           + pd.to_numeric(g.HomeScore, errors="coerce"))
+    hw = int(pd.to_numeric(g.HomeScore, errors="coerce")
+             > pd.to_numeric(g.AwayScore, errors="coerce"))
+    rows.append((pk, date, "ml", "home ML",
+                 float(f["game"]["_home_wp"]), hw, -1, home_ab, 1))
+    for x in PR.TOTAL_LINES:
+        rows.append((pk, date, "tot", f"Runs > {x}",
+                     float(f["game"][f"Runs > {x}"]),
+                     int(tot > x), -1, home_ab, 1))
+    for x in PR.TEAM_TOTAL_LINES:
+        rows.append((pk, date, "tt", f"Away Runs > {x}",
+                     float(f["game"][f"Away Runs > {x}"]),
+                     int(pd.to_numeric(g.AwayScore,
+                                       errors="coerce") > x),
+                     -1, away_ab, 0))
+        rows.append((pk, date, "tt", f"Home Runs > {x}",
+                     float(f["game"][f"Home Runs > {x}"]),
+                     int(pd.to_numeric(g.HomeScore,
+                                       errors="coerce") > x),
+                     -1, home_ab, 1))
+
+
+def replay_rows_gpu(start, end, n_sims=4000, chunk=64, progress=True,
+                    backend="gpu", max_games=None):
+    """replay_rows on the batched pipeline: prep_batch amortizes the
+    pandas/model overhead across each chunk, sim_gpu runs the chunk as
+    one device batch. Same rows, ~10x the throughput."""
+    import prep_batch
+    import sim_gpu
+    P = PR.Predictor()
+    games = P.stores.raw["games"]
+    span = games[(games.Date >= pd.Timestamp(start))
+                 & (games.Date <= pd.Timestamp(end))]
+    if max_games:
+        span = span.head(max_games)
+    lineups, starters, umps, wx = B._spec_frames(P)
+    gb, gp = _load_actuals()
+    gb_by = {pk: d for pk, d in gb.groupby("GamePk")}
+    gp_by = {pk: d for pk, d in
+             gp[gp.GS == 1].groupby("GamePk")}
+    empty_b = gb.iloc[0:0].set_index("PlayerId")
+    empty_p = gp.iloc[0:0].set_index("PlayerId")
+
+    rows = []
+    state = {"done": 0, "chunk": 0}
+    pend_specs, pend_games = [], []
+
+    def flush():
+        if not pend_specs:
+            return
+        state["chunk"] += 1
+        pm = prep_batch.prepare_games(P, pend_specs, n_sims=n_sims)
+        res_list = sim_gpu.run_batch(
+            [p for p, _ in pm], n_sims=n_sims,
+            seed=1000 + state["chunk"],
+            seasons=[m["season"] for _, m in pm],
+            is_dh=[bool(s.get("is_dh")) for s in pend_specs],
+            backend=backend)
+        for res, (_, meta), spec, g in zip(res_list, pm, pend_specs,
+                                           pend_games):
+            res["meta"] = meta
+            res["spec"] = spec
+            res["calib"] = P.calib
+            f = PR.game_frame(res)
+            act = gb_by.get(g.GamePk)
+            act = (act.set_index("PlayerId") if act is not None
+                   else empty_b)
+            pact = gp_by.get(g.GamePk)
+            pact = (pact.set_index("PlayerId") if pact is not None
+                    else empty_p)
+            _emit_game_rows(rows, g, f, act, pact)
+            state["done"] += 1
+            if progress and state["done"] % 100 == 0:
+                print(f"  replayed {state['done']} games...",
+                      flush=True)
+        pend_specs.clear()
+        pend_games.clear()
+
+    for _, g in span.iterrows():
+        spec = B.build_spec(P, g, lineups, starters, umps, wx)
+        if len(spec["away_lineup"]) < 9 or None in (
+                spec["away_starter"], spec["home_starter"]):
+            continue
+        pend_specs.append(spec)
+        pend_games.append(g)
+        if len(pend_specs) >= chunk:
+            flush()
+    flush()
+    return pd.DataFrame(rows, columns=ROW_COLS)
 
 
 def grade_replay(start, end, n_sims=4000, max_games=None):
@@ -202,7 +292,7 @@ def grade_replay(start, end, n_sims=4000, max_games=None):
 
 
 def fit_calibrators(start, end, n_sims=4000, min_n=500,
-                    max_games=None, reuse_rows=False):
+                    max_games=None, reuse_rows=False, gpu=False):
     """One shared Platt map (logit-space logistic) per family; identity
     (absent) below min_n, on a single-class sample, or on a
     non-positive slope. Replay rows are cached to
@@ -213,7 +303,9 @@ def fit_calibrators(start, end, n_sims=4000, min_n=500,
         df = pd.read_parquet(cache)
         print(f"reusing {len(df):,} cached replay rows ({cache.name})")
     else:
-        df = replay_rows(start, end, n_sims, max_games)
+        df = (replay_rows_gpu(start, end, n_sims, max_games=max_games)
+              if gpu else
+              replay_rows(start, end, n_sims, max_games))
         df.to_parquet(cache)
     out = {}
     print(f"\nfitting calibrators on {len(df):,} rows "
@@ -243,6 +335,69 @@ def fit_calibrators(start, end, n_sims=4000, min_n=500,
     print(f"wrote {len(out)} family calibrators -> "
           f"{ART / 'output_calibrators.joblib'}")
     return out
+
+
+def skill_ledger(start=None, end=None):
+    """The honest where-does-the-model-have-skill document, computed
+    straight from artifacts/calib_rows.parquet — NEVER re-sims. Per
+    family and per market: n, base rate, raw and calibrated log loss vs
+    the base-rate baseline, AUC, Brier. Writes CSVs beside the parquet
+    and prints both tables."""
+    from sklearn.metrics import roc_auc_score
+    df = pd.read_parquet(ART / "calib_rows.parquet")
+    if start:
+        df = df[df.Date >= str(start)]
+    if end:
+        df = df[df.Date <= str(end)]
+    cal_path = ART / "output_calibrators.joblib"
+    cal = joblib.load(cal_path) if cal_path.exists() else {}
+    df = df.copy()
+    df["p_cal"] = df["p"]
+    for fam in df["family"].unique():
+        c = cal.get(fam)
+        if c is not None:
+            mask = df["family"] == fam
+            df.loc[mask, "p_cal"] = np.clip(
+                c.predict(df.loc[mask, "p"].values), 1e-6, 1 - 1e-6)
+
+    def _table(keys):
+        rep = []
+        for key, sub in df.groupby(keys):
+            key = key if isinstance(key, tuple) else (key,)
+            base = sub.y.mean()
+            try:
+                auc = (roc_auc_score(sub.y, sub.p)
+                       if sub.y.nunique() > 1 else np.nan)
+            except ValueError:
+                auc = np.nan
+            rep.append(dict(
+                **dict(zip(keys, key)),
+                n=len(sub), rate=round(base, 4),
+                mean_p=round(sub.p_cal.mean(), 4),
+                ll_raw=round(logloss(sub.y, sub.p), 5),
+                ll_cal=round(logloss(sub.y, sub.p_cal), 5),
+                ll_base=round(logloss(sub.y,
+                                      np.full(len(sub), base)), 5),
+                auc=round(auc, 4) if auc == auc else np.nan,
+                brier=round(brier(sub.y, sub.p_cal), 5)))
+        rep = pd.DataFrame(rep)
+        rep["gain"] = (rep.ll_base - rep.ll_cal).round(5)
+        return rep.sort_values("gain", ascending=False)
+
+    fam_rep = _table(["family"])
+    mkt_rep = _table(["family", "market"])
+    print(f"\nSKILL LEDGER: {len(df):,} rows, "
+          f"{df.GamePk.nunique():,} games, {df.Date.nunique()} slates "
+          f"({df.Date.min()}..{df.Date.max()})\n")
+    print("per family (gain = base-rate logloss - calibrated logloss):")
+    print(fam_rep.to_string(index=False))
+    print("\nper market:")
+    print(mkt_rep.to_string(index=False))
+    fam_rep.to_csv(ART / "skill_ledger_families.csv", index=False)
+    mkt_rep.to_csv(ART / "skill_ledger_markets.csv", index=False)
+    print(f"\nwrote skill_ledger_families.csv / skill_ledger_markets.csv"
+          f" -> {ART}")
+    return fam_rep, mkt_rep
 
 
 # ------------------------------------------------------- the CLV gate
@@ -446,19 +601,30 @@ if __name__ == "__main__":
     ap.add_argument("--fit-calibrators", action="store_true",
                     dest="fitcal")
     ap.add_argument("--gate", action="store_true")
-    ap.add_argument("--start", required=True)
-    ap.add_argument("--end", required=True)
+    ap.add_argument("--ledger", action="store_true",
+                    help="skill ledger from calib_rows.parquet (no "
+                         "re-sim; optional --start/--end filter)")
+    ap.add_argument("--start", default=None)
+    ap.add_argument("--end", default=None)
     ap.add_argument("--sims", type=int, default=4000)
     ap.add_argument("--max-games", type=int, default=None)
     ap.add_argument("--min-n", type=int, default=800)
     ap.add_argument("--reuse-rows", action="store_true",
                     help="refit from artifacts/calib_rows.parquet "
                          "instead of replaying")
+    ap.add_argument("--gpu", action="store_true",
+                    help="batched replay path (prep_batch + sim_gpu "
+                         "on CUDA)")
     args = ap.parse_args()
-    if args.fitcal:
+    needs_range = not (args.ledger or (args.fitcal and args.reuse_rows))
+    if needs_range and not (args.start and args.end):
+        ap.error("--start and --end are required for this mode")
+    if args.ledger:
+        skill_ledger(args.start, args.end)
+    elif args.fitcal:
         fit_calibrators(args.start, args.end, n_sims=args.sims,
                         max_games=args.max_games,
-                        reuse_rows=args.reuse_rows)
+                        reuse_rows=args.reuse_rows, gpu=args.gpu)
     elif args.gate:
         market_gate(args.start, args.end, n_sims=args.sims,
                     min_n=args.min_n)
