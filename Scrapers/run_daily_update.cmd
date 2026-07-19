@@ -4,7 +4,7 @@ REM   1. update_all --retrain   scrape + validate everything, retrain models
 REM   2. Sundays only           CLV gate refresh over the captured-odds window
 REM Everything game-day-facing is MANUAL by design (user preference
 REM 2026-07-19): slate fetch, odds capture, serving and grading are run by
-REM hand (Tools/1, Tools/2, GUI or Model/serve_slate.py, Tools/4).
+REM hand (Tools/1, Tools/2, GUI or "Model/predict.py --serve", Tools/4).
 REM Logs to Logs\update_YYYY-MM-DD.log; exit 1 if any step failed.
 
 set "ROOT=%~dp0.."

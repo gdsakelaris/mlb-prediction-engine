@@ -204,13 +204,13 @@ def _emit_game_rows(rows, g, f, act, pact):
                      -1, home_ab, 1))
 
 
-def replay_rows_gpu(start, end, n_sims=4000, chunk=64, progress=True,
-                    backend="gpu", max_games=None):
-    """replay_rows on the batched pipeline: prep_batch amortizes the
-    pandas/model overhead across each chunk, sim_gpu runs the chunk as
-    one device batch. Same rows, ~10x the throughput."""
-    import prep_batch
-    import sim_gpu
+def replay_rows_batch(start, end, n_sims=4000, chunk=64, progress=True,
+                      backend="gpu", max_games=None):
+    """replay_rows on the batched pipeline: sim_batch.prepare_games
+    amortizes the pandas/model overhead across each chunk, run_batch
+    runs the chunk as one device batch. Same rows, ~10x the
+    throughput."""
+    import sim_batch
     P = PR.Predictor()
     games = P.stores.raw["games"]
     span = games[(games.Date >= pd.Timestamp(start))
@@ -233,8 +233,8 @@ def replay_rows_gpu(start, end, n_sims=4000, chunk=64, progress=True,
         if not pend_specs:
             return
         state["chunk"] += 1
-        pm = prep_batch.prepare_games(P, pend_specs, n_sims=n_sims)
-        res_list = sim_gpu.run_batch(
+        pm = sim_batch.prepare_games(P, pend_specs, n_sims=n_sims)
+        res_list = sim_batch.run_batch(
             [p for p, _ in pm], n_sims=n_sims,
             seed=1000 + state["chunk"],
             seasons=[m["season"] for _, m in pm],
@@ -292,7 +292,7 @@ def grade_replay(start, end, n_sims=4000, max_games=None):
 
 
 def fit_calibrators(start, end, n_sims=4000, min_n=500,
-                    max_games=None, reuse_rows=False, gpu=False):
+                    max_games=None, reuse_rows=False, batched=False):
     """One shared Platt map (logit-space logistic) per family; identity
     (absent) below min_n, on a single-class sample, or on a
     non-positive slope. Replay rows are cached to
@@ -303,10 +303,10 @@ def fit_calibrators(start, end, n_sims=4000, min_n=500,
         df = pd.read_parquet(cache)
         print(f"reusing {len(df):,} cached replay rows ({cache.name})")
     else:
-        df = (replay_rows_gpu(start, end, n_sims, max_games=max_games)
-              if gpu else
+        df = (replay_rows_batch(start, end, n_sims, max_games=max_games)
+              if batched else
               replay_rows(start, end, n_sims, max_games))
-        df.to_parquet(cache)
+        F.write_artifact(cache, df.to_parquet)
     out = {}
     print(f"\nfitting calibrators on {len(df):,} rows "
           f"({df.GamePk.nunique()} games)")
@@ -331,7 +331,8 @@ def fit_calibrators(start, end, n_sims=4000, min_n=500,
         out[fam] = cal
         print(f"  {fam}: n={len(sub):,} logloss {before:.5f} -> "
               f"{after:.5f} (in-sample; a={a:+.3f}, b={b:.3f})")
-    joblib.dump(out, ART / "output_calibrators.joblib")
+    F.write_artifact(ART / "output_calibrators.joblib",
+                     lambda p: joblib.dump(out, p))
     print(f"wrote {len(out)} family calibrators -> "
           f"{ART / 'output_calibrators.joblib'}")
     return out
@@ -393,8 +394,10 @@ def skill_ledger(start=None, end=None):
     print(fam_rep.to_string(index=False))
     print("\nper market:")
     print(mkt_rep.to_string(index=False))
-    fam_rep.to_csv(ART / "skill_ledger_families.csv", index=False)
-    mkt_rep.to_csv(ART / "skill_ledger_markets.csv", index=False)
+    F.write_artifact(ART / "skill_ledger_families.csv",
+                     lambda p: fam_rep.to_csv(p, index=False), backup=False)
+    F.write_artifact(ART / "skill_ledger_markets.csv",
+                     lambda p: mkt_rep.to_csv(p, index=False), backup=False)
     print(f"\nwrote skill_ledger_families.csv / skill_ledger_markets.csv"
           f" -> {ART}")
     return fam_rep, mkt_rep
@@ -612,9 +615,9 @@ if __name__ == "__main__":
     ap.add_argument("--reuse-rows", action="store_true",
                     help="refit from artifacts/calib_rows.parquet "
                          "instead of replaying")
-    ap.add_argument("--gpu", action="store_true",
-                    help="batched replay path (prep_batch + sim_gpu "
-                         "on CUDA)")
+    ap.add_argument("--batched", action="store_true",
+                    help="batched replay path (sim_batch prepare_games "
+                         "+ run_batch on CUDA)")
     args = ap.parse_args()
     needs_range = not (args.ledger or (args.fitcal and args.reuse_rows))
     if needs_range and not (args.start and args.end):
@@ -624,7 +627,7 @@ if __name__ == "__main__":
     elif args.fitcal:
         fit_calibrators(args.start, args.end, n_sims=args.sims,
                         max_games=args.max_games,
-                        reuse_rows=args.reuse_rows, gpu=args.gpu)
+                        reuse_rows=args.reuse_rows, batched=args.batched)
     elif args.gate:
         market_gate(args.start, args.end, n_sims=args.sims,
                     min_n=args.min_n)

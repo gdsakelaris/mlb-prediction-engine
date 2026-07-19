@@ -60,7 +60,11 @@ first-pitch-strike% (pitcher) and fp_sw/fp_n first-pitch aggression
 --backfill also archives every raw pitch to Data/raw_pitches/
 pitches_{year}.parquet (~all Savant detail columns, zstd), so future
 schema changes re-aggregate from disk via --from-raw instead of paying
-another 6-hour Savant download.
+another 6-hour Savant download. Incremental runs EXTEND the current
+season's archive from wherever it ends (drop-refetch-window + append,
+atomic swap), so pa_table's source stays current daily — before
+2026-07-19 it only advanced on --backfill, leaving the PA spine stale
+between manual backfills.
 
 Relational keys: PlayerId is the MLBAM id used everywhere; one row per
 (PlayerId, Date).
@@ -76,6 +80,7 @@ Usage:
 
 import argparse
 import io
+import os
 import time
 from datetime import date, timedelta
 from pathlib import Path
@@ -447,6 +452,29 @@ def write_raw(year, frames):
     print(f"    raw archive: {len(df):,} pitches -> {path.name}", flush=True)
 
 
+def merge_raw(year, frames, cut):
+    """Extend one season's raw archive in place: drop archived rows on or
+    after `cut`, append the freshly fetched pitches (schema-aligned to
+    the archive), swap atomically. New-in-Savant columns are picked up at
+    the next --backfill; the incremental path preserves the archive's
+    schema so --from-raw stays consistent."""
+    if not frames:
+        return
+    path = RAW_DIR / f"pitches_{year}.parquet"
+    old = pd.read_parquet(path)
+    new = pd.concat(frames, ignore_index=True)
+    for c in new.select_dtypes(include="object").columns:
+        new[c] = new[c].astype(str).where(new[c].notna())
+    new = new.reindex(columns=old.columns)
+    keep = old[pd.to_datetime(old["game_date"]).dt.date < cut]
+    merged = pd.concat([keep, new], ignore_index=True)
+    tmp = path.with_name(path.name + ".tmp")
+    merged.to_parquet(tmp, index=False, compression="zstd")
+    os.replace(tmp, path)
+    print(f"    raw archive extended from {cut}: {len(old):,} -> "
+          f"{len(merged):,} pitches ({path.name})", flush=True)
+
+
 def load_existing(path, backfill):
     if backfill or not path.exists():
         return None, None, set()
@@ -495,6 +523,16 @@ def main():
             continue
         got = 0
         raw_chunks = [] if args.backfill else None
+        raw_merge_from = None
+        if raw_chunks is None and clip is not None and raw_path.exists():
+            # incremental: the archive may lag the CSVs (it used to
+            # advance only on --backfill) — fetch from wherever IT ends,
+            # re-pulling REFETCH_DAYS of it for Savant back-corrections
+            rmax = pd.to_datetime(pd.read_parquet(
+                raw_path, columns=["game_date"])["game_date"]).max().date()
+            raw_merge_from = min(clip, rmax - timedelta(days=REFETCH_DAYS))
+            raw_chunks = []
+            clip = raw_merge_from
         for d0, d1 in season_windows(year, clip):
             raw = fetch_range(d0, d1)
             if raw_chunks is not None and not raw.empty:
@@ -506,7 +544,10 @@ def main():
                 bat_frames.append(bat)
             time.sleep(SLEEP)
         if raw_chunks is not None:
-            write_raw(year, raw_chunks)
+            if raw_merge_from is not None:
+                merge_raw(year, raw_chunks, raw_merge_from)
+            else:
+                write_raw(year, raw_chunks)
             raw_chunks.clear()
         print(f"{year}: {got:,} pitches", flush=True)
 

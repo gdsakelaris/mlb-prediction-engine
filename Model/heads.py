@@ -15,12 +15,12 @@ heads_report.csv). Serving applies the artifact in
 predict._apply_heads (after the family calibrators, with a cross-line
 ladder guard); replays never load heads, so calib_rows stays raw and
 heads always retrain against an unadjusted base. Retrain here after
-every calibration replay (team_context.py --build first if game
+every calibration replay (features.py --only teamctx first if game
 results have advanced).
 
 Requires: calib_rows.parquet WITH identity columns (PlayerId/Team/Home
 — replays run after 2026-07-19) and stores/team_game_context.parquet
-(python Model/team_context.py --build).
+(python Model/features.py --only teamctx).
 
 Usage:
     python Model/heads.py --train
@@ -167,8 +167,10 @@ def train(min_rows=3000, holdout=0.25, seed=7):
           f"stopped to 0 trees; gain = held-out logloss improvement "
           f"over Platt-only):")
     print(rep.to_string(index=False))
-    joblib.dump(heads, ART / "residual_heads.joblib")
-    rep.to_csv(ART / "heads_report.csv", index=False)
+    F.write_artifact(ART / "residual_heads.joblib",
+                     lambda p: joblib.dump(heads, p))
+    F.write_artifact(ART / "heads_report.csv",
+                     lambda p: rep.to_csv(p, index=False), backup=False)
     print(f"\nwrote residual_heads.joblib + heads_report.csv -> {ART}")
     return rep
 

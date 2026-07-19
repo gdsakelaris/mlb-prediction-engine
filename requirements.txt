@@ -19,4 +19,4 @@ joblib==1.5.2
 Pillow==11.3.0
 lightgbm==4.6.0
 xgboost==3.0.5
-cupy-cuda12x==13.6.0
+cupy-cuda12x==14.1.1

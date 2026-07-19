@@ -25,6 +25,8 @@ Stores built (python Model/features.py --build):
                             discipline/velocity, starter leash
   park_factors.parquet      per (Venue, Year) per-class multipliers from
                             the three PRIOR seasons, shrunk toward 1
+  park_geo.parquet          static fence distances (LF/CF/RF) and
+                            elevation by venue (porch/carry geometry)
   ump_factors.parquet       per (HpUmpId, Year) K/BB multipliers from
                             prior seasons, shrunk toward 1
   defense_team.parquet      prior-season team OAA + battery (framing,
@@ -62,6 +64,9 @@ drift.
 
 import argparse
 import json
+import os
+import shutil
+from collections import deque
 from datetime import date
 from pathlib import Path
 
@@ -73,6 +78,24 @@ DATA = ROOT / "Data"
 RAW = DATA / "raw_pitches"
 ART = ROOT / "Model" / "artifacts"
 STORES = ART / "stores"
+
+
+def write_artifact(path, write_fn, backup=True):
+    """Overwrite a serve artifact safely (the odds-store discipline):
+    copy the existing file to <dir>/backups/ first (single-generation
+    last-known-good, the rollback path after a bad retrain/replay), then
+    write to a temp path and swap in atomically — a crash mid-write can
+    never leave a truncated artifact serving. write_fn receives the temp
+    Path. backup=False for cheap derived reports where atomicity is
+    enough."""
+    path = Path(path)
+    if backup and path.exists():
+        bdir = path.parent / "backups"
+        bdir.mkdir(exist_ok=True)
+        shutil.copy2(path, bdir / path.name)
+    tmp = path.with_name(path.name + ".tmp")
+    write_fn(tmp)
+    os.replace(tmp, path)
 
 DECAY_HL = 90.0          # days; skill half-life for decayed panels
 VELO_HL_FAST = 30.0      # short-window velo (in-season trend vs baseline)
@@ -95,6 +118,15 @@ RAMP_NP = 60             # last start under 60 pitches = ramping up
 SHORT_START_OUTS = 12    # <= 12 outs = short start (opener / quick hook)
 CARRY_CF_W = 0.7         # CF wind helps both pull sides at this weight
 CARRY_OPP_W = 0.2        # opposite-field wind still helps a little
+
+# form-trend / HR-quality / park-geometry knobs (2026-07-19 wave 3,
+# mined from the old model's remaining families)
+TREND_HL = 30.0          # fast half-life; trend = fast rate - 90d rate
+HRQ_K = 10.0             # career HRs of shrinkage for HR EV/distance
+LG_SPRINT = 27.0         # ft/s league sprint speed (leg-hit pivot)
+SEA_LVL_FT = 0.005       # ft of HR carry per ft of park elevation
+PORCH_REF = 330.0        # nominal pull-fence distance porch terms center on
+AIR_REF = 0.1017         # Pressure/tempK at 29.92 inHg & 70F ("thin air" 0)
 PITCH_CLASS = {          # arsenal codes -> fast / breaking / offspeed
     "FF": "fast", "SI": "fast", "FC": "fast",
     "SL": "brk", "ST": "brk", "CU": "brk", "KC": "brk", "SV": "brk",
@@ -361,14 +393,18 @@ def _daily_class_counts(pa, ent, by_hand_col=None):
 
 def build_outcome_panels(pa):
     specs = [
-        ("panel_bat_out", "BatterId", None),
-        ("panel_bat_out_hand", "BatterId", "p_throws"),
-        ("panel_bat_out_loc", "BatterId", "home_bat"),
-        ("panel_pit_out", "PitcherId", None),
-        ("panel_pit_out_hand", "PitcherId", "stand"),
-        ("panel_pit_out_tto", "PitcherId", "tto"),
+        ("panel_bat_out", "BatterId", None, DECAY_HL),
+        ("panel_bat_out_hand", "BatterId", "p_throws", DECAY_HL),
+        ("panel_bat_out_loc", "BatterId", "home_bat", DECAY_HL),
+        ("panel_pit_out", "PitcherId", None, DECAY_HL),
+        ("panel_pit_out_hand", "PitcherId", "stand", DECAY_HL),
+        ("panel_pit_out_tto", "PitcherId", "tto", DECAY_HL),
+        # fast-decay twins of the overall panels: assemble emits the
+        # DELTA vs the 90d rate (hot/cold form the slow panel smooths)
+        ("panel_bat_out_fast", "BatterId", None, TREND_HL),
+        ("panel_pit_out_fast", "PitcherId", None, TREND_HL),
     ]
-    for name, ent, hand in specs:
+    for name, ent, hand, hl in specs:
         sub = pa.dropna(subset=[ent])
         if hand == "tto":
             # per-times-through-order pitcher rates: the sim's TTO axis
@@ -378,7 +414,7 @@ def build_outcome_panels(pa):
                              .astype("int64"))
         daily = _daily_class_counts(sub, ent, hand)
         ents = [ent] + ([hand] if hand else [])
-        panel = decayed_panel(daily, ents, ["pa"] + CLASSES)
+        panel = decayed_panel(daily, ents, ["pa"] + CLASSES, hl=hl)
         panel.to_parquet(STORES / f"{name}.parquet", index=False)
         print(f"{name}: {len(panel):,} entity-days", flush=True)
 
@@ -547,8 +583,8 @@ def build_il_table():
 
 def build_bat_tracking_table():
     """Statcast bat tracking (2023+), consumed PRIOR-season like every
-    other season-grain table. NaN before the tracked era — HGBT handles
-    missing natively."""
+    other season-grain table. NaN before the tracked era — XGBoost
+    handles missing natively."""
     bt = read_csv("mlb_bat_tracking.csv",
                   usecols=["Year", "PlayerId", "Swings", "BatSpeed",
                            "HardSwingRate", "SwingLength",
@@ -614,23 +650,41 @@ def build_hrpt_tables():
         if cls:
             disp2cls[str(r["Pitch"])] = cls
     hr = read_csv("mlb_homeruns.csv",
-                  usecols=["BatterId", "Date", "Pitch"])
+                  usecols=["BatterId", "Date", "Pitch", "Exit Velo",
+                           "Distance", "Ballpark"])
     hr["Date"] = pd.to_datetime(hr["Date"], errors="coerce")
     hr["BatterId"] = _num(hr["BatterId"])
     hr = hr.dropna(subset=["BatterId", "Date"]).copy()
     hr["BatterId"] = hr["BatterId"].astype("int64")
+    # HR quality: exit velo + sea-level-adjusted distance (each batter's
+    # BEST contact — censored sample, so heavily shrunk at assemble).
+    # Elevation credit keeps Coors homers from inflating raw power.
+    bp = read_csv("mlb_ballparks.csv",
+                  usecols=["Ballpark", "Elevation_ft"]
+                  ).drop_duplicates("Ballpark")
+    hr = hr.merge(bp, on="Ballpark", how="left")
+    ev = _num(hr["Exit Velo"])
+    dist = (_num(hr["Distance"])
+            - SEA_LVL_FT * _num(hr["Elevation_ft"]).fillna(0.0))
+    hr["ev_n"], hr["ev_sum"] = ev.notna().astype(float), ev.fillna(0.0)
+    hr["dist_n"] = dist.notna().astype(float)
+    hr["dist_sum"] = dist.fillna(0.0)
     hr["cls"] = hr["Pitch"].astype(str).map(disp2cls)
     hr = hr.dropna(subset=["cls"])
     for cls in ("fast", "brk", "off"):
         hr[f"hr_{cls}"] = (hr["cls"] == cls).astype(float)
     hr["hr_n"] = 1.0
+    qcols = ["hr_n", "hr_fast", "hr_brk", "hr_off",
+             "ev_n", "ev_sum", "dist_n", "dist_sum"]
     daily = hr.groupby(["BatterId", "Date"], sort=False)[
-        ["hr_n", "hr_fast", "hr_brk", "hr_off"]].sum().reset_index()
-    panel = decayed_panel(daily, ["BatterId"],
-                          ["hr_n", "hr_fast", "hr_brk", "hr_off"],
-                          hl=HRPT_HL)
+        qcols].sum().reset_index()
+    panel = decayed_panel(daily, ["BatterId"], qcols, hl=HRPT_HL)
     panel.to_parquet(STORES / "panel_bat_hrmix.parquet", index=False)
     lg = {c: float(hr[f"hr_{c}"].mean()) for c in ("fast", "brk", "off")}
+    lg["ev_mean"] = float((hr["ev_sum"].sum()
+                           / max(hr["ev_n"].sum(), 1.0)))
+    lg["dist_mean"] = float((hr["dist_sum"].sum()
+                             / max(hr["dist_n"].sum(), 1.0)))
     (STORES / "hrmix_league.json").write_text(json.dumps(lg, indent=1))
     ars["Year"] = _num(ars["Year"]) + 1      # serve year = prior + 1
     ars["usage"] = _num(ars["%"]) / 100.0
@@ -726,6 +780,42 @@ def build_park_factors(pa):
           f"(+{len(outh):,} handed HR rows)", flush=True)
 
 
+def build_park_geometry(pa):
+    """Static park geometry serving surface: fence distances by field
+    plus elevation, keyed by Venue name. Geometry gives HR features the
+    park factor can't: WHERE the fences are short lets batter-specific
+    pull/porch fits exist. Unmatched venues (renames, international
+    sites) come through as NaN and the trees route around them."""
+    bp = read_csv("mlb_ballparks.csv",
+                  usecols=["Ballpark", "LF", "CF", "RF", "Elevation_ft"])
+    bp = bp.rename(columns={"Ballpark": "Venue"}).drop_duplicates("Venue")
+    for c in ("LF", "CF", "RF", "Elevation_ft"):
+        bp[c] = _num(bp[c])
+    # historical names of CURRENT parks (sponsor renames — same physical
+    # geometry). Departed parks (Oakland Coliseum, Turner Field, Globe
+    # Life PARK, alternate sites) stay NaN deliberately.
+    aliases = {"Miller Park": "American Family Field",
+               "AT&T Park": "Oracle Park",
+               "Safeco Field": "T-Mobile Park",
+               "SunTrust Park": "Truist Park",
+               "Angel Stadium of Anaheim": "Angel Stadium",
+               "U.S. Cellular Field": "Rate Field",
+               "Guaranteed Rate Field": "Rate Field",
+               "Minute Maid Park": "Daikin Park",
+               "Marlins Park": "loanDepot Park",
+               "Oriole Park": "Oriole Park at Camden Yards"}
+    amap = pd.DataFrame({"Venue": list(aliases),
+                         "src": list(aliases.values())})
+    extra = amap.merge(bp.rename(columns={"Venue": "src"}), on="src")
+    bp = pd.concat([bp, extra[bp.columns]], ignore_index=True)
+    bp.to_parquet(STORES / "park_geo.parquet", index=False)
+    seen = pa["Venue"].dropna().unique()
+    cov = float(np.isin(seen, bp["Venue"].values).mean()) if len(seen) \
+        else 0.0
+    print(f"park_geo: {len(bp)} parks; covers {cov:.0%} of "
+          f"{len(seen)} pa venues", flush=True)
+
+
 def build_ump_factors(pa):
     """Per (HpUmpId, Year) K/BB multipliers from prior seasons, shrunk
     toward 1; the CURRENT season's row also pools its own season-to-date
@@ -762,6 +852,43 @@ def build_ump_factors(pa):
         agg["Year"] = year
         rows.append(agg[["HpUmpId", "Year", "uf_K", "uf_BB"]])
     out = pd.concat(rows, ignore_index=True)
+
+    # runs-per-game multiplier: the residual run environment an ump
+    # carries beyond what his K/BB factors mediate (zone size at the
+    # margins, hit-by-pitch temperament); same windowing as K/BB,
+    # game-grain shrinkage (K_UMP_G games of league belief)
+    K_UMP_G = 40
+    g = read_csv("mlb_games.csv",
+                 usecols=["GamePk", "Season", "AwayScore", "HomeScore"])
+    u = read_csv("mlb_umpires.csv", usecols=["GamePk", "HpUmpId"])
+    g = g.merge(u, on="GamePk", how="inner")
+    g["runs"] = _num(g["AwayScore"]) + _num(g["HomeScore"])
+    g = g.dropna(subset=["runs", "HpUmpId"])
+    g["HpUmpId"] = _num(g["HpUmpId"]).astype("int64")
+    g["Season"] = _num(g["Season"]).astype("int64")
+    gr = g.groupby(["HpUmpId", "Season"], sort=False).agg(
+        g_n=("runs", "size"), r_sum=("runs", "sum")).reset_index()
+    lgr = g.groupby("Season")["runs"].mean().rename("lg_rg").reset_index()
+    rrows = []
+    for year in range(int(g.Season.min()) + 1, int(g.Season.max()) + 2):
+        in_win = ((gr.Season < year)
+                  | ((gr.Season == year) & (year == cur)))
+        window = gr[in_win]
+        if window.empty:
+            continue
+        agg = window.groupby("HpUmpId")[["g_n", "r_sum"]].sum(
+            ).reset_index()
+        lgw = float(lgr[(lgr.Season < year)
+                        | ((lgr.Season == year) & (year == cur))][
+            "lg_rg"].mean())
+        w = agg["g_n"] / (agg["g_n"] + K_UMP_G)
+        agg["uf_R"] = 1.0 + w * ((agg["r_sum"]
+                                  / agg["g_n"].clip(lower=1))
+                                 / max(lgw, 1e-9) - 1.0)
+        agg["Year"] = year
+        rrows.append(agg[["HpUmpId", "Year", "uf_R"]])
+    out = out.merge(pd.concat(rrows, ignore_index=True),
+                    on=["HpUmpId", "Year"], how="outer")
     out.to_parquet(STORES / "ump_factors.parquet", index=False)
     print(f"ump_factors: {len(out):,} ump-years", flush=True)
 
@@ -776,6 +903,20 @@ def build_defense_tables():
     cat = cat[["Year", "Team", "FrameRV_pt", "PopTime", "CSAA_att",
                "SBAtt"]]
     out = oaa.merge(cat, on=["Year", "Team"], how="outer")
+    # unearned-run rate: error-proneness OAA's range component misses
+    # (prior season, (R-ER)*27/outs from the team's pitching lines)
+    gp = read_csv("mlb_game_pitching.csv",
+                  usecols=["Season", "Team", "IP", "R", "ER"])
+    ip = _num(gp["IP"]).fillna(0.0)
+    gp["outs"] = (ip.astype(int) * 3
+                  + ((ip - ip.astype(int)) * 10).round().astype(int))
+    gp["uer"] = _num(gp["R"]).fillna(0.0) - _num(gp["ER"]).fillna(0.0)
+    uer = gp.groupby(["Season", "Team"], sort=False).agg(
+        outs=("outs", "sum"), uer=("uer", "sum")).reset_index()
+    uer["def_uer"] = uer["uer"] * 27.0 / uer["outs"].clip(lower=1)
+    uer["Year"] = _num(uer["Season"]) + 1        # serve year = prior + 1
+    out = out.merge(uer[["Year", "Team", "def_uer"]],
+                    on=["Year", "Team"], how="left")
     out.to_parquet(STORES / "defense_team.parquet", index=False)
     catp = read_csv("mlb_catchers.csv")
     catp["Year"] = _num(catp["Year"]) + 1
@@ -1459,14 +1600,19 @@ def load_stores():
                  "arsenal_class_usage", "arsenal_meta",
                  "milb_priors_pit", "panel_bat_out_loc", "park_hand",
                  "panel_pit_out_tto", "panel_bvp", "panel_bat_sched",
-                 "league_env_daily"):
+                 "league_env_daily", "panel_bat_out_fast",
+                 "panel_pit_out_fast", "park_geo"):
         s[name] = pd.read_parquet(STORES / f"{name}.parquet")
     s["eb_k"] = json.loads((STORES / "eb_k.json").read_text())
     s["hrmix_league"] = json.loads(
         (STORES / "hrmix_league.json").read_text())
-    ros = read_csv("mlb_rosters.csv", usecols=["PlayerId", "DOB"])
+    ros = read_csv("mlb_rosters.csv",
+                   usecols=["PlayerId", "DOB", "Ht", "Wt"])
     ros["dob"] = pd.to_datetime(ros["DOB"], format="%m/%d/%Y",
                                 errors="coerce")
+    hw = ros["Ht"].astype(str).str.extract(r"(\d+)'\s*(\d+)")
+    ros["ht_in"] = _num(hw[0]) * 12 + _num(hw[1])
+    ros["wt"] = _num(ros["Wt"])
     s["dob"] = ros.dropna(subset=["dob"]).drop_duplicates("PlayerId")
     spr = read_csv("mlb_sprint_speed.csv",
                    usecols=["Year", "PlayerId", "SprintSpeed"])
@@ -1570,6 +1716,34 @@ def assemble_features(rows, stores):
     out.update({c: m[c] for c in m.columns})
     out = _shrunk_rates(out, "pt_", "pt_pa", PIT_RATES, pri_p,
                         stores["eb_k"])
+
+    # ---- HBP rates (A1 predicts the class; give it more than the
+    # league marginal — plunk-prone pitchers and crowd-the-plate
+    # batters are real, stable axes)
+    out = _shrunk_rates(out, "b_", "b_pa", ["HBP"], pri_b,
+                        stores["eb_k"], milb=mm)
+    out = _shrunk_rates(out, "p_", "p_pa", ["HBP"], pri_p,
+                        stores["eb_k"], milb=pmm)
+
+    # ---- outcome form trend: fast-decay (30d) shrunk rate minus the
+    # 90d rate. Both arms shrink to the SAME prior, so thin samples and
+    # rookies collapse to zero trend instead of a spurious one.
+    m = merge_asof_panel(rows, stores["panel_bat_out_fast"],
+                         ["BatterId"], ["pa"] + CLASSES, "btr_",
+                         hl=TREND_HL)
+    out.update({c: m[c] for c in m.columns})
+    out = _shrunk_rates(out, "btr_", "btr_pa", ["K", "BB", "HR", "1B"],
+                        pri_b, stores["eb_k"], milb=mm)
+    for c in ("K", "BB", "HR", "1B"):
+        out[f"b_tr_{c}"] = out[f"btr_{c}_rate"] - out[f"b_{c}_rate"]
+    m = merge_asof_panel(rows, stores["panel_pit_out_fast"],
+                         ["PitcherId"], ["pa"] + CLASSES, "ptr_",
+                         hl=TREND_HL)
+    out.update({c: m[c] for c in m.columns})
+    out = _shrunk_rates(out, "ptr_", "ptr_pa", ["K", "BB", "HR", "1B"],
+                        pri_p, stores["eb_k"], milb=pmm)
+    for c in ("K", "BB", "HR", "1B"):
+        out[f"p_tr_{c}"] = out[f"ptr_{c}_rate"] - out[f"p_{c}_rate"]
 
     # ---- batted-ball quality and pitch-level discipline
     for panel, ent, pref in (("panel_bat_bip", "BatterId", "bq_"),
@@ -1732,20 +1906,26 @@ def assemble_features(rows, stores):
                 right_on=["HpUmpId", "Year"], how="left")
     out["uf_K"] = j["uf_K"].fillna(1.0).values
     out["uf_BB"] = j["uf_BB"].fillna(1.0).values
+    out["uf_R"] = j["uf_R"].fillna(1.0).values
     dt_ = stores["defense_team"]
     j = rows[["fld_team", "Season"]].merge(
         dt_, left_on=["fld_team", "Season"], right_on=["Team", "Year"],
         how="left")
     out["def_oaa"] = j["def_oaa"].fillna(0.0).values
     out["frame_rv"] = j["FrameRV_pt"].fillna(0.0).values
+    out["def_uer"] = j["def_uer"].values
 
     dob = stores["dob"]
     j = rows[["BatterId", "Date"]].merge(
         dob, left_on="BatterId", right_on="PlayerId", how="left")
     out["b_age"] = ((j["Date"] - j["dob"]).dt.days / 365.25).values
+    out["b_ht"] = j["ht_in"].values
+    out["b_wt"] = j["wt"].values
     j = rows[["PitcherId", "Date"]].merge(
         dob, left_on="PitcherId", right_on="PlayerId", how="left")
     out["p_age"] = ((j["Date"] - j["dob"]).dt.days / 365.25).values
+    out["p_ht"] = j["ht_in"].values
+    out["p_wt"] = j["wt"].values
 
     out["same_hand"] = (rows["stand"].astype(str)
                         == rows["p_throws"].astype(str)).astype(float)
@@ -1898,9 +2078,19 @@ def assemble_features(rows, stores):
 
     # ---- HR pitch-class matchup: batter HR mix vs THIS arsenal
     m = merge_asof_panel(rows, stores["panel_bat_hrmix"], ["BatterId"],
-                         ["hr_n", "hr_fast", "hr_brk", "hr_off"],
+                         ["hr_n", "hr_fast", "hr_brk", "hr_off",
+                          "ev_n", "ev_sum", "dist_n", "dist_sum"],
                          "hm_", hl=HRPT_HL)
     lgmix = stores["hrmix_league"]
+    # HR quality: how hard/far this batter's homers go (censored — only
+    # best contact is in the log — hence the heavy shrink); the distance
+    # arm feeds the porch-margin geometry fit below
+    out["b_hrq_ev"] = ((m["hm_ev_sum"].fillna(0.0)
+                        + HRQ_K * lgmix["ev_mean"])
+                       / (m["hm_ev_n"].fillna(0.0) + HRQ_K))
+    out["b_hrq_dist"] = ((m["hm_dist_sum"].fillna(0.0)
+                          + HRQ_K * lgmix["dist_mean"])
+                         / (m["hm_dist_n"].fillna(0.0) + HRQ_K))
     cu = stores["arsenal_class_usage"]
     j = rows[["PitcherId", "Season"]].merge(
         cu, left_on=["PitcherId", "Season"],
@@ -1931,6 +2121,40 @@ def assemble_features(rows, stores):
         phh, left_on=["Venue", "Season", "stand"],
         right_on=["Venue", "Year", "stand"], how="left")
     out["pf_HR_hand"] = j["pf_HR_h"].fillna(1.0).values
+
+    # ---- park geometry + carry physics (trees can't multiply, so the
+    # porch/carry collisions are materialized as mx_ products)
+    pg = stores["park_geo"]
+    j = rows[["Venue"]].merge(pg, on="Venue", how="left")
+    elev_kft = j["Elevation_ft"].values / 1000.0
+    out["park_elev"] = elev_kft
+    pull_fence = np.where(rows["stand"].astype(str) == "R",
+                          j["LF"].values, j["RF"].values)
+    out["pull_fence"] = pull_fence
+    porch = PORCH_REF - pull_fence
+    # batter's adjusted HR distance vs the fence he pulls toward
+    out["mx_porch_margin"] = out["b_hrq_dist"] - pull_fence
+    out["mx_wind_porch"] = np.asarray(out["wind_pull"]) * porch
+    out["mx_carry_elev"] = (np.asarray(out["temp"]) - 70.0) * elev_kft
+    out["mx_air_porch"] = ((AIR_REF - np.asarray(out["air_density"]))
+                           * porch)
+
+    # ---- framing collisions: a good receiver hurts passive hitters
+    # and pays off edge-heavy pitchers
+    out["mx_frame_take"] = (np.asarray(out["frame_rv"])
+                            * np.asarray(out["bm_f32_take"]))
+    out["mx_frame_edge"] = (np.asarray(out["frame_rv"])
+                            * np.asarray(out["pm_edge"]))
+
+    # ---- sprint speed + leg-hit collision (fast + ground-ball profile
+    # = infield hits the 1B-class rate alone can't attribute)
+    spr = stores["sprint"].drop_duplicates(["PlayerId", "Year"])
+    j = rows[["BatterId", "Season"]].merge(
+        spr, left_on=["BatterId", "Season"],
+        right_on=["PlayerId", "Year"], how="left")
+    out["b_sprint"] = j["SprintSpeed"].values
+    out["mx_leg_hits"] = ((j["SprintSpeed"].values - LG_SPRINT)
+                          * np.asarray(out["bq_gb"]))
 
     # ---- batter schedule fatigue (rest days, games last 7/14 days)
     sch = stores["panel_bat_sched"].sort_values("Date")
@@ -1978,10 +2202,248 @@ def assemble_features(rows, stores):
     out["lg_rpg30"] = np.where((dg < 50).values, np.nan, out["lg_rpg30"])
 
     drop = {f"{p}{cl}"
-            for p in ("b_", "bh_", "bl_", "p_", "ph_", "pt_")
+            for p in ("b_", "bh_", "bl_", "p_", "ph_", "pt_",
+                      "btr_", "ptr_")
             for cl in CLASSES + ["pa", "HBP", "IPO"]} | {"Date", "Season"}
+    # fast-panel helper columns: only the b_tr_/p_tr_ DELTAS survive
+    drop |= {f"{p}{c}_rate" for p in ("btr_", "ptr_")
+             for c in ("K", "BB", "HR", "1B")}
+    drop |= {"btr_log_pa", "ptr_log_pa"}
     X = pd.DataFrame({c: v for c, v in out.items() if c not in drop})
     return X, list(X.columns)
+
+
+# ------------------------------------------- team-game context (heads)
+# Elo, recent form, rest/travel/schedule spots for the residual heads.
+# NONE of this feeds the component models or the sim — the simulator
+# generates game structure from components; these are exactly the
+# reduced-form signals that belong in the residual heads, where the sim
+# probability stays the anchor and count coherence is never at risk.
+# build_team_context writes stores/team_game_context.parquet (one row
+# per GamePk, away_/home_ prefixed, every value as-of strictly before
+# first pitch); slate_context runs the same state machine for an
+# upcoming slate at serve time.
+
+ELO_K = 4.0            # per-game update size
+ELO_HFA = 24.0         # home-field advantage, Elo points
+ELO_REGRESS = 1 / 3    # season-start regression toward 1500
+FORM_G = 10            # recent-form window (games)
+PYTH_EXP = 1.83
+TZ_DEG_PER_HR = 15.0
+EARTH_R_KM = 6371.0
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    p1, p2 = np.radians(lat1), np.radians(lat2)
+    dl = np.radians(lon2 - lon1)
+    a = (np.sin((p2 - p1) / 2) ** 2
+         + np.cos(p1) * np.cos(p2) * np.sin(dl / 2) ** 2)
+    return float(2 * EARTH_R_KM * np.arcsin(np.sqrt(a)))
+
+
+def _baseruns(h, bb, hbp, tb, hr, ab):
+    """Team-game BaseRuns expectation (sequencing-free run estimate)."""
+    a = h + bb + hbp - hr
+    b = 1.1 * (1.4 * tb - 0.6 * h - 3.0 * hr + 0.1 * (bb + hbp))
+    c = max(ab - h, 1.0)
+    return a * b / max(b + c, 1e-9) + hr
+
+
+def _team_game_maps():
+    """(GamePk, Team) -> bullpen line (ER/outs/NP), starter outs, and
+    the batting line BaseRuns needs. Everything is post-game truth,
+    consumed only via the running pregame state."""
+    gp = read_csv("mlb_game_pitching.csv",
+                  usecols=["GamePk", "Team", "GS", "IP", "ER", "NP"])
+    gp["GamePk"] = pd.to_numeric(gp["GamePk"], errors="coerce")
+    ip = pd.to_numeric(gp["IP"], errors="coerce").fillna(0)
+    gp["outs"] = (ip.astype(int) * 3 + round((ip % 1) * 10)).astype(float)
+    gp["ER"] = pd.to_numeric(gp["ER"], errors="coerce").fillna(0)
+    gp["NP"] = pd.to_numeric(gp["NP"], errors="coerce").fillna(0)
+    gs = pd.to_numeric(gp["GS"], errors="coerce").fillna(0)
+    pen = gp[gs == 0].groupby(["GamePk", "Team"]).agg(
+        er=("ER", "sum"), outs=("outs", "sum"),
+        np_=("NP", "sum"))
+    st = gp[gs == 1].groupby(["GamePk", "Team"])["outs"].sum()
+    gb = read_csv("mlb_game_batting.csv",
+                  usecols=["GamePk", "Team", "AB", "H", "2B", "3B",
+                           "HR", "BB", "HBP", "TB", "R"])
+    gb["GamePk"] = pd.to_numeric(gb["GamePk"], errors="coerce")
+    for c in ("AB", "H", "2B", "3B", "HR", "BB", "HBP", "TB", "R"):
+        gb[c] = pd.to_numeric(gb[c], errors="coerce").fillna(0)
+    bat = gb.groupby(["GamePk", "Team"])[["AB", "H", "HR", "BB", "HBP",
+                                          "TB", "R"]].sum()
+    return pen.to_dict("index"), st.to_dict(), bat.to_dict("index")
+
+
+def _load_games():
+    games = read_csv("mlb_games.csv")
+    games["Date"] = pd.to_datetime(games["Date"])
+    games["GamePk"] = pd.to_numeric(games["GamePk"], errors="coerce")
+    for c in ("AwayScore", "HomeScore"):
+        games[c] = pd.to_numeric(games[c], errors="coerce")
+    return games.dropna(subset=["GamePk", "Date"]).sort_values(
+        ["Date", "GamePk"]).reset_index(drop=True)
+
+
+def _ctx_inputs():
+    parks = read_csv("mlb_ballparks.csv")
+    coords = {}
+    for _, r in parks.iterrows():
+        try:
+            coords[r["Ballpark"]] = (float(r["Lat"]), float(r["Lon"]))
+        except (TypeError, ValueError):
+            pass
+    return coords, _team_game_maps()
+
+
+def _context_rows(games, coords, pen_map, st_map, bat_map):
+    """The pre-game state machine, one emitted row per game. Games with
+    NaN scores contribute no post-game update — which is exactly how an
+    upcoming slate rides through: state from history, no result."""
+    elo, season_seen, state = {}, {}, {}
+    rows = []
+    for g in games.itertuples(index=False):
+        date, pk = g.Date, int(g.GamePk)
+        side_vals = {}
+        for side, team in (("away", g.AwayTeam), ("home", g.HomeTeam)):
+            if season_seen.get(team) != g.Season:
+                elo[team] = (1500.0 + (1 - ELO_REGRESS)
+                             * (elo.get(team, 1500.0) - 1500.0))
+                season_seen[team] = g.Season
+                st = state.get(team)
+                if st:
+                    st["recent"].clear()
+                    st["pen"].clear()
+                    st["np3"].clear()
+                    st["st_outs"].clear()
+                    st["bsr"].clear()
+                    st.update(rf=0.0, ra=0.0, w=0.0, n=0.0)
+            st = state.setdefault(team, dict(
+                prev_date=None, prev_venue=None, prev_dn=None,
+                recent=deque(maxlen=FORM_G), rf=0.0, ra=0.0, w=0.0,
+                n=0.0, pen=deque(maxlen=30), np3=deque(),
+                st_outs=deque(maxlen=20), bsr=deque(maxlen=20)))
+            while st["np3"] and (date - st["np3"][0][0]).days > 3:
+                st["np3"].popleft()
+            rest = ((date - st["prev_date"]).days
+                    if st["prev_date"] is not None else np.nan)
+            travel, tzs = 0.0, 0.0
+            if st["prev_venue"] is not None:
+                c0 = coords.get(st["prev_venue"])
+                c1 = coords.get(g.Venue)
+                if c0 and c1:
+                    travel = haversine_km(c0[0], c0[1], c1[0], c1[1])
+                    tzs = (c1[1] - c0[1]) / TZ_DEG_PER_HR
+            dan = float(rest == 1 and st["prev_dn"] == "night"
+                        and str(g.DayNight) == "day") \
+                if rest == rest else 0.0
+            rec = list(st["recent"])
+            side_vals[side] = dict(
+                elo=elo[team], rest=rest, b2b=float(rest == 1),
+                travel_km=travel, tz_shift=tzs, day_after_night=dan,
+                w10=np.mean([r[0] for r in rec]) if rec else np.nan,
+                rf10=np.mean([r[1] for r in rec]) if rec else np.nan,
+                ra10=np.mean([r[2] for r in rec]) if rec else np.nan,
+                pyth=(st["rf"] ** PYTH_EXP
+                      / max(st["rf"] ** PYTH_EXP
+                            + st["ra"] ** PYTH_EXP, 1e-9)
+                      if st["n"] >= 20 else np.nan),
+                gp=st["n"],
+                pen_era=(27.0 * sum(e for e, _ in st["pen"])
+                         / max(sum(o for _, o in st["pen"]), 1.0)
+                         if st["pen"] else np.nan),
+                pen_np3=float(sum(v for _, v in st["np3"])),
+                st_outs=(float(np.mean(st["st_outs"]))
+                         if st["st_outs"] else np.nan),
+                bsr_luck=(float(np.mean(st["bsr"]))
+                          if st["bsr"] else np.nan))
+        row = {"GamePk": pk, "Date": str(date.date()),
+               "Season": int(g.Season),
+               "away_team": g.AwayTeam, "home_team": g.HomeTeam}
+        for side in ("away", "home"):
+            for k, v in side_vals[side].items():
+                row[f"{side}_{k}"] = v
+        row["elo_diff"] = (side_vals["home"]["elo"]
+                           - side_vals["away"]["elo"] + ELO_HFA)
+        rows.append(row)
+
+        # ---- post-game updates (never visible to this game's row)
+        if g.HomeScore == g.HomeScore and g.AwayScore == g.AwayScore:
+            hw = float(g.HomeScore > g.AwayScore)
+            e_home = 1.0 / (1.0 + 10 ** (-(elo[g.HomeTeam] + ELO_HFA
+                                           - elo[g.AwayTeam]) / 400))
+            elo[g.HomeTeam] += ELO_K * (hw - e_home)
+            elo[g.AwayTeam] -= ELO_K * (hw - e_home)
+            for team, mine, theirs, won in (
+                    (g.HomeTeam, g.HomeScore, g.AwayScore, hw),
+                    (g.AwayTeam, g.AwayScore, g.HomeScore, 1 - hw)):
+                st = state[team]
+                st["recent"].append((won, mine, theirs))
+                st["rf"] += mine
+                st["ra"] += theirs
+                st["w"] += won
+                st["n"] += 1
+                pg_ = pen_map.get((pk, team))
+                if pg_:
+                    st["pen"].append((pg_["er"], pg_["outs"]))
+                    st["np3"].append((date, pg_["np_"]))
+                so_ = st_map.get((pk, team))
+                if so_ is not None:
+                    st["st_outs"].append(so_)
+                bg_ = bat_map.get((pk, team))
+                if bg_:
+                    st["bsr"].append(bg_["R"] - _baseruns(
+                        bg_["H"], bg_["BB"], bg_["HBP"], bg_["TB"],
+                        bg_["HR"], bg_["AB"]))
+        for team in (g.AwayTeam, g.HomeTeam):
+            st = state[team]
+            st["prev_date"] = date
+            st["prev_venue"] = g.Venue
+            st["prev_dn"] = str(g.DayNight)
+    return rows, elo
+
+
+def build_team_context():
+    games = _load_games()
+    coords, (pen_map, st_map, bat_map) = _ctx_inputs()
+    rows, elo = _context_rows(games, coords, pen_map, st_map, bat_map)
+    out = pd.DataFrame(rows)
+    out.to_parquet(STORES / "team_game_context.parquet", index=False)
+    print(f"team_game_context: {len(out):,} games; current elo spread "
+          f"sd {np.std(list(elo.values())):.0f} pts", flush=True)
+    return out
+
+
+_SLATE_PK = 2_000_000_000    # pseudo GamePks sort after any real pk
+
+
+def slate_context(specs):
+    """Pre-game context for an upcoming slate (spec dicts as loaded
+    from todays_games.json). Runs the identical state machine over all
+    completed games plus one scoreless pseudo-row per slate game, and
+    returns row dicts (away_*/home_*/elo_diff keys) aligned to specs
+    order. Doubleheader game 2 sees game 1 only as same-day prev state
+    (no result exists yet — the correct pre-game truth)."""
+    games = _load_games()
+    pseudo = []
+    for i, sp in enumerate(specs):
+        d = pd.Timestamp(sp["date"])
+        pseudo.append(dict(
+            GamePk=_SLATE_PK + i, Date=d,
+            Season=int(sp.get("season") or d.year),
+            AwayTeam=str(sp["away_team"]),
+            HomeTeam=str(sp["home_team"]),
+            Venue=sp.get("venue") or "",
+            DayNight=sp.get("day_night") or "day",
+            AwayScore=np.nan, HomeScore=np.nan))
+    allg = pd.concat([games, pd.DataFrame(pseudo)],
+                     ignore_index=True).sort_values(
+        ["Date", "GamePk"]).reset_index(drop=True)
+    coords, (pen_map, st_map, bat_map) = _ctx_inputs()
+    rows, _ = _context_rows(allg, coords, pen_map, st_map, bat_map)
+    byk = {r["GamePk"]: r for r in rows}
+    return [byk[_SLATE_PK + i] for i in range(len(specs))]
 
 
 # --------------------------------------------------------------- CLI
@@ -1992,19 +2454,19 @@ def main():
                     help="build every store")
     ap.add_argument("--only", default="",
                     help="comma list: pa,panels,context,effects,priors,"
-                         "pbp,hazard,part,forecast")
+                         "pbp,hazard,part,teamctx,forecast")
     args = ap.parse_args()
     if not (args.build or args.only):
         ap.error("nothing to do: pass --build or --only ...")
     steps = set(args.only.split(",")) if args.only else {
         "pa", "panels", "context", "effects", "priors", "pbp", "hazard",
-        "part", "forecast"}
+        "part", "teamctx", "forecast"}
 
     STORES.mkdir(parents=True, exist_ok=True)
     pa = None
     if "pa" in steps:
         pa = build_pa_table()
-    if pa is None and steps - {"pa", "forecast"}:
+    if pa is None and steps - {"pa", "teamctx", "forecast"}:
         pa = pd.read_parquet(STORES / "pa_table.parquet")
         print(f"pa_table loaded: {len(pa):,} rows", flush=True)
     if "panels" in steps:
@@ -2022,6 +2484,7 @@ def main():
         build_league_env(pa)
     if "effects" in steps:
         build_park_factors(pa)
+        build_park_geometry(pa)
         build_ump_factors(pa)
         build_defense_tables()
         build_arsenal_tables()
@@ -2037,6 +2500,8 @@ def main():
         build_hazard_table(pa)
     if "part" in steps:
         build_participation(pa)
+    if "teamctx" in steps:
+        build_team_context()
     if "forecast" in steps:
         build_forecast_error()
 

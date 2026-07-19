@@ -12,6 +12,7 @@ Run:
 import base64
 import datetime as dt
 import io
+import queue
 import re
 import threading
 import tkinter as tk
@@ -245,16 +246,27 @@ class App(tk.Tk):
         self.pred = None
         self.pools = {}      # abbrev -> dict(batters={label: pid}, pitchers={...})
         self.abbrev_full = {}
-        # worker threads only write these; the main thread polls them
+        # the worker thread only writes these; the main thread polls them
         # (tkinter's after() must never be called from a worker thread)
         self._load_state = None
         self._load_msg = "starting..."
         self._pred_state = None
+        # ONE persistent worker runs every model job. XGBoost/LightGBM/
+        # CUDA inference leaves thread-local native state whose teardown
+        # fail-fasts the process (0xC0000409) when the thread that ran
+        # it exits mid-session — a thread-per-job design crashed the app
+        # right after each prediction finished. This thread never exits.
+        self._jobs = queue.Queue()
+        threading.Thread(target=self._worker_loop, daemon=True).start()
         self._build_layout()
         self._fit_minsize()
         self.status.set("Loading data and models...")
-        threading.Thread(target=self._load, daemon=True).start()
+        self._jobs.put(self._load)
         self.after(200, self._poll_load)
+
+    def _worker_loop(self):
+        while True:
+            self._jobs.get()()
 
     # ------------------------------------------------------------ setup
 
@@ -940,8 +952,7 @@ class App(tk.Tk):
         self.btn_predict["state"] = "disabled"
         self.status.set(f"Predicting {len(specs)} game(s)...")
         self._pred_state = None
-        threading.Thread(target=self._predict_run, args=(specs,),
-                         daemon=True).start()
+        self._jobs.put(lambda: self._predict_run(specs))
         self.after(200, self._poll_predict)
 
     def _predict_run(self, specs):

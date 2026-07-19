@@ -1,12 +1,12 @@
 """Fit every component model from the feature warehouse.
 
 Models fitted (artifacts in Model/artifacts/):
-  a1_model.joblib     8-class PA outcome: HistGradientBoosting multiclass
+  a1_model.joblib     8-class PA outcome: XGBoost multiclass
                       + vector-scaling calibrator fit on the calibration
                       year. Feature list and class order ride along.
   a2_model.joblib     4-class batted-ball type given in-play, same X.
   hazard_model.joblib starter-removal hazard per batter faced (binary
-                      HGBT + isotonic calibration).
+                      XGBoost + isotonic calibration).
   sb_models.joblib    steal-of-2B attempt and success logistic models
                       (with imputation pipelines).
   latent.json         game-level latent-variance sigmas (fit by
@@ -37,13 +37,13 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from xgboost import XGBClassifier
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import features as F  # noqa: E402
@@ -56,44 +56,26 @@ DESIGN_CAL_YEAR = 2024
 BBTYPES = F.BBTYPES
 
 
-def hgbt(**kw):
-    base = dict(learning_rate=0.08, max_iter=300, max_leaf_nodes=63,
-                min_samples_leaf=100, l2_regularization=1.0,
-                early_stopping=True, validation_fraction=0.05,
-                n_iter_no_change=15, random_state=7)
-    base.update(kw)
-    return HistGradientBoostingClassifier(**base)
+def make_clf(max_iter=300, eval_metric="mlogloss"):
+    """XGBoost estimator factory (CUDA histogram trees)."""
+    return XGBClassifier(
+        n_estimators=max_iter, learning_rate=0.08,
+        grow_policy="lossguide", max_leaves=63, max_depth=0,
+        min_child_weight=100, reg_lambda=1.0,
+        subsample=1.0, colsample_bytree=1.0,
+        tree_method="hist", device="cuda",
+        early_stopping_rounds=15, eval_metric=eval_metric,
+        n_jobs=-1, random_state=7, verbosity=0)
 
 
-def make_clf(gbm, max_iter=300, eval_metric="mlogloss"):
-    """Estimator factory: 'hgbt' (CPU) or 'xgb' (CUDA histogram trees,
-    hyperparameters mirrored as closely as the two libraries allow so an
-    A/B compares estimators, not settings)."""
-    if gbm == "xgb":
-        from xgboost import XGBClassifier
-        return XGBClassifier(
-            n_estimators=max_iter, learning_rate=0.08,
-            grow_policy="lossguide", max_leaves=63, max_depth=0,
-            min_child_weight=100, reg_lambda=1.0,
-            subsample=1.0, colsample_bytree=1.0,
-            tree_method="hist", device="cuda",
-            early_stopping_rounds=15, eval_metric=eval_metric,
-            n_jobs=-1, random_state=7, verbosity=0)
-    return hgbt(max_iter=max_iter)
-
-
-def _fit_es(clf, gbm, Xtr, ytr):
-    """Fit with each estimator's early-stopping convention: HGBT holds
-    out 5% internally; XGB gets the same 5% as an explicit eval_set."""
-    if gbm == "xgb":
-        rng = np.random.default_rng(7)
-        idx = rng.permutation(len(ytr))
-        cut = int(len(idx) * 0.95)
-        clf.fit(Xtr.iloc[idx[:cut]], ytr[idx[:cut]],
-                eval_set=[(Xtr.iloc[idx[cut:]], ytr[idx[cut:]])],
-                verbose=False)
-    else:
-        clf.fit(Xtr, ytr)
+def _fit_es(clf, Xtr, ytr):
+    """Fit with 5% held out as the early-stopping eval_set."""
+    rng = np.random.default_rng(7)
+    idx = rng.permutation(len(ytr))
+    cut = int(len(idx) * 0.95)
+    clf.fit(Xtr.iloc[idx[:cut]], ytr[idx[:cut]],
+            eval_set=[(Xtr.iloc[idx[cut:]], ytr[idx[cut:]])],
+            verbose=False)
     return clf
 
 
@@ -122,19 +104,19 @@ def _report_a1(name, y, p, classes):
     return ll
 
 
-def fit_a_models(pa, X, cal_year, gbm="hgbt"):
+def fit_a_models(pa, X, cal_year):
     y = pa["label"].map({c: i for i, c in enumerate(CLASSES)}).values
     tr = (pa["Season"] < cal_year).values
     ca = (pa["Season"] == cal_year).values
     Xf = X.astype(np.float32)
 
     _banner(f"A1 — PA outcome model ({len(CLASSES)} classes, "
-            f"{X.shape[1]} features, {gbm})")
+            f"{X.shape[1]} features)")
     _kv("train rows", f"{tr.sum():,}  (seasons <= {cal_year - 1})")
     _kv("calibrate rows", f"{ca.sum():,}  ({cal_year})")
     t0 = time.time()
-    a1 = make_clf(gbm)
-    _fit_es(a1, gbm, Xf[tr], y[tr])
+    a1 = make_clf()
+    _fit_es(a1, Xf[tr], y[tr])
     _kv("fit time", f"{time.time() - t0:.0f}s")
     p_cal_raw = a1.predict_proba(Xf[ca])
     scaler = VectorScaler().fit(p_cal_raw, y[ca])
@@ -168,10 +150,10 @@ def fit_a_models(pa, X, cal_year, gbm="hgbt"):
     inplay = pa["bb_type"].isin(BBTYPES).values
     y2 = pa["bb_type"].map({b: i for i, b in enumerate(BBTYPES)}).values
     tr2, ca2 = tr & inplay, ca & inplay
-    _banner(f"A2 — batted-ball type model (4 classes, {gbm})")
+    _banner("A2 — batted-ball type model (4 classes)")
     _kv("train rows", f"{tr2.sum():,}  (in-play)")
-    a2 = make_clf(gbm, max_iter=200)
-    _fit_es(a2, gbm, Xf[tr2], y2[tr2])
+    a2 = make_clf(max_iter=200)
+    _fit_es(a2, Xf[tr2], y2[tr2])
     p2_raw = a2.predict_proba(Xf[ca2])
     scaler2 = VectorScaler().fit(p2_raw, y2[ca2])
     ll2 = log_loss(y2[ca2], scaler2.transform(p2_raw),
@@ -193,7 +175,7 @@ HAZ_FEATS = ["bf", "cum_pitches", "tto", "inning", "outs", "score_diff",
              "gap_days", "ramp", "prev_short", "il_ret30", "outs_sd"]
 
 
-def fit_hazard(cal_year, gbm="hgbt"):
+def fit_hazard(cal_year):
     hz = pd.read_parquet(STORES / "hazard_table.parquet")
     leash = pd.read_parquet(STORES / "panel_leash.parquet")
     m = F.merge_asof_panel(
@@ -212,12 +194,11 @@ def fit_hazard(cal_year, gbm="hgbt"):
     ca = hz["Season"] == cal_year
     Xh = hz[HAZ_FEATS].astype(np.float32)
     yh = hz["removed"].values
-    _banner(f"B — starter-removal hazard ({len(HAZ_FEATS)} features, "
-            f"{gbm})")
+    _banner(f"B — starter-removal hazard ({len(HAZ_FEATS)} features)")
     _kv("train rows", f"{tr.sum():,}")
     _kv("removal rate", f"{yh[tr.values].mean():.3%}")
-    mdl = make_clf(gbm, max_iter=250, eval_metric="logloss")
-    _fit_es(mdl, gbm, Xh[tr.values], yh[tr.values])
+    mdl = make_clf(max_iter=250, eval_metric="logloss")
+    _fit_es(mdl, Xh[tr.values], yh[tr.values])
     p_ca = mdl.predict_proba(Xh[ca.values])[:, 1]
     iso = IsotonicRegression(out_of_bounds="clip").fit(p_ca, yh[ca.values])
     ll = log_loss(yh[ca.values], np.clip(iso.predict(p_ca), 1e-6, 1 - 1e-6))
@@ -286,7 +267,8 @@ def fit_latent():
     and starter-K dispersion best matches the actual distributions."""
     import backtest as B  # local import: sim/backtest exist by P2
     res = B.moment_match_latent()
-    (ART / "latent.json").write_text(json.dumps(res, indent=1))
+    F.write_artifact(ART / "latent.json",
+                     lambda p: p.write_text(json.dumps(res, indent=1)))
     print(f"latent fitted: {res}", flush=True)
 
 
@@ -298,12 +280,9 @@ def main():
                     help="train <=2023, evaluate 2024 (no serve artifacts)")
     ap.add_argument("--fit-latent", action="store_true",
                     help="moment-match latent sigmas (requires sim.py)")
-    ap.add_argument("--gbm", choices=("hgbt", "xgb"), default="xgb",
-                    help="estimator: XGBoost (CUDA, default since the "
-                         "2026-07-19 A/B) or sklearn HGBT (CPU)")
     ap.add_argument("--no-write", action="store_true",
                     help="fit + report only; leave artifacts untouched "
-                         "(estimator trials)")
+                         "(trial runs)")
     args = ap.parse_args()
 
     if args.fit_latent:
@@ -326,18 +305,18 @@ def main():
     _kv("features", f"{len(cols)}")
     _kv("assembly time", f"{time.time() - t0:.0f}s")
 
-    a1, a2 = fit_a_models(pa, X, cal_year, gbm=args.gbm)
-    hz = fit_hazard(cal_year, gbm=args.gbm)
+    a1, a2 = fit_a_models(pa, X, cal_year)
+    hz = fit_hazard(cal_year)
     sb = fit_sb(cal_year)
 
     if args.design_eval or args.no_write:
         print("\nreport-only run: artifacts NOT written", flush=True)
         return
     ART.mkdir(parents=True, exist_ok=True)
-    joblib.dump(a1, ART / "a1_model.joblib")
-    joblib.dump(a2, ART / "a2_model.joblib")
-    joblib.dump(hz, ART / "hazard_model.joblib")
-    joblib.dump(sb, ART / "sb_models.joblib")
+    for name, obj in (("a1_model", a1), ("a2_model", a2),
+                      ("hazard_model", hz), ("sb_models", sb)):
+        F.write_artifact(ART / f"{name}.joblib",
+                         lambda p, o=obj: joblib.dump(o, p))
     if not (ART / "latent.json").exists():
         (ART / "latent.json").write_text(json.dumps(
             dict(fitted=False, mu_env=0.0, sigma_env=0.0,
@@ -350,7 +329,8 @@ def main():
         data_max_date=str(pa.Date.max().date()),
         n_pa=int(len(pa)),
         a1=a1["metrics"], a2=a2["metrics"], hazard=hz["metrics"])
-    (ART / "manifest.json").write_text(json.dumps(manifest, indent=1))
+    F.write_artifact(ART / "manifest.json",
+                     lambda p: p.write_text(json.dumps(manifest, indent=1)))
     _banner("ARTIFACTS WRITTEN")
     _kv("models", "a1 / a2 / hazard / sb  -> Model/artifacts/")
     _kv("cal_year", f"{cal_year}")

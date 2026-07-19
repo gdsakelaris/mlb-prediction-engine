@@ -250,5 +250,6 @@ if __name__ == "__main__":
     args = ap.parse_args()
     if args.fit_latent:
         res = moment_match_latent(args.games, args.sims)
-        (ART / "latent.json").write_text(json.dumps(res, indent=1))
+        F.write_artifact(ART / "latent.json",
+                         lambda p: p.write_text(json.dumps(res, indent=1)))
         print(f"latent.json written: {res}")
