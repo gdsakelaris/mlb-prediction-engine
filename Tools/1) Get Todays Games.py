@@ -36,7 +36,7 @@ starters and umpire precisely as they were served pregame (the lineup
 counterpart of the mlb_weather_forecast.csv archive).
 
 Usage:
-    python Tools/1_get_todays_games.py
+    python "Tools/1) Get Todays Games.py"
 """
 
 import csv
@@ -253,6 +253,15 @@ def parse_start_et(text):
         return None
     hour = int(m.group(1)) % 12 + (12 if m.group(3).upper() == "PM" else 0)
     return f"{hour:02d}:{m.group(2)}"
+
+
+def fmt_start_et(start_et):
+    """'19:10' -> '7:10p' for the console table; '?' when unknown."""
+    if not start_et:
+        return "?"
+    hh, mm = start_et.split(":")
+    h = int(hh)
+    return f"{(h - 1) % 12 + 1}:{mm}{'p' if h >= 12 else 'a'}"
 
 
 # ------------------------------------------------------------------ mlb.com
@@ -814,6 +823,7 @@ def main():
     print(f"  home-plate umpire resolved: {filled['ump']}/{len(games)}")
     for g, src in zip(games, sources):
         print(f'  {g["away_team"]:>3} @ {g["home_team"]:<3} {g["venue"]:<28} '
+              f'{fmt_start_et(g["start_et"]):>6} ET '
               f'{g["day_night"] or "?":<5} temp {str(g["temp"]) or "?":>5}  '
               f'wind {str(g["wind_speed"]) or "?":>4} {g["wind_dir"] or "-":<10} '
               f'hum {str(g["humidity"]) or "?":>5} '

@@ -73,8 +73,10 @@ def _fit_es(clf, Xtr, ytr):
     rng = np.random.default_rng(7)
     idx = rng.permutation(len(ytr))
     cut = int(len(idx) * 0.95)
-    clf.fit(Xtr.iloc[idx[:cut]], ytr[idx[:cut]],
-            eval_set=[(Xtr.iloc[idx[cut:]], ytr[idx[cut:]])],
+    take = ((lambda a, i: a.iloc[i]) if hasattr(Xtr, "iloc")
+            else (lambda a, i: a[i]))
+    clf.fit(take(Xtr, idx[:cut]), ytr[idx[:cut]],
+            eval_set=[(take(Xtr, idx[cut:]), ytr[idx[cut:]])],
             verbose=False)
     return clf
 
@@ -104,37 +106,19 @@ def _report_a1(name, y, p, classes):
     return ll
 
 
-def fit_a_models(pa, X, cal_year):
-    y = pa["label"].map({c: i for i, c in enumerate(CLASSES)}).values
-    tr = (pa["Season"] < cal_year).values
-    ca = (pa["Season"] == cal_year).values
-    Xf = X.astype(np.float32)
-
-    _banner(f"A1 — PA outcome model ({len(CLASSES)} classes, "
-            f"{X.shape[1]} features)")
-    _kv("train rows", f"{tr.sum():,}  (seasons <= {cal_year - 1})")
-    _kv("calibrate rows", f"{ca.sum():,}  ({cal_year})")
-    t0 = time.time()
-    a1 = make_clf()
-    _fit_es(a1, Xf[tr], y[tr])
-    _kv("fit time", f"{time.time() - t0:.0f}s")
-    p_cal_raw = a1.predict_proba(Xf[ca])
-    scaler = VectorScaler().fit(p_cal_raw, y[ca])
-    p_cal = scaler.transform(p_cal_raw)
-
-    ll_model = _report_a1("A1 calibrated", y[ca], p_cal, CLASSES)
+def _a1_baselines(pa, X, y, tr, ca):
     lg = pd.Series(y[tr]).value_counts(normalize=True).sort_index().values
     ll_league = log_loss(y[ca], np.tile(lg, (ca.sum(), 1)),
                          labels=list(range(len(CLASSES))))
-    rate_cols = [f"b_{c}_rate" for c in F.BAT_RATES]
-    have = [c for c in rate_cols if c in X.columns]
-    bat_only = X.loc[ca, have].to_numpy(dtype=float)
-    rest = np.clip(1 - np.nansum(bat_only, axis=1), 1e-6, 1)
     marg = np.zeros((ca.sum(), len(CLASSES)))
     for j, c in enumerate(CLASSES):
         col = f"b_{c}_rate"
         marg[:, j] = (X.loc[ca, col].to_numpy(dtype=float)
                       if col in X.columns else np.nan)
+    rate_cols = [f"b_{c}_rate" for c in F.BAT_RATES]
+    have = [c for c in rate_cols if c in X.columns]
+    bat_only = X.loc[ca, have].to_numpy(dtype=float)
+    rest = np.clip(1 - np.nansum(bat_only, axis=1), 1e-6, 1)
     hbp = np.full(ca.sum(), lg[CLASSES.index("HBP")])
     marg[:, CLASSES.index("HBP")] = hbp
     marg[:, CLASSES.index("IPO")] = rest - hbp
@@ -142,11 +126,13 @@ def fit_a_models(pa, X, cal_year):
     marg = np.clip(marg, 1e-6, 1)
     marg /= marg.sum(axis=1, keepdims=True)
     ll_marg = log_loss(y[ca], marg, labels=list(range(len(CLASSES))))
-    _kv("baseline: league", f"{ll_league:.5f}   (model gain "
-        f"{ll_league - ll_model:+.5f})")
-    _kv("baseline: batter-marginal", f"{ll_marg:.5f}   (model gain "
-        f"{ll_marg - ll_model:+.5f})")
+    return ll_league, ll_marg
 
+
+def fit_a2(pa, X, cal_year):
+    tr = (pa["Season"] < cal_year).values
+    ca = (pa["Season"] == cal_year).values
+    Xf = X.astype(np.float32)
     inplay = pa["bb_type"].isin(BBTYPES).values
     y2 = pa["bb_type"].map({b: i for i, b in enumerate(BBTYPES)}).values
     tr2, ca2 = tr & inplay, ca & inplay
@@ -159,20 +145,118 @@ def fit_a_models(pa, X, cal_year):
     ll2 = log_loss(y2[ca2], scaler2.transform(p2_raw),
                    labels=list(range(len(BBTYPES))))
     _kv("logloss (calibrated)", f"{ll2:.5f}")
+    return dict(model=a2, scaler=scaler2, classes=BBTYPES,
+                features=list(X.columns), cal_year=cal_year,
+                metrics=dict(logloss=ll2))
 
-    return (dict(model=a1, scaler=scaler, classes=CLASSES,
-                 features=list(X.columns), cal_year=cal_year,
-                 metrics=dict(logloss=ll_model, league=ll_league,
-                              batter_marginal=ll_marg)),
-            dict(model=a2, scaler=scaler2, classes=BBTYPES,
-                 features=list(X.columns), cal_year=cal_year,
-                 metrics=dict(logloss=ll2)))
+
+def fit_a1_flat(pa, X, cal_year):
+    y = pa["label"].map({c: i for i, c in enumerate(CLASSES)}).values
+    tr = (pa["Season"] < cal_year).values
+    ca = (pa["Season"] == cal_year).values
+    Xf = X.astype(np.float32)
+    _banner(f"A1 — flat PA outcome model ({len(CLASSES)} classes, "
+            f"{X.shape[1]} features)")
+    _kv("train rows", f"{tr.sum():,}  (seasons <= {cal_year - 1})")
+    _kv("calibrate rows", f"{ca.sum():,}  ({cal_year})")
+    t0 = time.time()
+    a1 = make_clf()
+    _fit_es(a1, Xf[tr], y[tr])
+    _kv("fit time", f"{time.time() - t0:.0f}s")
+    p_cal_raw = a1.predict_proba(Xf[ca])
+    scaler = VectorScaler().fit(p_cal_raw, y[ca])
+    p_cal = scaler.transform(p_cal_raw)
+    ll_model = _report_a1("A1 calibrated", y[ca], p_cal, CLASSES)
+    ll_league, ll_marg = _a1_baselines(pa, X, y, tr, ca)
+    _kv("baseline: league", f"{ll_league:.5f}   (model gain "
+        f"{ll_league - ll_model:+.5f})")
+    _kv("baseline: batter-marginal", f"{ll_marg:.5f}   (model gain "
+        f"{ll_marg - ll_model:+.5f})")
+    return dict(model=a1, scaler=scaler, classes=CLASSES,
+                features=list(X.columns), cal_year=cal_year,
+                metrics=dict(logloss=ll_model, league=ll_league,
+                             batter_marginal=ll_marg))
+
+
+def _t3_matrix(Xf, bb_idx):
+    """Append the bb-type dummy block (GB baseline) as constants."""
+    n = len(Xf)
+    d = np.zeros((n, 3), dtype=np.float32)
+    if bb_idx > 0:
+        d[:, bb_idx - 1] = 1.0
+    return np.column_stack([Xf, d])
+
+
+def fit_a1_tree(pa, X, cal_year, a2d):
+    """Hierarchical contact tree: T1 {K,BB,HBP,in-play} and T3
+    outcome|bb-type {out,1B,2B,3B,HR}, composed with A2 (=T2) into the
+    flat 8-class vector + the class-conditional bb mix. Evaluated as
+    the COMPOSITE against the flat baselines."""
+    y8 = pa["label"].map({c: i for i, c in enumerate(CLASSES)}).values
+    tr = (pa["Season"] < cal_year).values
+    ca = (pa["Season"] == cal_year).values
+    Xf = X.astype(np.float32).to_numpy()
+    feats = list(X.columns)
+
+    t1_map = {"K": 0, "BB": 1, "HBP": 2}
+    y1 = pa["label"].map(lambda c: t1_map.get(c, 3)).values
+    _banner(f"A1 TREE / T1 — PA gate ({len(F.T1_CLASSES)} classes, "
+            f"{len(feats)} features)")
+    _kv("train rows", f"{tr.sum():,}")
+    t0 = time.time()
+    t1 = make_clf()
+    _fit_es(t1, Xf[tr], y1[tr])
+    s1 = VectorScaler().fit(t1.predict_proba(Xf[ca]), y1[ca])
+    _kv("fit time", f"{time.time() - t0:.0f}s")
+
+    inplay = pa["bb_type"].isin(BBTYPES).values
+    bb_idx = pa["bb_type"].map(
+        {b: i for i, b in enumerate(BBTYPES)}).fillna(0).astype(int)
+    y3 = pa["label"].map(
+        {c: i for i, c in enumerate(F.T3_CLASSES)}).values
+    tr3, ca3 = tr & inplay, ca & inplay
+    _banner(f"A1 TREE / T3 — outcome | bb-type "
+            f"({len(F.T3_CLASSES)} classes)")
+    _kv("train rows", f"{tr3.sum():,}  (in-play)")
+    d3 = np.zeros((len(pa), 3), dtype=np.float32)
+    for j in range(1, 4):
+        d3[bb_idx.values == j, j - 1] = 1.0
+    X3 = np.column_stack([Xf, d3])
+    t0 = time.time()
+    t3 = make_clf()
+    _fit_es(t3, X3[tr3], y3[tr3])
+    s3 = VectorScaler().fit(t3.predict_proba(X3[ca3]), y3[ca3])
+    _kv("fit time", f"{time.time() - t0:.0f}s")
+
+    # composite 8-class evaluation on the cal year
+    p1c = s1.transform(t1.predict_proba(Xf[ca]))
+    p2c = a2d["scaler"].transform(a2d["model"].predict_proba(Xf[ca]))
+    p3c = np.stack(
+        [s3.transform(t3.predict_proba(_t3_matrix(Xf[ca], bi)))
+         for bi in range(4)], axis=1)
+    p8, _ = F.tree_compose(p1c, p2c, p3c)
+    _banner("A1 TREE — composite 8-class evaluation")
+    ll_model = _report_a1("tree composite", y8[ca], p8, CLASSES)
+    ll_league, ll_marg = _a1_baselines(pa, X, y8, tr, ca)
+    _kv("baseline: league", f"{ll_league:.5f}   (model gain "
+        f"{ll_league - ll_model:+.5f})")
+    _kv("baseline: batter-marginal", f"{ll_marg:.5f}   (model gain "
+        f"{ll_marg - ll_model:+.5f})")
+
+    return dict(kind="tree", classes=CLASSES, features=feats,
+                cal_year=cal_year,
+                t1=dict(model=t1, scaler=s1, classes=F.T1_CLASSES),
+                t3=dict(model=t3, scaler=s3, classes=F.T3_CLASSES,
+                        features=feats + F.BB_DUMMIES),
+                metrics=dict(logloss=ll_model, league=ll_league,
+                             batter_marginal=ll_marg))
 
 
 HAZ_FEATS = ["bf", "cum_pitches", "tto", "inning", "outs", "score_diff",
              "k_so_far", "br_so_far", "runs_so_far", "rest_p",
              "leash_np", "leash_bf", "leash_starts", "season_idx",
-             "gap_days", "ramp", "prev_short", "il_ret30", "outs_sd"]
+             "gap_days", "ramp", "prev_short", "il_ret30", "outs_sd",
+             "pen_np3"]
 
 
 def fit_hazard(cal_year):
@@ -197,6 +281,11 @@ def fit_hazard(cal_year):
     _banner(f"B — starter-removal hazard ({len(HAZ_FEATS)} features)")
     _kv("train rows", f"{tr.sum():,}")
     _kv("removal rate", f"{yh[tr.values].mean():.3%}")
+    if "cause" in hz.columns:   # competing-risks label (diagnostic only;
+        mix = (hz.loc[hz.removed == 1, "cause"]  # the served hazard stays
+               .value_counts(normalize=True))    # all-cause by design)
+        _kv("removal cause mix", "  ".join(
+            f"{k}:{v:.1%}" for k, v in mix.items() if k))
     mdl = make_clf(max_iter=250, eval_metric="logloss")
     _fit_es(mdl, Xh[tr.values], yh[tr.values])
     p_ca = mdl.predict_proba(Xh[ca.values])[:, 1]
@@ -283,6 +372,13 @@ def main():
     ap.add_argument("--no-write", action="store_true",
                     help="fit + report only; leave artifacts untouched "
                          "(trial runs)")
+    ap.add_argument("--flat", action="store_true",
+                    help="train the flat 8-class A1 instead of the "
+                         "contact tree (A/B baseline; the 2026-07-19 "
+                         "full-2025 ledger A/B was a statistical tie "
+                         "0.06538 vs 0.06528 — tree SHIPPED by "
+                         "decision: correct generative process, "
+                         "class-conditional bb for the sim/SGP)")
     args = ap.parse_args()
 
     if args.fit_latent:
@@ -305,7 +401,9 @@ def main():
     _kv("features", f"{len(cols)}")
     _kv("assembly time", f"{time.time() - t0:.0f}s")
 
-    a1, a2 = fit_a_models(pa, X, cal_year)
+    a2 = fit_a2(pa, X, cal_year)
+    a1 = (fit_a1_flat(pa, X, cal_year) if args.flat
+          else fit_a1_tree(pa, X, cal_year, a2))
     hz = fit_hazard(cal_year)
     sb = fit_sb(cal_year)
 

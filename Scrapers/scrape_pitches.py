@@ -126,11 +126,16 @@ REFETCH_DAYS = 2
 FADE_MIN_FB = 8                  # fastballs needed for a per-start velo slope
 
 
-def fetch_range(d0, d1, tries=3):
-    """All pitches in [d0, d1] (regular season). Splits on the result cap."""
+GT_ALL = "R|F|D|L|W|"        # regular + the four postseason rounds
+GT_POST = "F|D|L|W|"         # postseason only (targeted backfill)
+
+
+def fetch_range(d0, d1, tries=3, gt=GT_ALL):
+    """All pitches in [d0, d1] (regular + postseason). Splits on the
+    result cap."""
     params = {
         "all": "true", "type": "details", "player_type": "batter",
-        "hfGT": "R|", "minors": "false",
+        "hfGT": gt, "minors": "false",
         "game_date_gt": str(d0), "game_date_lt": str(d1),
     }
     for attempt in range(tries):
@@ -151,9 +156,9 @@ def fetch_range(d0, d1, tries=3):
         print(f"    {d0}..{d1}: {len(df):,} rows (cap?) -> splitting",
               flush=True)
         time.sleep(SLEEP)
-        left = fetch_range(d0, mid)
+        left = fetch_range(d0, mid, gt=gt)
         time.sleep(SLEEP)
-        right = fetch_range(mid + timedelta(days=1), d1)
+        right = fetch_range(mid + timedelta(days=1), d1, gt=gt)
         return pd.concat([left, right], ignore_index=True)
     return df
 
@@ -475,6 +480,80 @@ def merge_raw(year, frames, cut):
           f"{len(merged):,} pitches ({path.name})", flush=True)
 
 
+def append_raw(year, frames):
+    """Append newly fetched pitches to a season's raw archive, replacing
+    any archived rows for the same game_pks (idempotent re-runs)."""
+    if not frames:
+        return
+    path = RAW_DIR / f"pitches_{year}.parquet"
+    new = pd.concat(frames, ignore_index=True)
+    for c in new.select_dtypes(include="object").columns:
+        new[c] = new[c].astype(str).where(new[c].notna())
+    if not path.exists():
+        RAW_DIR.mkdir(parents=True, exist_ok=True)
+        new.to_parquet(path, index=False, compression="zstd")
+        print(f"    raw archive created: {len(new):,} pitches "
+              f"({path.name})", flush=True)
+        return
+    old = pd.read_parquet(path)
+    new = new.reindex(columns=old.columns)
+    pks = set(pd.to_numeric(new["game_pk"], errors="coerce").dropna())
+    keep = old[~pd.to_numeric(old["game_pk"],
+                              errors="coerce").isin(pks)]
+    merged = pd.concat([keep, new], ignore_index=True)
+    tmp = path.with_name(path.name + ".tmp")
+    merged.to_parquet(tmp, index=False, compression="zstd")
+    os.replace(tmp, path)
+    print(f"    raw archive +{len(merged) - len(keep):,} pitches "
+          f"({len(old):,} -> {len(merged):,}, {path.name})", flush=True)
+
+
+def postseason_backfill(outdir):
+    """One-time targeted pull of postseason pitches (hfGT F|D|L|W) for
+    every season, appended to the raw archives and merged into the daily
+    CSVs. Regular-season rows are untouched; safe to re-run."""
+    p_path, b_path = outdir / OUT_PITCHERS, outdir / OUT_BATTERS
+    kept_p = pd.read_csv(p_path, encoding="utf-8-sig",
+                         low_memory=False) if p_path.exists() else None
+    kept_b = pd.read_csv(b_path, encoding="utf-8-sig",
+                         low_memory=False) if b_path.exists() else None
+    pit_frames, bat_frames = [], []
+    for year in YEARS:
+        raw_chunks, got = [], 0
+        d0 = date(year, 9, 20)
+        end = min(date(year, 11, 30), date.today())
+        while d0 <= end:
+            d1 = min(d0 + timedelta(days=CHUNK_DAYS - 1), end)
+            raw = fetch_range(d0, d1, gt=GT_POST)
+            if not raw.empty:
+                raw_chunks.append(raw)
+                pit, bat = aggregate(raw)
+                if pit is not None:
+                    got += int(pit["n"].sum())
+                    pit_frames.append(pit)
+                    bat_frames.append(bat)
+            time.sleep(SLEEP)
+            d0 = d1 + timedelta(days=1)
+        append_raw(year, raw_chunks)
+        print(f"{year}: {got:,} postseason pitches", flush=True)
+
+    def finish(kept, frames, path):
+        new = pd.concat(frames, ignore_index=True) if frames else None
+        if new is None:
+            return
+        if kept is not None:
+            kept["Date"] = kept["Date"].astype(str)
+            new["Date"] = new["Date"].astype(str)
+            new = pd.concat([kept, new], ignore_index=True)
+        new = (new.drop_duplicates(["PlayerId", "Date"], keep="last")
+               .sort_values(["PlayerId", "Date"]))
+        new.to_csv(path, index=False, encoding="utf-8-sig")
+        print(f"wrote {len(new):,} rows -> {path}", flush=True)
+
+    finish(kept_p, pit_frames, p_path)
+    finish(kept_b, bat_frames, b_path)
+
+
 def load_existing(path, backfill):
     if backfill or not path.exists():
         return None, None, set()
@@ -494,9 +573,16 @@ def main():
     ap.add_argument("--from-raw", action="store_true", dest="from_raw",
                     help="re-aggregate seasons from Data/raw_pitches archives "
                          "where present (implies --backfill for those years)")
+    ap.add_argument("--postseason-backfill", action="store_true",
+                    dest="post_backfill",
+                    help="one-time pull of postseason pitches for every "
+                         "season (archives + daily CSVs); safe to re-run")
     args = ap.parse_args()
     if args.from_raw:
         args.backfill = True
+    if args.post_backfill:
+        postseason_backfill(Path(args.outdir))
+        return
     outdir = Path(args.outdir)
     p_path, b_path = outdir / OUT_PITCHERS, outdir / OUT_BATTERS
 

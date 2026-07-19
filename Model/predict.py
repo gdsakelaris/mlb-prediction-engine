@@ -99,6 +99,32 @@ def _hrr(t, s):
     return t[..., s["H"]] + t[..., s["R"]] + t[..., s["RBI"]]
 
 
+PB_K = 64.0     # pseudo-sims of parametric-tail shrinkage
+
+
+def _tail_prob(counts, thr):
+    """P(count > thr) with a parametric shrink for sparse tails:
+    (empirical hits + PB_K * parametric) / (n + PB_K), the parametric
+    term a moment-fit negative binomial (Poisson when var <= mean).
+    Data-rich probabilities stay essentially empirical; beyond-support
+    lines get smooth nonzero tails instead of hard 0s."""
+    from scipy import stats as _st
+    counts = np.asarray(counts)
+    n = counts.size
+    hits = float((counts > thr).sum())
+    m = float(counts.mean())
+    v = float(counts.var())
+    k = int(np.floor(thr))
+    if m <= 1e-9:
+        pp = 0.0
+    elif v > m * 1.0001:
+        r = m * m / (v - m)
+        pp = float(_st.nbinom.sf(k, r, r / (r + m)))
+    else:
+        pp = float(_st.poisson.sf(k, m))
+    return float((hits + PB_K * pp) / (n + PB_K))
+
+
 class _Stores:
     def __init__(self, raw):
         self.raw = raw
@@ -121,7 +147,7 @@ def _load_raw():
                      low_memory=False,
                      usecols=["GamePk", "Season", "Date", "PlayerId",
                               "Name", "Team", "GS", "GF", "IP", "BF",
-                              "NP"])
+                              "NP", "SV", "HLD"])
     gp["Date"] = pd.to_datetime(gp["Date"])
     parks = pd.read_csv(DATA / "mlb_ballparks.csv", encoding="utf-8-sig")
     umps = pd.read_csv(DATA / "mlb_umpires.csv", encoding="utf-8-sig")
@@ -179,6 +205,8 @@ class Predictor:
         ros = self.stores.raw["rosters"]
         self._catchers = set(
             ros.loc[ros.Position == "Catcher", "PlayerId"].astype(int))
+        self._roster_pos = dict(zip(ros.PlayerId.astype(int),
+                                    ros.Position))
         # batter participation hazard table -> dense lookup array
         self.part_haz = None
         part_path = F.STORES / "participation.parquet"
@@ -218,6 +246,45 @@ class Predictor:
             self._defense = {
                 (int(y), str(t)): (o, fr) for y, t, o, fr in zip(
                     dt_.Year, dt_.Team, dt_.def_oaa, dt_.FrameRV_pt)}
+        # sim identity-adjuster stores (features.py --only simadj);
+        # every one degrades to neutral engine behavior when absent
+        def _pq(name):
+            p = F.STORES / name
+            return pd.read_parquet(p) if p.exists() else None
+
+        self._runner_z, self._stretch_zmap = {}, {}
+        self._catcher_wpmap, self._arm_of_p, self._arm_of_t = {}, {}, {}
+        rz_ = _pq("runner_z.parquet")
+        if rz_ is not None:
+            self._runner_z = {
+                (int(s), int(p)): (float(r), float(d)) for s, p, r, d in
+                zip(rz_.Season, rz_.PlayerId, rz_.run_z, rz_.dp_z)}
+        am_ = _pq("arm_of.parquet")
+        if am_ is not None:
+            self._arm_of_p = {(int(s), int(p)): float(z) for s, p, z in
+                              zip(am_.Season, am_.PlayerId, am_.arm_z)}
+        at_ = _pq("arm_of_team.parquet")
+        if at_ is not None:
+            self._arm_of_t = {(int(s), str(t)): float(z) for s, t, z in
+                              zip(at_.Season, at_.Team, at_.team_arm_z)}
+        sz_ = _pq("stretch_z.parquet")
+        if sz_ is not None:
+            self._stretch_zmap = {
+                (int(s), int(p)): float(z) for s, p, z in
+                zip(sz_.Season, sz_.PlayerId, sz_.stretch_z)}
+        cw_ = _pq("catcher_wp.parquet")
+        if cw_ is not None:
+            self._catcher_wpmap = {
+                (int(s), int(p)): float(r) for s, p, r in
+                zip(cw_.Season, cw_.PlayerId, cw_.wp_rate)}
+        tj = F.STORES / "advance_tilt.json"
+        self._tilt = json.loads(tj.read_text()) if tj.exists() else {}
+        sj = F.STORES / "stretch.json"
+        self._stretch = json.loads(sj.read_text()) if sj.exists() \
+            else None
+        self._outfielders = set(ros.loc[ros.Position.isin(
+            ["Left Field", "Center Field", "Right Field"]),
+            "PlayerId"].astype(int))
         tick("computing bullpen availability...")
         self._relief_exit = self._reliever_exit_table()
         tick("ready")
@@ -288,6 +355,134 @@ class Predictor:
         out.sort(key=lambda t: -t[1])
         return out[:MAX_PEN]
 
+    def _class_vecs(self, X):
+        """A1/A2 probabilities for assembled matchup rows. Returns
+        (p8 [n,8], a2arr): a2arr is [n,4] P(bb | in-play) under the
+        flat artifact or [n,8,4] P(bb | outcome class) under the
+        hierarchical contact tree."""
+        X2 = X.reindex(columns=self.a2["features"]).astype(np.float32)
+        p2 = self.a2["scaler"].transform(
+            self.a2["model"].predict_proba(X2))
+        X1 = X.reindex(columns=self.a1["features"]).astype(np.float32)
+        if self.a1.get("kind") != "tree":
+            p8 = self.a1["scaler"].transform(
+                self.a1["model"].predict_proba(X1))
+            return p8, p2
+        t1, t3 = self.a1["t1"], self.a1["t3"]
+        p1 = t1["scaler"].transform(t1["model"].predict_proba(X1))
+        Xn = X1.to_numpy()
+
+        def t3mat(bi):
+            d = np.zeros((len(Xn), 3), dtype=np.float32)
+            if bi > 0:
+                d[:, bi - 1] = 1.0
+            return np.column_stack([Xn, d])
+
+        p3 = np.stack(
+            [t3["scaler"].transform(t3["model"].predict_proba(t3mat(bi)))
+             for bi in range(4)], axis=1)
+        return F.tree_compose(p1, p2, p3)
+
+    _POS_SLOT = {"First Base": 3, "Second Base": 4, "Third Base": 5,
+                 "Shortstop": 6, "Left Field": 7, "Center Field": 8,
+                 "Right Field": 9}
+
+    def _fielder_map(self, pids):
+        """Lineup pids -> {savant fielder slot 3-9: pid} by roster
+        primary position (first claimant wins; unfilled slots NaN)."""
+        fm = {i: np.nan for i in range(3, 10)}
+        for pid in pids:
+            if pid is None or pid < 0:
+                continue
+            sl = self._POS_SLOT.get(str(self._roster_pos.get(int(pid))))
+            if sl and not (fm[sl] == fm[sl]):
+                fm[sl] = int(pid)
+        return fm
+
+    def _sim_adjusters(self, players, season, away, home, date,
+                       pen_rows_away, pen_rows_home):
+        """Identity-adjuster prep arrays for one game: runner/GIDP z per
+        player row, starter stretch z, OF-arm advancement effect and
+        catcher WP+PB rate per FIELDING side, and the leverage-aware pen
+        entry orders (high-leverage: save/hold arms first; low-leverage:
+        length first)."""
+        n = len(players)
+        run_z = np.zeros(n, dtype=np.float32)
+        dp_z = np.zeros(n, dtype=np.float32)
+        stretch_z = np.zeros(n, dtype=np.float32)
+        for i, pid in enumerate(players):
+            if pid is None or pid < 0:
+                continue
+            if i < 18:
+                rz = self._runner_z.get((season, int(pid)))
+                if rz:
+                    run_z[i], dp_z[i] = rz
+            else:
+                stretch_z[i] = self._stretch_zmap.get(
+                    (season, int(pid)), 0.0)
+
+        th = self._tilt
+        ratio = (th.get("theta_arm", 0.0) / th["theta_adv"]
+                 if th.get("theta_adv") else 0.0)
+        arm_eff = np.zeros(2, dtype=np.float32)
+        pre_wp = np.full(
+            2, float(self.preevents["wp_pb_per_pa_runners_on"]),
+            dtype=np.float32)
+        for side, team, lu in ((0, away, players[0:9]),
+                               (1, home, players[9:18])):
+            zs = [self._arm_of_p[(season, int(p))] for p in lu
+                  if p >= 0 and int(p) in self._outfielders
+                  and (season, int(p)) in self._arm_of_p]
+            tz = (float(np.mean(zs)) if zs
+                  else self._arm_of_t.get((season, team), 0.0))
+            arm_eff[side] = ratio * tz
+            cid = next((int(p) for p in lu
+                        if p >= 0 and int(p) in self._catchers), None)
+            if cid is not None:
+                pre_wp[side] = self._catcher_wpmap.get(
+                    (season, cid), pre_wp[side])
+
+        pen_hi = np.full((2, MAX_PEN), -1, dtype=np.int16)
+        pen_lo = np.full((2, MAX_PEN), -1, dtype=np.int16)
+        gp_cache = getattr(self, "_gp_team_cache", {})
+        d = pd.Timestamp(date)
+        for side, team, prows in ((0, away, pen_rows_away),
+                                  (1, home, pen_rows_home)):
+            stats = {}
+            sub = gp_cache.get(team)
+            if sub is not None and prows:
+                rec = sub[(sub.Date >= d - pd.Timedelta(days=365))
+                          & (sub.Date < d)
+                          & (pd.to_numeric(sub.GS,
+                                           errors="coerce") == 0)]
+                if len(rec):
+                    ipn = pd.to_numeric(rec.IP, errors="coerce").fillna(0)
+                    fr = pd.DataFrame(dict(
+                        pid=rec.PlayerId,
+                        sv=pd.to_numeric(rec.SV,
+                                         errors="coerce").fillna(0),
+                        hld=pd.to_numeric(rec.HLD,
+                                          errors="coerce").fillna(0),
+                        outs=(ipn.astype(int) * 3
+                              + np.round((ipn % 1) * 10))))
+                    g = fr.groupby("pid").agg(sv=("sv", "sum"),
+                                              hld=("hld", "sum"),
+                                              outs=("outs", "mean"))
+                    stats = {int(p): (float(r.sv), float(r.hld),
+                                      float(r.outs))
+                             for p, r in g.iterrows()}
+            rows = [(r, *stats.get(int(players[r]), (0.0, 0.0, 3.0)))
+                    for r in prows]
+            hi = sorted(rows, key=lambda t: -(2.0 * t[1] + t[2]))
+            lo = sorted(rows,
+                        key=lambda t: -(t[3] - 0.5 * (t[1] + t[2])))
+            pen_hi[side, :len(hi)] = [r for r, *_ in hi]
+            pen_lo[side, :len(lo)] = [r for r, *_ in lo]
+
+        return dict(run_z=run_z, dp_z=dp_z, stretch_z=stretch_z,
+                    arm_eff=arm_eff, pre_wp=pre_wp, pen_hi=pen_hi,
+                    pen_lo=pen_lo, stretch=self._stretch)
+
     def _last_lineup(self, team):
         gb = self.stores.raw["gb"]
         rows = gb[(gb.Team == team) & gb.BattingOrder.notna()].copy()
@@ -344,6 +539,15 @@ class Predictor:
                                    20 + MAX_PEN + len(pen_home)))
         bat_rows_all = list(range(18)) + list(bench_rows)
 
+        # pre-game team context (Elo) + the fielding team's actual
+        # fielders by roster position — A1 features; ctx is injected by
+        # predict_slate (spec["_ctx"]); absent -> NaN (XGB-native)
+        ctx = spec.get("_ctx") or {}
+        elo_a = ctx.get("away_elo", np.nan)
+        elo_h = ctx.get("home_elo", np.nan)
+        fm_side = {away: self._fielder_map(bat_away),
+                   home: self._fielder_map(bat_home)}
+
         # ---- matchup feature rows for A1/A2 (18 lineup + 2 bench bats)
         rows = []
         for prow in pit_rows:
@@ -375,15 +579,16 @@ class Predictor:
                         Pressure=spec.get("pressure"),
                         HpUmpId=spec.get("hp_ump_id"),
                         rest_p=self._rest(ppid, date),
+                        b_elo=(elo_h if bat_is_home else elo_a),
+                        p_elo=(elo_a if bat_is_home else elo_h),
+                        **{f"fielder_{i}": fm_side[p_team][i]
+                           for i in range(3, 10)},
                     ))
         rdf = pd.DataFrame(rows)
         X, _ = F.assemble_features(rdf, self.fstores)
-        feats = self.a1["features"]
-        X = X.reindex(columns=feats).astype(np.float32)
-        p1 = self.a1["scaler"].transform(self.a1["model"].predict_proba(X))
-        p2 = self.a2["scaler"].transform(self.a2["model"].predict_proba(X))
+        p1, p2 = self._class_vecs(X)
         avec = np.full((n_players, 20, 3, 8), np.nan)
-        a2vec = np.full((n_players, 20, 3, 4), np.nan)
+        a2vec = np.full((n_players, 20, 3) + p2.shape[1:], np.nan)
         i = 0
         for prow in pit_rows:
             for bi, brow in enumerate(bat_rows_all):
@@ -394,8 +599,9 @@ class Predictor:
 
         # ---- hazard grids for the two starters
         haz = np.zeros((2, 41, 11))
-        for si, (prow, ppid) in enumerate(((18, sp_away), (19, sp_home))):
-            haz[si] = self._hazard_grid(ppid, date, season)
+        for si, (prow, ppid, team) in enumerate(
+                ((18, sp_away, away), (19, sp_home, home))):
+            haz[si] = self._hazard_grid(ppid, date, season, team)
 
         # ---- steal matrices (runner PLAYER ROW vs every pitcher row)
         sb_att, sb_suc = self._sb_matrices(players, pit_rows,
@@ -420,6 +626,8 @@ class Predictor:
             [1 if players[i] in self._catchers else 0
              for i in range(18)], dtype=np.int8)
 
+        adj = self._sim_adjusters(players, season, away, home, date,
+                                  pen_rows_away, pen_rows_home)
         lat = dict(self.latent)
         prep = sim.GamePrep(
             n_players=n_players, starters=[18, 19], avec=avec,
@@ -429,7 +637,11 @@ class Predictor:
             latent=lat, bench_rows=bench_rows,
             part_haz=self.part_haz, bat_side=bat_side,
             pit_throws=pit_throws, slot_is_c=slot_is_c,
-            pre_wp=self.preevents["wp_pb_per_pa_runners_on"],
+            run_z=adj["run_z"], dp_z=adj["dp_z"],
+            arm_eff=adj["arm_eff"], stretch=adj["stretch"],
+            stretch_z=adj["stretch_z"], pen_hi=adj["pen_hi"],
+            pen_lo=adj["pen_lo"],
+            pre_wp=adj["pre_wp"],
             pre_pk=self.preevents["pickoff_out_per_pa_runners_on"])
         meta = dict(players=players, names=[self._name(p) if p >= 0
                                             else "League Avg"
@@ -461,7 +673,21 @@ class Predictor:
             return np.nan
         return float((d - pd.Timestamp(arr[i - 1])).days)
 
-    def _hazard_grid(self, ppid, date, season):
+    def _pen_np3(self, team, date):
+        """Own-pen pitches over the last 3 days (pen fatigue: a gassed
+        pen stretches the starter's leash). Mirrors teamctx pen_np3."""
+        gp = getattr(self, "_gp_team_cache", {}).get(team)
+        if gp is None:
+            return np.nan
+        d = pd.Timestamp(date)
+        rec = gp[(gp.Date >= d - pd.Timedelta(days=3)) & (gp.Date < d)
+                 & (pd.to_numeric(gp.GS, errors="coerce") == 0)]
+        if not len(rec):
+            return 0.0
+        return float(pd.to_numeric(rec.NP, errors="coerce")
+                     .fillna(0).sum())
+
+    def _hazard_grid(self, ppid, date, season, team=None):
         leash = self.fstores.get("panel_leash")
         lz = None
         if leash is not None:
@@ -522,7 +748,8 @@ class Predictor:
             leash_np=np_avg, leash_bf=bf_avg, leash_starts=starts,
             season_idx=season - 2015,
             gap_days=gap_days, ramp=ramp, prev_short=prev_short,
-            il_ret30=il_ret30, outs_sd=outs_sd))
+            il_ret30=il_ret30, outs_sd=outs_sd,
+            pen_np3=(self._pen_np3(team, date) if team else np.nan)))
         Xh = rows[self.hz["features"]].astype(np.float32)
         p = self.hz["iso"].predict(
             self.hz["model"].predict_proba(Xh)[:, 1])
@@ -606,16 +833,38 @@ class Predictor:
 
     # ------------------------------------------------------ slate run
 
+    def _game_effects(self, spec):
+        """Venue HR factor + ump run factor for the residual heads'
+        game-grain context (1.0 when unknown)."""
+        season = int(spec.get("season")
+                     or pd.Timestamp(spec["date"]).year)
+        park_hr = ump_r = 1.0
+        pf = self.fstores.get("park_factors")
+        if pf is not None:
+            m = pf[(pf.Venue == (spec.get("venue") or ""))
+                   & (pf.Year == season)]
+            if len(m):
+                park_hr = float(m.pf_HR.iloc[0])
+        uf = self.fstores.get("ump_factors")
+        ump = spec.get("hp_ump_id")
+        if uf is not None and ump:
+            m = uf[(uf.HpUmpId == int(ump)) & (uf.Year == season)]
+            if len(m):
+                ump_r = float(m.uf_R.iloc[0])
+        return park_hr, ump_r
+
     def predict_slate(self, specs, n_sims=N_SIMS, progress=None):
         tick = progress or (lambda m: None)
         hctx = None
-        if self.heads:
-            tick("building slate context for residual heads...")
-            try:
-                hctx = F.slate_context(specs)
-            except Exception as e:              # noqa: BLE001
-                print(f"heads: slate context unavailable ({e}); "
-                      f"serving Platt-only", flush=True)
+        tick("building slate context...")
+        try:
+            hctx = F.slate_context(specs)
+            for sp, cx in zip(specs, hctx):
+                cx["park_hr"], cx["ump_r"] = self._game_effects(sp)
+                sp["_ctx"] = cx     # Elo into the A1 feature rows
+        except Exception as e:              # noqa: BLE001
+            print(f"slate context unavailable ({e}); serving without "
+                  f"Elo/heads context", flush=True)
         out = []
         for gi, spec in enumerate(specs):
             tick(f"game {gi + 1}/{len(specs)}: preparing...")
@@ -743,6 +992,8 @@ def _apply_heads(heads, ctx, deft, season, bat_rows, pit_rows, grow,
             f["home"] = float(hf)
             f["line"] = _line_of(col)
             f["p_dist"] = abs(p - 0.5)
+            f["park_hr"] = ctx.get("park_hr", 1.0)
+            f["ump_r"] = ctx.get("ump_r", 1.0)
             feats.append(f)
         X = pd.DataFrame(feats)[h["features"]]
         raw = h["bst"].predict(X, num_iteration=h["best_iter"],
@@ -804,27 +1055,27 @@ def game_frame(res):
             "Career G": meta["career_g"][brow],
             "HR": float((sub[:, s["HR"]] >= 1).mean()),
             "xTB": round(float(tb.mean()), 2),
-            "2+ TB": float((tb >= 2).mean()),
-            "3+ TB": float((tb >= 3).mean()),
-            "4+ TB": float((tb >= 4).mean()),
+            "2+ TB": _tail_prob(tb, 1.5),
+            "3+ TB": _tail_prob(tb, 2.5),
+            "4+ TB": _tail_prob(tb, 3.5),
             "xH": round(float(sub[:, s["H"]].mean()), 2),
             "Hit": float((sub[:, s["H"]] >= 1).mean()),
-            "2+ Hits": float((sub[:, s["H"]] >= 2).mean()),
+            "2+ Hits": _tail_prob(sub[:, s["H"]], 1.5),
             "xRBI": round(float(sub[:, s["RBI"]].mean()), 2),
             "RBI": float((sub[:, s["RBI"]] >= 1).mean()),
-            "2+ RBI": float((sub[:, s["RBI"]] >= 2).mean()),
+            "2+ RBI": _tail_prob(sub[:, s["RBI"]], 1.5),
             "xR": round(float(sub[:, s["R"]].mean()), 2),
             "Run": float((sub[:, s["R"]] >= 1).mean()),
-            "2+ Runs": float((sub[:, s["R"]] >= 2).mean()),
+            "2+ Runs": _tail_prob(sub[:, s["R"]], 1.5),
             "xHRR": round(float(hrr.mean()), 2),
-            "H+R+RBI 2+": float((hrr >= 2).mean()),
-            "H+R+RBI 3+": float((hrr >= 3).mean()),
-            "H+R+RBI 4+": float((hrr >= 4).mean()),
+            "H+R+RBI 2+": _tail_prob(hrr, 1.5),
+            "H+R+RBI 3+": _tail_prob(hrr, 2.5),
+            "H+R+RBI 4+": _tail_prob(hrr, 3.5),
             "SB": float((sub[:, s["SB"]] >= 1).mean()),
             "xSO": round(float(sub[:, s["K"]].mean()), 2),
             "K": float((sub[:, s["K"]] >= 1).mean()),
-            "2+ K": float((sub[:, s["K"]] >= 2).mean()),
-            "3+ K": float((sub[:, s["K"]] >= 3).mean()),
+            "2+ K": _tail_prob(sub[:, s["K"]], 1.5),
+            "3+ K": _tail_prob(sub[:, s["K"]], 2.5),
             "Single": float((sub[:, s["B1"]] >= 1).mean()),
             "Double": float((sub[:, s["B2"]] >= 1).mean()),
             "Triple": float((sub[:, s["B3"]] >= 1).mean()),
@@ -845,19 +1096,19 @@ def game_frame(res):
                "Name": meta["names"][prow], "ID": pid,
                "xK": round(float(sub[:, s["PK_"]].mean()), 2)}
         for x in K_LINES:
-            row[f"K > {x}"] = float((sub[:, s["PK_"]] > x).mean())
+            row[f"K > {x}"] = _tail_prob(sub[:, s["PK_"]], x)
         row["xER"] = round(float(sub[:, s["PER"]].mean()), 2)
         for x in PER_LINES:
-            row[f"ER > {x}"] = float((sub[:, s["PER"]] > x).mean())
+            row[f"ER > {x}"] = _tail_prob(sub[:, s["PER"]], x)
         row["xOuts"] = round(float(sub[:, s["OUTS"]].mean()), 2)
         for x in OUT_LINES:
-            row[f"Outs > {x}"] = float((sub[:, s["OUTS"]] > x).mean())
+            row[f"Outs > {x}"] = _tail_prob(sub[:, s["OUTS"]], x)
         row["xHits"] = round(float(sub[:, s["PH"]].mean()), 2)
         for x in PHA_LINES:
-            row[f"Hits > {x}"] = float((sub[:, s["PH"]] > x).mean())
+            row[f"Hits > {x}"] = _tail_prob(sub[:, s["PH"]], x)
         row["xBB"] = round(float(sub[:, s["PBB"]].mean()), 2)
         for x in PBB_LINES:
-            row[f"BB > {x}"] = float((sub[:, s["PBB"]] > x).mean())
+            row[f"BB > {x}"] = _tail_prob(sub[:, s["PBB"]], x)
         for c in row:
             for pref, fam in PIT_FAM.items():
                 if c.startswith(pref):
@@ -1038,7 +1289,7 @@ def build_bets(out, date):
         if counts is None:
             continue
         p_over = _cal(res.get("calib"), MKT_FAM.get(market),
-                      float((counts > line).mean()))
+                      _tail_prob(counts, line))
         fair = O.sharp_fair(g.to_dict("records"))
         meta = res["meta"]
         name = meta["names"][row_i]
@@ -1193,7 +1444,7 @@ def save_excel_slate(specs, out, path=None):
     if not bet_rows:
         cell = ws.cell(row=2, column=1,
                        value="no captured odds for this date — run "
-                             "Tools/2_scrape_odds.py near game time")
+                             "\"Tools/2) Scrape Odds.py\" near game time")
         cell.border = box
         cell.alignment = center
 

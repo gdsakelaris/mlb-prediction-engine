@@ -56,21 +56,22 @@ N_KEYS = 8 * 5 * 8 * 3
 
 
 def dense_patterns(pat):
-    """sim.load_patterns dict -> (cum [960, K], arr [960, K, 8]) with
-    every possible key resolved (fallback chain applied up front) and
-    rows padded with cum=2.0 so a comparison-sum sample never lands on
-    padding."""
+    """sim.load_patterns dict -> (cum [960, NB, K], arr [960, K, 8])
+    with every possible key resolved (fallback chain applied up front),
+    the identity-tilt bucket axis preserved, and rows padded with
+    cum=2.0 so a comparison-sum sample never lands on padding."""
     cache = {}
-    kmax = max(len(c) for c, _ in pat.values())
-    cum = np.full((N_KEYS, kmax), 2.0, dtype=np.float32)
+    kmax = max(c.shape[1] for c, _ in pat.values())
+    nb = S_.NB
+    cum = np.full((N_KEYS, nb, kmax), 2.0, dtype=np.float32)
     arr = np.zeros((N_KEYS, kmax, 8), dtype=np.int8)
     for k in range(N_KEYS):
         entry = pat.get(k)
         if entry is None:
             entry = S_._fallback_pattern(k, pat, cache)
         c, a = entry
-        n = len(c)
-        cum[k, :n] = c
+        n = c.shape[1]
+        cum[k, :, :n] = c
         arr[k, :n] = a
         if n:
             arr[k, n:] = a[-1]
@@ -115,8 +116,35 @@ class BatchPrep:
             dtype=np.int8)
         self.pre_pk = xp.asarray(
             np.array([p.pre_pk for p in preps]), dtype=f32)
-        self.pre_wp = xp.asarray(
-            np.array([p.pre_wp for p in preps]), dtype=f32)
+        # pre_wp is per-fielding-side (catcher grain); scalars broadcast
+        self.pre_wp = xp.asarray(np.stack([
+            np.broadcast_to(np.asarray(p.pre_wp, dtype=np.float32)
+                            .ravel() if np.size(p.pre_wp) > 1
+                            else np.full(2, float(p.pre_wp)), (2,))
+            for p in preps]), dtype=f32)
+        np_ = preps[0].n_players
+        z0 = np.zeros(np_, dtype=np.float32)
+        self.run_z = xp.asarray(np.stack(
+            [np.asarray(getattr(p, "run_z", z0)) for p in preps]),
+            dtype=f32)
+        self.dp_z = xp.asarray(np.stack(
+            [np.asarray(getattr(p, "dp_z", z0)) for p in preps]),
+            dtype=f32)
+        self.arm_eff = xp.asarray(np.stack(
+            [np.asarray(getattr(p, "arm_eff", np.zeros(2)))
+             for p in preps]), dtype=f32)
+        self.stretch_z = xp.asarray(np.stack(
+            [np.asarray(getattr(p, "stretch_z", z0)) for p in preps]),
+            dtype=f32)
+        self.stretch = getattr(preps[0], "stretch", None)
+        ph = [getattr(p, "pen_hi", None) for p in preps]
+        pl = [getattr(p, "pen_lo", None) for p in preps]
+        if all(x is not None for x in ph) and \
+                all(x is not None for x in pl):
+            self.pen_hi = xp.asarray(np.stack(ph), dtype=np.int16)
+            self.pen_lo = xp.asarray(np.stack(pl), dtype=np.int16)
+        else:
+            self.pen_hi = self.pen_lo = None
         part = preps[0].part_haz
         self.part = (xp.asarray(part, dtype=f32)
                      if part is not None else None)
@@ -203,9 +231,33 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
                     float(sig.get("sigma_pitcher", 0.0)), (N, 2))
     z_off = _normal(xp, rng, 0.0,
                     float(sig.get("sigma_offense", 0.0)), (N, 2))
+    z_k = _normal(xp, rng, 0.0, float(sig.get("sigma_k", 0.0)), (N, 2))
 
     reg_n = bp.reg[gidx]                 # per-row regulation innings
     ghost_n = bp.ghost[gidx]
+    tilt_edges = xp.asarray(S_.TILT_EDGES, dtype=xp.float32)
+
+    # leverage-aware pen (absent orders -> legacy fixed sequence)
+    lev = bp.pen_hi is not None
+    pen_used = (xp.zeros((N, 2, bp.pen_hi.shape[2]), dtype=bool)
+                if lev else None)
+
+    def pick_pen(idx, side, hi_mask):
+        s32 = side.astype(xp.int32)
+        order = xp.where(hi_mask[:, None], bp.pen_hi[gidx[idx], s32],
+                         bp.pen_lo[gidx[idx], s32])
+        npen = order.shape[1]
+        slots = xp.clip(order - 20 - 8 * s32[:, None], 0,
+                        npen - 1).astype(xp.int32)
+        ok = (order >= 0) & ~pen_used[idx[:, None], s32[:, None], slots]
+        pos = ok.argmax(axis=1).astype(xp.int32)
+        anyok = ok.any(axis=1)
+        chosen = xp.where(anyok, order[xp.arange(int(idx.size)), pos],
+                          -1).astype(xp.int16)
+        cslot = xp.clip(chosen.astype(xp.int32) - 20 - 8 * s32, 0,
+                        npen - 1)
+        pen_used[idx[anyok], s32[anyok], cslot[anyok]] = True
+        return chosen
 
     def bat_axis(rows):
         return rows - 18 * (rows >= 36).astype(rows.dtype)
@@ -240,12 +292,18 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
             leave = rng.random(int(ridx.size), dtype=xp.float32) < exit_p
             if bool(leave.any()):
                 lidx, lfld = ridx[leave], rfld[leave]
-                nxt = bp.pen[gidx[lidx], lfld,
-                             pen_next[lidx, lfld].astype(xp.int32)]
+                if lev:
+                    hi = ((inning[lidx] >= 7)
+                          & (xp.abs(score[lidx, 0].astype(xp.int32)
+                                    - score[lidx, 1]) <= 2))
+                    nxt = pick_pen(lidx, lfld, hi)
+                else:
+                    nxt = bp.pen[gidx[lidx], lfld,
+                                 pen_next[lidx, lfld].astype(xp.int32)]
+                    pen_next[lidx, lfld] = xp.minimum(
+                        pen_next[lidx, lfld] + 1, bp.pen.shape[2] - 1)
                 has = nxt >= 0
                 cur_pit[lidx[has], lfld[has]] = nxt[has]
-                pen_next[lidx, lfld] = xp.minimum(
-                    pen_next[lidx, lfld] + 1, bp.pen.shape[2] - 1)
                 stint_outs[lidx, lfld] = 0
 
         outs[idx] = 0
@@ -292,7 +350,8 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
             bases[idx, 0] = -1
             resp[idx, 0] = -1
         u = rng.random(int(a.size), dtype=xp.float32)
-        wp = any_on & (u < bp.pre_wp[ga]) & (outs[a] < 3)
+        wp = any_on & (u < bp.pre_wp[ga, ft.astype(xp.int32)]) \
+            & (outs[a] < 3)
         if bool(wp.any()):
             idx = a[wp]
             for b in (2, 1, 0):
@@ -396,12 +455,18 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
                 oidx = idx[out_now]
                 oft = ftc[out_now]
                 starter_in[oidx, oft] = False
-                nxt = bp.pen[gidx[oidx], oft,
-                             pen_next[oidx, oft].astype(xp.int32)]
+                if lev:
+                    hi = ((inning[oidx] >= 7)
+                          & (xp.abs(score[oidx, 0].astype(xp.int32)
+                                    - score[oidx, 1]) <= 2))
+                    nxt = pick_pen(oidx, oft, hi)
+                else:
+                    nxt = bp.pen[gidx[oidx], oft,
+                                 pen_next[oidx, oft].astype(xp.int32)]
+                    pen_next[oidx, oft] = xp.minimum(
+                        pen_next[oidx, oft] + 1, bp.pen.shape[2] - 1)
                 has = nxt >= 0
                 cur_pit[oidx[has], oft[has]] = nxt[has]
-                pen_next[oidx, oft] = xp.minimum(
-                    pen_next[oidx, oft] + 1, bp.pen.shape[2] - 1)
                 stint_outs[oidx, oft] = 0
         pit = cur_pit[a, ft].astype(xp.int32)
 
@@ -453,6 +518,20 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
         zp = z_pit[a, ft]
         mult[:, CI["K"]] *= xp.exp(zp)
         mult[:, ONBASE] *= xp.exp(-0.5 * zp)[:, None]
+        # starter-only K-form draw; renormalization compensates
+        mult[:, CI["K"]] *= xp.exp(z_k[a, ft] * starter_in[a, ft])
+        # base-state (stretch) conditioning
+        if bp.stretch is not None:
+            stz = bp.stretch_z[ga, pit]
+            on_now = (bases[a] >= 0).any(axis=1)
+            kadj = xp.where(
+                on_now,
+                bp.stretch["dk_on"] + bp.stretch["b1k"] * stz,
+                xp.float32(bp.stretch["dk_off"]))
+            mult[:, CI["K"]] *= xp.exp(kadj)
+            mult[:, CI["BB"]] *= xp.exp(xp.where(
+                on_now, xp.float32(bp.stretch["db_on"]),
+                xp.float32(bp.stretch["db_off"])))
         P = P * mult
         P /= P.sum(axis=1, keepdims=True)
         cum = xp.cumsum(P, axis=1)
@@ -460,14 +539,21 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
         u = rng.random(int(a.size), dtype=xp.float32)
         cls = (u[:, None] > cum).sum(axis=1).astype(xp.int32)
 
-        # ---- 5. batted-ball type when in play
+        # ---- 5. batted-ball type when in play (class-conditional
+        # under the contact tree: P(bb | outcome), 6-dim a2vec)
         bb = xp.zeros(int(a.size), dtype=xp.int32)
         inplay = ((cls == CI["1B"]) | (cls == CI["2B"])
                   | (cls == CI["3B"]) | (cls == CI["HR"])
                   | (cls == CI["IPO"]))
         if bool(inplay.any()):
-            P2 = bp.a2vec[ga[inplay], pit[inplay],
-                          bat_axis(batter_row[inplay]), tto[inplay]]
+            if bp.a2vec.ndim == 6:
+                P2 = bp.a2vec[ga[inplay], pit[inplay],
+                              bat_axis(batter_row[inplay]),
+                              tto[inplay], cls[inplay]]
+            else:
+                P2 = bp.a2vec[ga[inplay], pit[inplay],
+                              bat_axis(batter_row[inplay]),
+                              tto[inplay]]
             cum2 = xp.cumsum(P2, axis=1)
             cum2[:, -1] = 1.0 + 1e-9
             u2 = rng.random(int(inplay.sum()), dtype=xp.float32)
@@ -485,8 +571,25 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
         bb_code = xp.where(inplay, bb + 1, 0)
         key = ((cls * 5 + bb_code) * 8 + st) * 3 + outs[a].astype(
             xp.int32)
+        # identity-tilt bucket (see sim.py): lead-runner speed/value net
+        # of OF arm on hits; batter GIDP propensity on GB outs w/ r1
+        hitm = ((cls == CI["1B"]) | (cls == CI["2B"])
+                | (cls == CI["3B"]))
+        dpm = ((cls == CI["IPO"]) & (bb_code == 1) & ((st & 1) > 0)
+               & (outs[a] < 2))
+        lead = xp.where(bases[a, 2] >= 0, bases[a, 2],
+                        xp.where(bases[a, 1] >= 0, bases[a, 1],
+                                 bases[a, 0])).astype(xp.int32)
+        zsel = xp.where(lead >= 0,
+                        bp.run_z[ga, xp.maximum(lead, 0)],
+                        bp.run_z[ga, batter_row]) \
+            + bp.arm_eff[ga, ft.astype(xp.int32)]
+        zsel = xp.where(dpm, bp.dp_z[ga, batter_row], zsel)
+        b_idx = (zsel[:, None] > tilt_edges[None, :]).sum(
+            axis=1).astype(xp.int32)
+        bucket = xp.where(hitm | dpm, b_idx, 2)
         u = rng.random(int(a.size), dtype=xp.float32)
-        pick = _sample_dense(xp, bp.pat_cum[key], u)
+        pick = _sample_dense(xp, bp.pat_cum[key, bucket], u)
         pick = xp.minimum(pick, bp.pat_arr.shape[1] - 1)
         chosen = bp.pat_arr[key, pick]          # [n, 8] int8
         dests = chosen[:, :4]
@@ -504,6 +607,15 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
             pruns = xp.where(cap, need, pruns)
             prbi = xp.where(cap, xp.minimum(prbi, pruns), prbi)
             pearn = xp.where(cap, xp.minimum(pearn, pruns), pearn)
+            # demote trailing dest==4 so the R ledger matches (see sim.py)
+            ci = xp.flatnonzero(cap)
+            colmap = xp.asarray([3, 2, 1, 0])
+            dsub = dests[ci][:, colmap].astype(xp.int8)
+            ksc = xp.cumsum((dsub == 4).astype(xp.int16), axis=1)
+            demote = (dsub == 4) & (ksc > need[ci][:, None])
+            fill = xp.where(xp.arange(4)[None, :] == 3, 1, 9)
+            dsub = xp.where(demote, fill, dsub).astype(xp.int8)
+            dests[ci[:, None], colmap[None, :]] = dsub
 
         # ---- apply pattern (stats, runners, outs, scores)
         outs[a] += oadd.astype(xp.int8)
@@ -677,6 +789,22 @@ def _resolve_game(P, spec, n_sims):
     slot_is_c = np.array(
         [1 if players[i] in P._catchers else 0 for i in range(18)],
         dtype=np.int8)
+    # pre-game Elo (spec ctx, else team-context store via game_pk) and
+    # the actual fielders per side — A1 feature inputs
+    ctx = spec.get("_ctx") or {}
+    elo_a = ctx.get("away_elo", np.nan)
+    elo_h = ctx.get("home_elo", np.nan)
+    if not (elo_a == elo_a) and spec.get("game_pk") is not None \
+            and P.fstores.get("teamctx") is not None:
+        tcm = getattr(P, "_elo_by_pk", None)
+        if tcm is None:
+            tc = P.fstores["teamctx"]
+            tcm = {int(k): (float(av), float(hv)) for k, av, hv in
+                   zip(tc.GamePk, tc.away_elo, tc.home_elo)}
+            P._elo_by_pk = tcm
+        elo_a, elo_h = tcm.get(int(spec["game_pk"]), (np.nan, np.nan))
+    fm_side = {away: P._fielder_map(bat_away),
+               home: P._fielder_map(bat_home)}
     meta = dict(players=players,
                 names=[P._name(p) if p >= 0 else "League Avg"
                        for p in players],
@@ -689,7 +817,8 @@ def _resolve_game(P, spec, n_sims):
                 pen_rows_away=pen_rows_away,
                 pen_rows_home=pen_rows_home, bat_rows_all=bat_rows_all,
                 pen_order=pen_order, bat_side=bat_side,
-                pit_throws=pit_throws, slot_is_c=slot_is_c, meta=meta)
+                pit_throws=pit_throws, slot_is_c=slot_is_c, meta=meta,
+                elo=(elo_a, elo_h), fm_side=fm_side)
 
 
 def _matchup_frame(P, resolved):
@@ -709,11 +838,13 @@ def _matchup_frame(P, resolved):
             pthrows = pthrows if pthrows in ("L", "R") else "R"
             p_team = away if (prow == 18
                               or prow in rv["pen_rows_away"]) else home
+            fm = rv["fm_side"][p_team]
             for brow in rv["bat_rows_all"]:
                 bpid = players[brow]
                 bat_is_home = (brow >= 9) if brow < 18 else \
                     (brow == rv["bench_rows"][1])
                 stand = P._stand(bpid, pthrows)
+                elo_a, elo_h = rv["elo"]
                 for tto in (1, 2, 3):
                     rows.append((date, season, bpid, ppid, stand,
                                  pthrows, tto, int(bat_is_home), p_team,
@@ -726,12 +857,18 @@ def _matchup_frame(P, resolved):
                                  spec.get("humidity"),
                                  spec.get("pressure"),
                                  spec.get("hp_ump_id"),
-                                 rest_by_pid[ppid]))
+                                 rest_by_pid[ppid],
+                                 elo_h if bat_is_home else elo_a,
+                                 elo_a if bat_is_home else elo_h,
+                                 fm[3], fm[4], fm[5], fm[6], fm[7],
+                                 fm[8], fm[9]))
         blocks.append(rows)
     cols = ["Date", "Season", "BatterId", "PitcherId", "stand",
             "p_throws", "tto", "home_bat", "fld_team", "Venue",
             "DayNight", "Temp", "WindSpeed", "WindDir", "Condition",
-            "Humidity", "Pressure", "HpUmpId", "rest_p"]
+            "Humidity", "Pressure", "HpUmpId", "rest_p",
+            "b_elo", "p_elo", "fielder_3", "fielder_4", "fielder_5",
+            "fielder_6", "fielder_7", "fielder_8", "fielder_9"]
     rdf = pd.DataFrame([r for b in blocks for r in b], columns=cols)
     rdf["Date"] = pd.to_datetime(rdf["Date"])
     return rdf
@@ -739,19 +876,19 @@ def _matchup_frame(P, resolved):
 
 def _fill_avec(P, resolved, rdf, n_sims):
     """One assemble + one predict per model for the whole chunk, then
-    scatter back into per-game avec/a2vec."""
+    scatter back into per-game avec/a2vec (a2vec is class-conditional
+    under the contact tree)."""
     X, _ = F.assemble_features(rdf, P.fstores)
-    X = X.reindex(columns=P.a1["features"]).astype(np.float32)
-    p1 = P.a1["scaler"].transform(P.a1["model"].predict_proba(X))
-    p2 = P.a2["scaler"].transform(P.a2["model"].predict_proba(X))
+    p1, p2 = P._class_vecs(X)
     per_game = 18 * 20 * 3
     out = []
     for gi, rv in enumerate(resolved):
         n_players = rv["n_players"]
         avec = np.full((n_players, 20, 3, 8), np.nan)
-        a2vec = np.full((n_players, 20, 3, 4), np.nan)
+        a2vec = np.full((n_players, 20, 3) + p2.shape[1:], np.nan)
         b1 = p1[gi * per_game:(gi + 1) * per_game].reshape(18, 20, 3, 8)
-        b2 = p2[gi * per_game:(gi + 1) * per_game].reshape(18, 20, 3, 4)
+        b2 = p2[gi * per_game:(gi + 1) * per_game].reshape(
+            (18, 20, 3) + p2.shape[1:])
         for j, prow in enumerate(rv["pit_rows"]):
             avec[prow] = b1[j]
             a2vec[prow] = b2[j]
@@ -798,6 +935,7 @@ def _hazard_grids(P, resolved):
         d64 = np.datetime64(d)
         for si, prow in enumerate((18, 19)):
             ppid = rv["players"][prow]
+            team = rv["away"] if si == 0 else rv["home"]
             lz = None
             if leash is not None:
                 mine = leash[(leash.PlayerId == ppid)
@@ -848,7 +986,8 @@ def _hazard_grids(P, resolved):
                 leash_np=np_avg, leash_bf=bf_avg, leash_starts=starts,
                 season_idx=rv["season"] - 2015,
                 gap_days=gap_days, ramp=ramp, prev_short=prev_short,
-                il_ret30=il_ret30, outs_sd=outs_sd)))
+                il_ret30=il_ret30, outs_sd=outs_sd,
+                pen_np3=P._pen_np3(team, d))))
     rows = pd.concat(frames, ignore_index=True)
     Xh = rows[P.hz["features"]].astype(np.float32)
     p = P.hz["iso"].predict(P.hz["model"].predict_proba(Xh)[:, 1])
@@ -947,6 +1086,9 @@ def prepare_games(P, specs, n_sims=4000):
                                                   grids, sbs):
         pen_order = np.broadcast_to(rv["pen_order"],
                                     (n_sims, 2, PR.MAX_PEN))
+        adj = P._sim_adjusters(rv["players"], rv["season"], rv["away"],
+                               rv["home"], rv["date"],
+                               rv["pen_rows_away"], rv["pen_rows_home"])
         lat = dict(P.latent)
         prep = S_.GamePrep(
             n_players=rv["n_players"], starters=[18, 19], avec=avec,
@@ -956,7 +1098,10 @@ def prepare_games(P, specs, n_sims=4000):
             bench_rows=rv["bench_rows"], part_haz=P.part_haz,
             bat_side=rv["bat_side"], pit_throws=rv["pit_throws"],
             slot_is_c=rv["slot_is_c"],
-            pre_wp=P.preevents["wp_pb_per_pa_runners_on"],
+            run_z=adj["run_z"], dp_z=adj["dp_z"],
+            arm_eff=adj["arm_eff"], stretch=adj["stretch"],
+            stretch_z=adj["stretch_z"], pen_hi=adj["pen_hi"],
+            pen_lo=adj["pen_lo"], pre_wp=adj["pre_wp"],
             pre_pk=P.preevents["pickoff_out_per_pa_runners_on"])
         out.append((prep, rv["meta"]))
     return out

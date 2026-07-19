@@ -6,7 +6,7 @@ HR probability (with fair odds), hit probability, both starters' projected
 strikeouts with over-probabilities, and game totals.
 
 Run:
-    python Tools/3_gui.py
+    python "Tools/3) GUI.py"
 """
 
 import base64
@@ -18,7 +18,7 @@ import threading
 import tkinter as tk
 import warnings
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import pandas as pd
 
@@ -423,23 +423,42 @@ class App(tk.Tk):
 
     def _load_todays_file(self, silent=False):
         """Populate the slate from Data/todays_games.json (written by
-        Tools/1_get_todays_games.py) if it exists."""
-        import json
+        "Tools/1) Get Todays Games.py") if it exists."""
         path = DATA_DIR / "todays_games.json"
         if not path.exists():
             if not silent:
                 messagebox.showinfo(
                     "No file", "Data/todays_games.json not found.\nRun: "
-                    "python Tools/1_get_todays_games.py")
+                    "python \"Tools/1) Get Todays Games.py\"")
             return
+        self._load_slate_file(path, silent=silent)
+
+    def _load_slate_from_file(self):
+        """Pick any slate JSON (todays_games.json shape) — archived or
+        regenerated slates from Data/slates — and load it. The served
+        workbook is named from the slate's own date, so old slates file
+        themselves under the right day in Predictions/."""
+        slates_dir = DATA_DIR / "slates"
+        path = filedialog.askopenfilename(
+            title="Load slate JSON",
+            initialdir=str(slates_dir if slates_dir.is_dir() else DATA_DIR),
+            filetypes=[("Slate JSON", "*.json"), ("All files", "*.*")])
+        if path:
+            self._load_slate_file(Path(path))
+
+    def _load_slate_file(self, path, silent=False):
+        import json
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
             specs = payload.get("games", [])
         except Exception as e:
             if not silent:
                 messagebox.showerror("Load failed", str(e))
             return
         if not specs:
+            if not silent:
+                messagebox.showinfo("Empty slate",
+                                    f"{Path(path).name} has no games.")
             return
         self._clear_slate()
         # earliest first pitch first — the workbook sheets keep this order
@@ -450,8 +469,10 @@ class App(tk.Tk):
             self.slate.append(spec)
             self.lb_slate.insert("end", self._slate_row_text(spec))
         scraped = str(payload.get("scraped_at", ""))[:16].replace("T", " ")
-        self.status.set(f"Auto-loaded {len(specs)} games from "
-                        f"todays_games.json (scraped {scraped}). "
+        date = str(specs[0].get("date", ""))
+        self.status.set(f"Loaded {len(specs)} games ({date}) from "
+                        f"{Path(path).name}"
+                        f"{f' (scraped {scraped})' if scraped else ''}. "
                         f"Click a game to load/edit it; Predict runs the "
                         f"whole slate.")
 
@@ -569,7 +590,7 @@ class App(tk.Tk):
         self.cb_wdir = add(2, "Wind dir", ttk.Combobox(top, width=14), row=1)
         self.cb_cond = add(3, "Condition", ttk.Combobox(top, width=14), row=1)
         # Air-density inputs (scraped from the Open-Meteo forecast by
-        # 1_get_todays_games.py; editable). Blank = NaN, the model imputes.
+        # "1) Get Todays Games.py"; editable). Blank = NaN, the model imputes.
         # Under a closed roof (Condition = Dome) the model swaps humidity
         # for a fixed indoor value, so this field only matters outdoors.
         self.sp_hum = add(4, "Humidity %", ttk.Spinbox(top, from_=0, to=100,
@@ -639,14 +660,16 @@ class App(tk.Tk):
                    command=self._add_to_slate).pack(fill="x", pady=1)
         ttk.Button(sb, text="Update selected game",
                    command=self._update_selected).pack(fill="x", pady=1)
+        ttk.Button(sb, text="Remove selected",
+                   command=self._remove_from_slate).pack(fill="x", pady=1)
         ttk.Button(sb, text="🡅",
                    command=lambda: self._move_slate(-1)).pack(fill="x", pady=1)
         ttk.Button(sb, text="🡇",
                    command=lambda: self._move_slate(1)).pack(fill="x", pady=1)
-        ttk.Button(sb, text="Remove selected",
-                   command=self._remove_from_slate).pack(fill="x", pady=1)
         ttk.Button(sb, text="Clear slate",
                    command=self._clear_slate).pack(fill="x", pady=1)
+        ttk.Button(sb, text="Load slate from file…",
+                   command=self._load_slate_from_file).pack(fill="x", pady=1)
         ttk.Button(sb, text="Load today's file",
                    command=self._load_todays_file).pack(fill="x", pady=1)
 

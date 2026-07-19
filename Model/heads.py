@@ -86,6 +86,25 @@ def _load_rows():
             right_on=["Team", "Year"], how="left")
         df[f"{side}_def_oaa"] = j["def_oaa"].values
         df[f"{side}_frame"] = j["FrameRV_pt"].values
+    # game-grain effects: venue HR factor + ump run factor (predict
+    # serves the same values via _game_effects; 1.0 when unknown)
+    games = pd.read_csv(F.DATA / "mlb_games.csv", encoding="utf-8-sig",
+                        usecols=["GamePk", "Venue"], low_memory=False)
+    umps = pd.read_csv(F.DATA / "mlb_umpires.csv", encoding="utf-8-sig",
+                       usecols=["GamePk", "HpUmpId"], low_memory=False)
+    df = df.merge(games, on="GamePk", how="left")
+    df = df.merge(umps, on="GamePk", how="left")
+    pf = pd.read_parquet(F.STORES / "park_factors.parquet")[
+        ["Venue", "Year", "pf_HR"]]
+    df = df.merge(pf, left_on=["Venue", "_seas"],
+                  right_on=["Venue", "Year"], how="left")
+    uf = pd.read_parquet(F.STORES / "ump_factors.parquet")[
+        ["HpUmpId", "Year", "uf_R"]]
+    df = df.merge(uf, left_on=["HpUmpId", "_seas"],
+                  right_on=["HpUmpId", "Year"], how="left",
+                  suffixes=("", "_uf"))
+    df["park_hr"] = df["pf_HR"].fillna(1.0)
+    df["ump_r"] = df["uf_R"].fillna(1.0)
     return df
 
 
@@ -102,6 +121,8 @@ def _features(df):
     # extremity of the anchored price — shape context, not the anchor
     # itself (no sign, no level; the base margin cannot be reproduced)
     X["p_dist"] = (df["p_cal"] - 0.5).abs()
+    X["park_hr"] = df["park_hr"]
+    X["ump_r"] = df["ump_r"]
     return X
 
 

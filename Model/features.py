@@ -171,8 +171,42 @@ PA_COLS = [
     "on_1b", "on_2b", "on_3b", "outs_when_up", "inning", "inning_topbot",
     "bat_score", "fld_score", "n_thruorder_pitcher",
     "batter_days_since_prev_game", "pitcher_days_since_prev_game",
-    "fielder_2", "home_team", "away_team",
+    "fielder_2", "fielder_3", "fielder_4", "fielder_5", "fielder_6",
+    "fielder_7", "fielder_8", "fielder_9", "home_team", "away_team",
 ]
+
+
+# ------------------------------------------------ contact-tree pieces
+# Hierarchical PA model: T1 {K, BB, HBP, in-play} -> T2 batted-ball
+# type (the A2 model) -> T3 outcome | bb-type {out, 1B, 2B, 3B, HR}
+# conditioned on the same features (park/defense included). Composed
+# back to the flat 8-class vector plus the CLASS-CONDITIONAL bb-type
+# mix P(bb | outcome) the sim samples from (the flat design sampled bb
+# independently of the outcome class — HRs drew ground balls).
+
+T1_CLASSES = ["K", "BB", "HBP", "IP"]
+T3_CLASSES = ["IPO", "1B", "2B", "3B", "HR"]
+BB_DUMMIES = ["bb_fly", "bb_line", "bb_pop"]   # ground ball = baseline
+
+
+def tree_compose(p1, p2, p3):
+    """(T1 [n,4], T2 [n,4], T3 [n,4,5]) -> (p8 [n,8] in CLASSES order,
+    a2cond [n,8,4] = P(bb | class); rows for K/BB/HBP carry the
+    marginal, the sim never reads them)."""
+    n = len(p1)
+    joint = p2[:, :, None] * p3                 # [n, bb, T3 class]
+    marg = joint.sum(axis=1)                    # [n, 5]
+    ip = p1[:, 3]
+    p8 = np.zeros((n, len(CLASSES)))
+    p8[:, 0], p8[:, 1], p8[:, 2] = p1[:, 0], p1[:, 1], p1[:, 2]
+    for j, c in enumerate(T3_CLASSES):
+        p8[:, CLASSES.index(c)] = ip * marg[:, j]
+    a2cond = np.zeros((n, len(CLASSES), 4))
+    a2cond[:, :3, :] = p2[:, None, :]
+    for j, c in enumerate(T3_CLASSES):
+        a2cond[:, CLASSES.index(c), :] = (
+            joint[:, :, j] / np.clip(marg[:, j:j + 1], 1e-12, None))
+    return p8, a2cond
 
 
 class VectorScaler:
@@ -275,6 +309,8 @@ def build_pa_table():
     pa["BatterId"] = _num(pa["batter"]).astype("int64")
     pa["PitcherId"] = _num(pa["pitcher"]).astype("int64")
     pa["CatcherId"] = _num(pa["fielder_2"])
+    for _fi in range(3, 10):        # actual defense on the field
+        pa[f"fielder_{_fi}"] = _num(pa[f"fielder_{_fi}"])
     pa["tto"] = _num(pa["n_thruorder_pitcher"]).fillna(1).clip(1, 4)
     pa["outs"] = _num(pa["outs_when_up"]).fillna(0).clip(0, 2).astype("int8")
     for b, col in ((1, "on_1b"), (2, "on_2b"), (3, "on_3b")):
@@ -319,7 +355,9 @@ def build_pa_table():
             "home_bat", "bat_team", "fld_team", "bat_sc", "score_diff",
             "tto", "cum_pitches", "pa_pitches", "rest_b", "rest_p", "Venue",
             "DayNight", "Temp", "WindSpeed", "WindDir", "Condition",
-            "Humidity", "Pressure", "HpUmpId"]
+            "Humidity", "Pressure", "HpUmpId",
+            "fielder_3", "fielder_4", "fielder_5", "fielder_6",
+            "fielder_7", "fielder_8", "fielder_9"]
     pa = pa[keep].sort_values(["Date", "game_pk", "at_bat_number"])
     STORES.mkdir(parents=True, exist_ok=True)
     pa.to_parquet(STORES / "pa_table.parquet", index=False)
@@ -1384,6 +1422,312 @@ def build_sb_table(pa):
           f"era scale {scale}", flush=True)
 
 
+# ------------------------------------------------- sim adjuster stores
+#
+# Per-player mechanisms the pattern-bank/pre-event layers consume at sim
+# time (identity-aware advancement, GIDP, stretch splits, catcher WP).
+# All stores are keyed by CONSUMPTION season: season Y rows are built
+# from data strictly before Y, so serve lookups and the tilt fits are
+# leakage-free by construction.
+
+DP_K = 150.0             # r1-on GB opportunities of shrinkage for GIDP
+CATCHER_WP_K = 1500.0    # runner-on PAs of shrinkage for catcher WP/PB
+ADV_SITS = {             # extra-base situations: (label, StartBase) ->
+    ("1B", "2B"): ("H",),          # station 3B; extra = scored
+    ("1B", "1B"): ("3B", "H"),     # station 2B; extra = 3B or scored
+    ("2B", "1B"): ("H",),          # station 3B; extra = scored
+}
+
+
+def _season_z(df, col, by, w=None, clip=2.5):
+    """Within-group z-score (population weighted if w given)."""
+    g = df.groupby(by)[col]
+    mu = g.transform("mean")
+    sd = g.transform("std").replace(0, np.nan)
+    return ((df[col] - mu) / sd).clip(-clip, clip).fillna(0.0)
+
+
+def _pbp_terminal_outs():
+    """Per-PA out count from the terminal play's movements (mid-PA
+    CS/PK outs excluded — the same universe the pattern bank uses)."""
+    m = pd.read_csv(DATA / "mlb_pbp.csv", encoding="utf-8-sig",
+                    usecols=["GamePk", "AtBatIndex", "PlayIndex",
+                             "IsOut"], low_memory=False)
+    m["game_pk"] = _num(m["GamePk"])
+    m["at_bat_number"] = _num(m["AtBatIndex"]) + 1
+    m["PlayIndex"] = _num(m["PlayIndex"]).fillna(-1)
+    last = m.groupby(["game_pk", "at_bat_number"])["PlayIndex"]
+    m = m[m["PlayIndex"] == last.transform("max")]
+    return (m.groupby(["game_pk", "at_bat_number"])["IsOut"].sum()
+            .rename("nout").reset_index())
+
+
+def build_runner_z(pa):
+    """runner_z.parquet: per (Season, PlayerId) run_z — standardized
+    blend of sprint speed and Savant extra-base runner value — and dp_z,
+    the batter's EB-shrunk GIDP propensity given a GB with a runner on
+    first and <2 outs. Consumption-season keyed (prior data only)."""
+    spr = read_csv("mlb_sprint_speed.csv",
+                   usecols=["Year", "PlayerId", "SprintSpeed"])
+    spr["PlayerId"] = _num(spr["PlayerId"])
+    spr["SprintSpeed"] = _num(spr["SprintSpeed"])
+    spr = spr.dropna()
+    spr["z_spr"] = _season_z(spr, "SprintSpeed", "Year")
+    brr = read_csv("mlb_baserunning.csv",
+                   usecols=["Year", "PlayerId", "RunnerRunsXB",
+                            "Opportunities"])
+    brr["PlayerId"] = _num(brr["PlayerId"])
+    o = _num(brr["Opportunities"]).clip(lower=1)
+    brr["xb_rate"] = _num(brr["RunnerRunsXB"]) / o
+    brr = brr.dropna(subset=["PlayerId", "xb_rate"])
+    brr.loc[o < 20, "xb_rate"] = 0.0     # tiny samples -> league
+    brr["z_brr"] = _season_z(brr, "xb_rate", "Year")
+    rz = spr[["Year", "PlayerId", "z_spr"]].merge(
+        brr[["Year", "PlayerId", "z_brr"]],
+        on=["Year", "PlayerId"], how="outer")
+    rz["run_z"] = rz[["z_spr", "z_brr"]].mean(axis=1).clip(-2.5, 2.5)
+    rz["Season"] = rz["Year"] + 1
+
+    nout = _pbp_terminal_outs()
+    opp = pa[((pa.state0.values & 1) > 0) & (pa.outs0 < 2)][
+        ["game_pk", "at_bat_number", "Season", "BatterId", "label",
+         "bb_type"]].merge(nout, on=["game_pk", "at_bat_number"],
+                           how="left")
+    opp["dp"] = ((opp.label == "IPO") & (opp.bb_type == "ground_ball")
+                 & (opp.nout >= 2)).astype(int)
+    per = (opp.groupby(["Season", "BatterId"])
+           .agg(n=("dp", "size"), dp=("dp", "sum")).reset_index()
+           .sort_values(["BatterId", "Season"]))
+    g = per.groupby("BatterId")
+    per["n_prior"] = g["n"].cumsum() - per["n"]
+    per["dp_prior"] = g["dp"].cumsum() - per["dp"]
+    lg = float(opp.dp.mean())
+    per["dp_rate"] = ((per["dp_prior"] + DP_K * lg)
+                      / (per["n_prior"] + DP_K))
+    sd = per.loc[per.n_prior >= 50, "dp_rate"].std()
+    per["dp_z"] = ((per["dp_rate"] - lg) / max(sd, 1e-6)).clip(-2.5, 2.5)
+    out = rz[["Season", "PlayerId", "run_z"]].merge(
+        per.rename(columns={"BatterId": "PlayerId"})[
+            ["Season", "PlayerId", "dp_z"]],
+        on=["Season", "PlayerId"], how="outer")
+    out["run_z"] = out["run_z"].fillna(0.0)
+    out["dp_z"] = out["dp_z"].fillna(0.0)
+    out.to_parquet(STORES / "runner_z.parquet", index=False)
+    print(f"runner_z: {len(out):,} player-seasons "
+          f"(league GB-DP rate {lg:.3%})", flush=True)
+    return out, opp
+
+
+def build_arm_of(pa):
+    """arm_of.parquet: per (Season, PlayerId) standardized OF arm
+    strength, plus a per (Season, Team) fielding aggregate for the tilt
+    fit and serve fallback. Arm data exists 2020+; earlier seasons z=0."""
+    arm = read_csv("mlb_arm_strength.csv",
+                   usecols=["Year", "PlayerId", "ArmOf"])
+    arm["PlayerId"] = _num(arm["PlayerId"])
+    arm["ArmOf"] = _num(arm["ArmOf"])
+    arm = arm.dropna()
+    arm["arm_z"] = _season_z(arm, "ArmOf", "Year")
+    gbb = read_csv("mlb_game_batting.csv",
+                   usecols=["Season", "PlayerId", "Team"])
+    gbb["PlayerId"] = _num(gbb["PlayerId"])
+    team = (gbb.groupby(["Season", "PlayerId"])["Team"]
+            .agg(lambda s: s.mode().iat[0]).reset_index())
+    at = arm.merge(team, left_on=["Year", "PlayerId"],
+                   right_on=["Season", "PlayerId"], how="left")
+    tz = (at.dropna(subset=["Team"])
+          .groupby(["Year", "Team"])["arm_z"].mean()
+          .rename("team_arm_z").reset_index())
+    ply = arm[["Year", "PlayerId", "arm_z"]].copy()
+    ply["Season"] = ply["Year"] + 1
+    tz["Season"] = tz["Year"] + 1
+    ply[["Season", "PlayerId", "arm_z"]].to_parquet(
+        STORES / "arm_of.parquet", index=False)
+    tz[["Season", "Team", "team_arm_z"]].to_parquet(
+        STORES / "arm_of_team.parquet", index=False)
+    print(f"arm_of: {len(ply):,} player-seasons, "
+          f"{len(tz):,} team-seasons", flush=True)
+    return tz
+
+
+def build_advance_tilt(pa, rz, dp_opp, arm_team):
+    """advance_tilt.json: logistic tilt coefficients the pattern bank
+    applies at sim time — theta_adv (lead-runner speed/value per extra
+    base), theta_arm (fielding OF arm), theta_dp (batter GIDP propensity
+    on DP patterns). Fit on runner-level extra-base outcomes with
+    situation/outs controls; z's are prior-season (as-of-honest)."""
+    from sklearn.linear_model import LogisticRegression
+    mv = pd.read_csv(DATA / "mlb_pbp.csv", encoding="utf-8-sig",
+                     usecols=["GamePk", "AtBatIndex", "PlayIndex",
+                              "RunnerId", "StartBase", "EndBase",
+                              "IsOut"], low_memory=False)
+    mv["game_pk"] = _num(mv["GamePk"])
+    mv["at_bat_number"] = _num(mv["AtBatIndex"]) + 1
+    mv["PlayIndex"] = _num(mv["PlayIndex"]).fillna(-1)
+    last = mv.groupby(["game_pk", "at_bat_number"])["PlayIndex"]
+    mv = mv[mv["PlayIndex"] == last.transform("max")]
+    # collapse multi-SEGMENT movements to origin -> final disposition
+    # (a scoring runner is 2B->3B then 3B->H as separate rows; without
+    # this the first segment masks the extra base — same lesson as
+    # build_pattern_table)
+    mv = mv.reset_index(drop=True).reset_index(names="_row")
+    grp = mv.groupby(["game_pk", "at_bat_number", "RunnerId"],
+                     sort=False)
+    mv = mv.assign(_first=grp["_row"].transform("min"),
+                   _last=grp["_row"].transform("max"),
+                   _out=grp["IsOut"].transform("max"))
+    start = mv.loc[mv["_row"] == mv["_first"],
+                   ["game_pk", "at_bat_number", "RunnerId", "StartBase"]]
+    final = mv.loc[mv["_row"] == mv["_last"],
+                   ["game_pk", "at_bat_number", "RunnerId", "EndBase",
+                    "_out"]]
+    mv = start.merge(final, on=["game_pk", "at_bat_number", "RunnerId"])
+    mv = mv.rename(columns={"_out": "IsOut"})
+    core = pa[["game_pk", "at_bat_number", "Season", "label",
+               "fld_team", "outs0"]]
+    mv = mv.merge(core, on=["game_pk", "at_bat_number"], how="inner")
+
+    frames = []
+    for i, ((lab, sb), extra_bases) in enumerate(ADV_SITS.items()):
+        s = mv[(mv.label == lab) & (mv.StartBase == sb)].copy()
+        s["extra"] = (s.EndBase.isin(extra_bases)
+                      & (s.IsOut != 1)).astype(int)
+        s["sit"] = i
+        frames.append(s)
+    ds = pd.concat(frames, ignore_index=True)
+    ds = ds.merge(rz[["Season", "PlayerId", "run_z"]],
+                  left_on=["Season", "RunnerId"],
+                  right_on=["Season", "PlayerId"], how="left")
+    ds = ds.merge(arm_team.rename(columns={"Team": "fld_team"}),
+                  on=["Season", "fld_team"], how="left")
+    ds["run_z"] = ds["run_z"].fillna(0.0)
+    ds["team_arm_z"] = ds["team_arm_z"].fillna(0.0)
+    X = np.column_stack([
+        ds["run_z"].values, ds["team_arm_z"].values,
+        (ds["outs0"] == 1).astype(float).values,
+        (ds["outs0"] == 2).astype(float).values,
+        (ds["sit"] == 1).astype(float).values,
+        (ds["sit"] == 2).astype(float).values])
+    lr = LogisticRegression(C=1e6, max_iter=1000).fit(X, ds["extra"])
+    theta_adv = float(lr.coef_[0][0])
+    theta_arm = float(lr.coef_[0][1])
+
+    d = dp_opp.merge(rz[["Season", "PlayerId", "dp_z"]],
+                     left_on=["Season", "BatterId"],
+                     right_on=["Season", "PlayerId"], how="left")
+    d = d[(d.label == "IPO") & (d.bb_type == "ground_ball")]
+    d["dp_z"] = d["dp_z"].fillna(0.0)
+    lr2 = LogisticRegression(C=1e6, max_iter=1000).fit(
+        d[["dp_z"]].values, d["dp"])
+    theta_dp = float(lr2.coef_[0][0])
+
+    tilt = dict(theta_adv=round(theta_adv, 4),
+                theta_arm=round(theta_arm, 4),
+                theta_dp=round(theta_dp, 4),
+                n_adv=int(len(ds)), n_dp=int(len(d)),
+                extra_rate=round(float(ds.extra.mean()), 4),
+                dp_given_gb=round(float(d.dp.mean()), 4))
+    (STORES / "advance_tilt.json").write_text(json.dumps(tilt, indent=1))
+    print(f"advance_tilt: {tilt}", flush=True)
+
+
+def build_stretch_table(pa):
+    """stretch.json + stretch_z.parquet: base-state K/BB conditioning.
+    League log-offsets for K and BB with runners on vs empty (A1 has no
+    state input — the sim applies these and renormalizes), plus a
+    per-pitcher slope on the standardized stretch velo delta (fbstr
+    split), prior-season keyed."""
+    on = (pa.state0.values > 0)
+    k, bb = (pa.label == "K").values, (pa.label == "BB").values
+    pk_all, pb_all = float(k.mean()), float(bb.mean())
+    off = ~on
+    stretch = {
+        "w_on": round(float(on.mean()), 4),
+        "dk_on": round(float(np.log(k[on].mean() / pk_all)), 4),
+        "dk_off": round(float(np.log(k[off].mean() / pk_all)), 4),
+        "db_on": round(float(np.log(bb[on].mean() / pb_all)), 4),
+        "db_off": round(float(np.log(bb[off].mean() / pb_all)), 4),
+    }
+
+    d = read_csv("mlb_pitch_daily_pitchers.csv",
+                 usecols=["PlayerId", "Date", "fb_n", "fb_v", "fbstr_n",
+                          "fbstr_v"])
+    d["Season"] = pd.to_datetime(d["Date"]).dt.year
+    for c in ("fb_n", "fb_v", "fbstr_n", "fbstr_v"):
+        d[c] = _num(d[c]).fillna(0.0)
+    ps = d.groupby(["Season", "PlayerId"])[
+        ["fb_n", "fb_v", "fbstr_n", "fbstr_v"]].sum().reset_index()
+    wn_n = ps["fb_n"] - ps["fbstr_n"]
+    wn_v = ps["fb_v"] - ps["fbstr_v"]
+    ok = (ps["fbstr_n"] >= STRETCH_MIN_N) & (wn_n >= STRETCH_MIN_N)
+    ps["delta"] = np.where(
+        ok, ps["fbstr_v"] / ps["fbstr_n"].clip(lower=1)
+        - wn_v / wn_n.clip(lower=1), np.nan)
+    ps = ps.dropna(subset=["delta"])
+    ps["stretch_z"] = _season_z(ps, "delta", "Season")
+    sz = ps[["Season", "PlayerId", "stretch_z"]].copy()
+    sz["Season"] = sz["Season"] + 1
+
+    # per-pitcher K logit split (runners on vs empty) vs career stretch z
+    sub = pa[["PitcherId", "label"]].assign(on=on)
+    agg = (sub.assign(k=(sub.label == "K").astype(int))
+           .groupby(["PitcherId", "on"])
+           .agg(n=("k", "size"), k=("k", "sum")).reset_index()
+           .pivot(index="PitcherId", columns="on", values=["n", "k"]))
+    agg.columns = ["n_off", "n_on", "k_off", "k_on"]
+    agg = agg[(agg.n_on >= 400) & (agg.n_off >= 400)].reset_index()
+    p_on = (agg.k_on / agg.n_on).clip(1e-3, 1 - 1e-3)
+    p_off = (agg.k_off / agg.n_off).clip(1e-3, 1 - 1e-3)
+    agg["dlogit"] = (np.log(p_on / (1 - p_on))
+                     - np.log(p_off / (1 - p_off)))
+    cz = ps.groupby("PlayerId")["stretch_z"].mean().rename("z")
+    agg = agg.merge(cz, left_on="PitcherId", right_index=True,
+                    how="inner")
+    zc = agg["z"] - agg["z"].mean()
+    dc = agg["dlogit"] - agg["dlogit"].mean()
+    b1k = float((zc * dc).sum() / max((zc ** 2).sum(), 1e-9))
+    stretch["b1k"] = round(b1k, 4)
+    stretch["n_pitchers"] = int(len(agg))
+    (STORES / "stretch.json").write_text(json.dumps(stretch, indent=1))
+    sz.to_parquet(STORES / "stretch_z.parquet", index=False)
+    print(f"stretch: {stretch}; z store {len(sz):,} pitcher-seasons",
+          flush=True)
+
+
+def build_catcher_wp(pa):
+    """catcher_wp.parquet: per (Season, CatcherId) EB-shrunk WP+PB rate
+    per runner-on PA (prior seasons only), replacing the league pre_wp
+    scalar at serve. Pickoffs stay league-level (pitcher-driven)."""
+    mid = pd.read_csv(DATA / "mlb_pbp.csv", encoding="utf-8-sig",
+                      usecols=["GamePk", "AtBatIndex", "EventType"],
+                      low_memory=False)
+    mid["game_pk"] = _num(mid["GamePk"])
+    mid["at_bat_number"] = _num(mid["AtBatIndex"]) + 1
+    wp = (mid[mid.EventType.isin(["wild_pitch", "passed_ball"])]
+          .drop_duplicates(["game_pk", "at_bat_number"]))
+    wp = wp.assign(wp=1)[["game_pk", "at_bat_number", "wp"]]
+    on = pa[pa.state > 0][["game_pk", "at_bat_number", "Season",
+                           "CatcherId"]].merge(
+        wp, on=["game_pk", "at_bat_number"], how="left")
+    on["wp"] = on["wp"].fillna(0).astype(int)
+    lg = float(on.wp.mean())
+    per = (on.groupby(["Season", "CatcherId"])
+           .agg(n=("wp", "size"), wp=("wp", "sum")).reset_index()
+           .sort_values(["CatcherId", "Season"]))
+    g = per.groupby("CatcherId")
+    per["n_prior"] = g["n"].cumsum() - per["n"]
+    per["wp_prior"] = g["wp"].cumsum() - per["wp"]
+    per["wp_rate"] = ((per["wp_prior"] + CATCHER_WP_K * lg)
+                      / (per["n_prior"] + CATCHER_WP_K))
+    out = per.rename(columns={"CatcherId": "PlayerId"})[
+        ["Season", "PlayerId", "wp_rate"]]
+    out.to_parquet(STORES / "catcher_wp.parquet", index=False)
+    print(f"catcher_wp: {len(out):,} catcher-seasons "
+          f"(league {lg:.3%}/runner-on PA, rate spread "
+          f"{out.wp_rate.min():.3%}..{out.wp_rate.max():.3%})",
+          flush=True)
+
+
 def build_hazard_table(pa):
     """Per-batter-faced rows for STARTERS with removal labels (1 = this
     was the starter's last batter; game-end-while-pitching censored rows
@@ -1447,19 +1791,89 @@ def build_hazard_table(pa):
         direction="backward")
     ilj["il_ret30"] = ((ilj["d_"] - ilj["act_date"]).dt.days
                        <= 30).fillna(False).astype(float)
+
+    # competing-risks CAUSE label for the removal event (the collapsed
+    # all-cause hazard stays the serving model; the label separates
+    # managerial hooks from exits the manager didn't choose):
+    #   injury  IL placement within 3 days after the start
+    #   ph      a pinch hitter appeared in the pitcher's batting slot
+    #           (pitchers-bat games; upper bound — the PH may have hit
+    #           for a later reliever)
+    #   hook    everything else (incl. undetectable rain/suspensions)
+    ilp = read_csv("mlb_il.csv", usecols=["PlayerId", "PlaceDate"])
+    ilp["PlayerId"] = _num(ilp["PlayerId"])
+    ilp["PlaceDate"] = pd.to_datetime(ilp["PlaceDate"], errors="coerce")
+    ilp = ilp.dropna().sort_values("PlaceDate")
+    inj = pd.merge_asof(
+        ilj[["GamePk", "PlayerId", "d_"]].sort_values("d_"),
+        ilp, left_on="d_", right_on="PlaceDate", by="PlayerId",
+        direction="forward")
+    inj["injury"] = ((inj["PlaceDate"] - inj["d_"]).dt.days
+                     <= 3).fillna(False)
+    ilj = ilj.merge(inj[["GamePk", "PlayerId", "injury"]],
+                    on=["GamePk", "PlayerId"], how="left")
+
+    gbb = read_csv("mlb_game_batting.csv",
+                   usecols=["GamePk", "PlayerId", "Team",
+                            "BattingOrder"])
+    gbb["GamePk"] = _num(gbb["GamePk"])
+    gbb["bo"] = _num(gbb["BattingOrder"])
+    gbb = gbb.dropna(subset=["bo"])
+    pslot = gbb[(gbb["bo"] % 100 == 0)].merge(
+        ilj[["GamePk", "PlayerId"]], on=["GamePk", "PlayerId"],
+        how="inner")
+    pslot["slot"] = pslot["bo"] // 100
+    subs = gbb[gbb["bo"] % 100 > 0].copy()
+    subs["slot"] = subs["bo"] // 100
+    subbed = subs[["GamePk", "Team", "slot"]].drop_duplicates()
+    subbed["ph"] = True
+    pslot = pslot.merge(subbed, on=["GamePk", "Team", "slot"],
+                        how="left")
+    ilj = ilj.merge(
+        pslot[["GamePk", "PlayerId", "ph"]].drop_duplicates(),
+        on=["GamePk", "PlayerId"], how="left")
+    ilj["cause"] = np.select(
+        [ilj["injury"].fillna(False).values,
+         ilj["ph"].fillna(False).values],
+        ["injury", "ph"], default="hook")
+
     reg = ilj[["GamePk", "PlayerId", "gap_days", "ramp", "prev_short",
-               "il_ret30"]]
+               "il_ret30", "cause"]]
     reg.columns = ["game_pk", "PitcherId", "gap_days", "ramp",
-                   "prev_short", "il_ret30"]
+                   "prev_short", "il_ret30", "cause"]
     sub = sub.merge(reg, on=["game_pk", "PitcherId"], how="left")
+    sub["cause"] = sub["cause"].where(sub["removed"] == 1, "")
+
+    # pen fatigue: a gassed pen stretches the starter's leash. Own-side
+    # pen pitches over the last 3 days from the team context store
+    # (as-of pre-game by construction; teamctx builds before hazard).
+    sub["pen_np3"] = np.nan
+    tc_path = STORES / "team_game_context.parquet"
+    if tc_path.exists():
+        tc = pd.read_parquet(tc_path, columns=[
+            "GamePk", "away_pen_np3", "home_pen_np3"])
+        tc["game_pk"] = _num(tc["GamePk"])
+        gmap = read_csv("mlb_games.csv", usecols=["GamePk", "HomeTeam"])
+        gmap["game_pk"] = _num(gmap["GamePk"])
+        sub = sub.merge(tc[["game_pk", "away_pen_np3",
+                            "home_pen_np3"]], on="game_pk", how="left")
+        sub = sub.merge(gmap[["game_pk", "HomeTeam"]], on="game_pk",
+                        how="left")
+        sub["pen_np3"] = np.where(sub["fld_team"] == sub["HomeTeam"],
+                                  sub["home_pen_np3"],
+                                  sub["away_pen_np3"])
 
     keep = ["game_pk", "Date", "Season", "PitcherId", "at_bat_number",
             "bf", "cum_pitches", "tto", "inning", "outs", "score_diff",
             "k_so_far", "br_so_far", "runs_so_far", "rest_p", "removed",
-            "gap_days", "ramp", "prev_short", "il_ret30"]
+            "gap_days", "ramp", "prev_short", "il_ret30", "cause",
+            "pen_np3"]
     sub[keep].to_parquet(STORES / "hazard_table.parquet", index=False)
+    mix = sub.loc[sub.removed == 1, "cause"].value_counts(normalize=True)
     print(f"hazard_table: {len(sub):,} starter-BF rows, removal rate "
-          f"{sub.removed.mean():.3%}", flush=True)
+          f"{sub.removed.mean():.3%}, cause mix "
+          f"{ {k: round(float(v), 4) for k, v in mix.items()} }",
+          flush=True)
 
 
 def build_participation(pa):
@@ -1618,6 +2032,20 @@ def load_stores():
                    usecols=["Year", "PlayerId", "SprintSpeed"])
     spr["Year"] = _num(spr["Year"]) + 1
     s["sprint"] = spr
+    # team-strength context (Elo) — may not exist mid-first-build
+    tc_p = STORES / "team_game_context.parquet"
+    s["teamctx"] = (pd.read_parquet(
+        tc_p, columns=["GamePk", "away_elo", "home_elo"])
+        if tc_p.exists() else None)
+    # player-grain OAA, prior-season consumption (actual fielders)
+    oaa_p = DATA / "mlb_oaa_players.csv"
+    if oaa_p.exists():
+        poa = read_csv("mlb_oaa_players.csv",
+                       usecols=["Year", "PlayerId", "OAA"])
+        poa["Year"] = _num(poa["Year"]) + 1
+        s["player_oaa"] = poa
+    else:
+        s["player_oaa"] = None
     return s
 
 
@@ -2201,6 +2629,60 @@ def assemble_features(rows, stores):
         out[c] = np.where(thin, np.nan, out[c])
     out["lg_rpg30"] = np.where((dg < 50).values, np.nan, out["lg_rpg30"])
 
+    # ---- team strength (Elo) — reduced-form, as-of pre-game. Serve
+    # rows carry b_elo/p_elo (predict injects from slate_context);
+    # training rows carry game_pk and join the team-context store.
+    b_elo = p_elo = None
+    if "b_elo" in rows.columns:
+        b_elo = pd.to_numeric(rows["b_elo"], errors="coerce")
+        p_elo = pd.to_numeric(rows["p_elo"], errors="coerce")
+    elif "game_pk" in rows.columns and stores.get("teamctx") is not None:
+        tc = stores["teamctx"]
+        j = rows[["game_pk", "home_bat"]].merge(
+            tc, left_on="game_pk", right_on="GamePk", how="left")
+        hb = _num(j["home_bat"]).fillna(0).values == 1
+        b_elo = pd.Series(np.where(hb, j["home_elo"], j["away_elo"]))
+        p_elo = pd.Series(np.where(hb, j["away_elo"], j["home_elo"]))
+    if b_elo is not None:
+        out["b_team_elo"] = (b_elo - 1500.0).values
+        out["p_team_elo"] = (p_elo - 1500.0).values
+        out["elo_diff"] = (b_elo - p_elo).values
+    else:
+        out["b_team_elo"] = np.full(n, np.nan)
+        out["p_team_elo"] = np.full(n, np.nan)
+        out["elo_diff"] = np.full(n, np.nan)
+
+    # ---- actual-fielder defense: player-level OAA of the seven
+    # non-battery fielders (train: Savant fielder_3..9; serve: the
+    # fielding team's lineup mapped by roster position), aggregated
+    # IF/OF and collided with the batter's ground/air profile
+    if ("fielder_3" in rows.columns
+            and stores.get("player_oaa") is not None):
+        poa = stores["player_oaa"]
+        omap = {(int(y), int(p)): float(v) for y, p, v in
+                zip(poa.Year, poa.PlayerId, poa.OAA) if v == v}
+        seas = _num(rows["Season"]).fillna(0).astype(int).values
+        arrs = []
+        for i in range(3, 10):
+            fid = _num(rows[f"fielder_{i}"]).fillna(-1).astype(int).values
+            arrs.append(np.array(
+                [omap.get((s_, f_), np.nan)
+                 for s_, f_ in zip(seas, fid)], dtype=float))
+        arrs = np.vstack(arrs)
+        with np.errstate(all="ignore"):
+            if_oaa = np.nanmean(arrs[:4], axis=0)
+            of_oaa = np.nanmean(arrs[4:], axis=0)
+        out["def_oaa_if"] = if_oaa
+        out["def_oaa_of"] = of_oaa
+        gbs = np.asarray(pd.to_numeric(pd.Series(out["bq_gb"]),
+                                       errors="coerce"))
+        out["mx_oaa_gb"] = (gbs - 0.44) * if_oaa
+        out["mx_oaa_air"] = (0.44 - gbs) * of_oaa
+    else:
+        for c in ("def_oaa_if", "def_oaa_of", "mx_oaa_gb",
+                  "mx_oaa_air"):
+            out[c] = np.full(n, np.nan)
+
     drop = {f"{p}{cl}"
             for p in ("b_", "bh_", "bl_", "p_", "ph_", "pt_",
                       "btr_", "ptr_")
@@ -2454,13 +2936,13 @@ def main():
                     help="build every store")
     ap.add_argument("--only", default="",
                     help="comma list: pa,panels,context,effects,priors,"
-                         "pbp,hazard,part,teamctx,forecast")
+                         "pbp,simadj,hazard,part,teamctx,forecast")
     args = ap.parse_args()
     if not (args.build or args.only):
         ap.error("nothing to do: pass --build or --only ...")
     steps = set(args.only.split(",")) if args.only else {
-        "pa", "panels", "context", "effects", "priors", "pbp", "hazard",
-        "part", "teamctx", "forecast"}
+        "pa", "panels", "context", "effects", "priors", "pbp", "simadj",
+        "hazard", "part", "teamctx", "forecast"}
 
     STORES.mkdir(parents=True, exist_ok=True)
     pa = None
@@ -2496,12 +2978,18 @@ def main():
     if "pbp" in steps:
         build_pattern_table(pa)
         build_sb_table(pa)
+    if "simadj" in steps:
+        rz, dp_opp = build_runner_z(pa)
+        arm_team = build_arm_of(pa)
+        build_advance_tilt(pa, rz, dp_opp, arm_team)
+        build_stretch_table(pa)
+        build_catcher_wp(pa)
+    if "teamctx" in steps:      # before hazard: pen_np3 feeds the leash
+        build_team_context()
     if "hazard" in steps:
         build_hazard_table(pa)
     if "part" in steps:
         build_participation(pa)
-    if "teamctx" in steps:
-        build_team_context()
     if "forecast" in steps:
         build_forecast_error()
 

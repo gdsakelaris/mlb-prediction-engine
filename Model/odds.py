@@ -2,7 +2,7 @@
 
 Data/mlb_odds.csv is the one file in Data/ that cannot be rebuilt after
 the fact — pregame prices vanish once games start — so its schema lives
-here, in one place, shared by the capture tool (Tools/2_scrape_odds.py)
+here, in one place, shared by the capture tool ("Tools/2) Scrape Odds.py")
 and every future consumer. This module defines:
 
   ODDS_COLUMNS     the store's column set. One row per (Date, PlayerId,

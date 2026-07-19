@@ -56,6 +56,7 @@ def build_spec(P, game_row, lineups, starters, umps, wx):
     st = starters[starters.GamePk == pk]
     spec = dict(
         date=str(pd.Timestamp(game_row.Date).date()),
+        game_pk=int(pk),
         season=int(game_row.Season),
         away_team=game_row.AwayTeam, home_team=game_row.HomeTeam,
         venue=game_row.Venue, day_night=game_row.DayNight,
@@ -200,7 +201,7 @@ def moment_match_latent(n_games=60, n_sims=1000):
     print(f"target CIs (date-block bootstrap): {target_ci}", flush=True)
 
     best = dict(mu_env=0.0, sigma_env=0.0, sigma_offense=0.0,
-                sigma_pitcher=0.0, sigma_hr=0.0)
+                sigma_pitcher=0.0, sigma_hr=0.0, sigma_k=0.0)
 
     def loss(latent):
         df = sim_sample(P, sample, latent, n_sims=n_sims)
@@ -224,7 +225,8 @@ def moment_match_latent(n_games=60, n_sims=1000):
                         ("sigma_env", [0.0, 0.06, 0.12]),
                         ("sigma_offense", [0.0, 0.08, 0.15]),
                         ("sigma_pitcher", [0.0, 0.10, 0.20]),
-                        ("sigma_hr", [0.0, 0.15, 0.30])):
+                        ("sigma_hr", [0.0, 0.15, 0.30]),
+                        ("sigma_k", [0.0, 0.10, 0.20, 0.30])):
         scores = {}
         for v in grid:
             cand = dict(best)

@@ -42,18 +42,59 @@ def pattern_key(cls, bb, state, outs):
     return ((cls * 5 + bb) * 8 + state) * 3 + outs
 
 
+# identity-tilt buckets: pattern sampling is biased by a standardized
+# z (lead-runner speed/value net of OF arm on hits; batter GIDP
+# propensity on ground-ball outs). z is quantized to 5 buckets and the
+# tilted cumulative banks are precomputed per bucket, so runtime cost is
+# one extra gather index. Bucket 2 (z=0) reproduces the league bank.
+TILT_MUS = np.array([-1.5, -0.75, 0.0, 0.75, 1.5])
+TILT_EDGES = np.array([-1.125, -0.375, 0.375, 1.125])
+NB = len(TILT_MUS)
+
+
+def _pattern_tilt(cls, bb, state, outs, arr, p, tilt):
+    """Per-pattern tilt coefficient c for one key: exp(c * z) reweights
+    pattern probabilities. c is centered (p-weighted) within the key so
+    the neutral bucket keeps the league marginal exactly."""
+    c = np.zeros(len(arr), dtype=float)
+    if tilt is None:
+        return c
+    if cls in (3, 4, 5):                       # hits: advancement tilt
+        station = {3: 1, 4: 2, 5: 3}[cls]
+        adv = np.zeros(len(arr), dtype=float)
+        bd = arr[:, 0].astype(int)
+        adv += np.where((bd >= 1) & (bd <= 4), bd - station, 0
+                        ).clip(min=0)
+        for slot, base in ((1, 1), (2, 2), (3, 3)):
+            if not (state & (1 << (base - 1))):
+                continue
+            d = arr[:, slot].astype(int)
+            adv += np.where((d >= 1) & (d <= 4), d - base, 0)
+        c = tilt.get("theta_adv", 0.0) * (adv - float(np.dot(p, adv)))
+    elif cls == 7 and bb == 1 and (state & 1) and outs < 2:
+        isdp = (arr[:, 4] >= 2).astype(float)  # GB out w/ r1: DP tilt
+        c = tilt.get("theta_dp", 0.0) * (isdp - float(np.dot(p, isdp)))
+    return c
+
+
 def load_patterns(stores_dir=None):
-    """pattern_table.parquet -> {key: (cum probs, patterns[n, 8])} with
-    the same key encoding the sim uses."""
+    """pattern_table.parquet -> {key: (cum[NB, n], patterns[n, 8])}:
+    per-bucket tilted cumulative probabilities (see TILT_MUS) with the
+    same key encoding the sim uses. Tilt thetas come from
+    advance_tilt.json when present; absent -> all buckets identical."""
+    import json
     import pandas as pd
     stores_dir = Path(stores_dir) if stores_dir else \
         Path(__file__).resolve().parent / "artifacts" / "stores"
+    tilt_path = stores_dir / "advance_tilt.json"
+    tilt = json.loads(tilt_path.read_text()) if tilt_path.exists() \
+        else None
     tab = pd.read_parquet(stores_dir / "pattern_table.parquet")
     cls_idx = {c: i for i, c in enumerate(
         ["K", "BB", "HBP", "1B", "2B", "3B", "HR", "IPO"])}
-    tab["_k"] = pattern_key(tab["label"].map(cls_idx).astype(int),
-                            tab["bb_type"].fillna("").map(BB_CODE)
-                            .astype(int),
+    tab["_cls"] = tab["label"].map(cls_idx).astype(int)
+    tab["_bb"] = tab["bb_type"].fillna("").map(BB_CODE).astype(int)
+    tab["_k"] = pattern_key(tab["_cls"], tab["_bb"],
                             tab["state"].astype(int),
                             tab["outs"].astype(int))
     out = {}
@@ -62,7 +103,12 @@ def load_patterns(stores_dir=None):
         arr = g[cols].to_numpy(dtype=np.int8)
         p = g["p"].to_numpy(dtype=float)
         p = p / p.sum()
-        out[int(k)] = (np.cumsum(p), arr)
+        c = _pattern_tilt(int(g["_cls"].iat[0]), int(g["_bb"].iat[0]),
+                          int(g["state"].iat[0]), int(g["outs"].iat[0]),
+                          arr, p, tilt)
+        w = p[None, :] * np.exp(np.outer(TILT_MUS, c))
+        w /= w.sum(axis=1, keepdims=True)
+        out[int(k)] = (np.cumsum(w, axis=1), arr)
     return out
 
 # stat tensor columns (batters use the first block, pitchers the second;
@@ -102,7 +148,11 @@ class GamePrep:
                     the lineup player as runner vs that pitcher's battery
                     (outs adjustment folded by predict)
     pattern bank:   flat arrays keyed by (class, bb, state, outs)
-    latent sigmas:  dict(sigma_env, sigma_pitcher, sigma_hr)
+    latent sigmas:  dict(sigma_env, sigma_pitcher, sigma_hr, sigma_k)
+                    sigma_k is a per-game per-STARTER strikeout-form
+                    draw: multiplies the K class while the starter is in,
+                    renormalization absorbs the mass (starter-K
+                    dispersion knob; relievers unaffected)
     """
 
     def __init__(self, **kw):
@@ -174,8 +224,48 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
     z_hr = rng.normal(0, sig.get("sigma_hr", 0.0), S)
     z_pit = rng.normal(0, sig.get("sigma_pitcher", 0.0), (S, 2))
     z_off = rng.normal(0, sig.get("sigma_offense", 0.0), (S, 2))
+    z_k = rng.normal(0, sig.get("sigma_k", 0.0), (S, 2))
 
-    pat = prep.patterns          # dict: key -> (cum, arr[n, 8])
+    # identity adjusters (older preps lack them -> neutral defaults)
+    zp32 = np.zeros(n_players, dtype=np.float32)
+    run_z = np.asarray(getattr(prep, "run_z", zp32), dtype=np.float32)
+    dp_z = np.asarray(getattr(prep, "dp_z", zp32), dtype=np.float32)
+    arm_eff = np.asarray(getattr(prep, "arm_eff", np.zeros(2)),
+                         dtype=np.float32)
+    stretch_z = np.asarray(getattr(prep, "stretch_z", zp32),
+                           dtype=np.float32)
+    stre = getattr(prep, "stretch", None)
+    pre_wp2 = np.asarray(prep.pre_wp, dtype=float).ravel()
+    if pre_wp2.size == 1:
+        pre_wp2 = np.repeat(pre_wp2, 2)
+
+    # leverage-aware pen: two entry orders (player rows) chosen by game
+    # state at entry, with a used-arm mask; absent -> legacy fixed order
+    pen_hi = getattr(prep, "pen_hi", None)
+    pen_lo = getattr(prep, "pen_lo", None)
+    pen_used = None
+    if pen_hi is not None and pen_lo is not None:
+        pen_hi = np.asarray(pen_hi, dtype=np.int16)
+        pen_lo = np.asarray(pen_lo, dtype=np.int16)
+        pen_used = np.zeros((S, 2, pen_hi.shape[1]), dtype=bool)
+
+    def _pick_pen(idx, side, hi_mask):
+        """First unused arm in the leverage-matched order; -1 = none."""
+        order = np.where(hi_mask[:, None], pen_hi[side], pen_lo[side])
+        npen = order.shape[1]
+        slots = np.clip(order - 20 - 8 * side[:, None], 0, npen - 1)
+        ok = (order >= 0) & ~pen_used[idx[:, None], side[:, None], slots]
+        pos = ok.argmax(axis=1)
+        anyok = ok.any(axis=1)
+        chosen = np.where(anyok, order[np.arange(idx.size), pos],
+                          -1).astype(np.int16)
+        cslot = np.clip(chosen - 20 - 8 * side, 0, npen - 1)
+        pen_used[idx[anyok], side[anyok], cslot[anyok]] = True
+        return chosen
+
+    pen_pick = _pick_pen if pen_used is not None else None
+
+    pat = prep.patterns          # dict: key -> (cum[NB, n], arr[n, 8])
     empty_key_fallback = {}
 
     def occ_row(sims, bt_arr, slot_arr):
@@ -211,7 +301,7 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
             bases[idx, 0] = -1
             resp[idx, 0] = -1
         u = rng.random(a.size)
-        wp = any_on & (u < prep.pre_wp) & (outs[a] < 3)
+        wp = any_on & (u < pre_wp2[ft]) & (outs[a] < 3)
         if wp.any():
             idx = a[wp]
             for b in (2, 1, 0):                      # lead runners first
@@ -289,7 +379,7 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
             _end_half(self_ended, inning, half, outs, bases, resp, score,
                       runs_f5, runs_i1, bat_ptr, done, stint_outs,
                       cur_pit, starter_in, pen_next, prep, rng, tensor,
-                      REG, rules, active, bench)
+                      REG, rules, active, bench, pen_pick)
             keep = ~self_ended[a] & ~done[a]
             a = a[keep]
             if a.size == 0:
@@ -310,11 +400,18 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
                 oidx = idx[out_now]
                 oft = ftc[out_now]
                 starter_in[oidx, oft] = False
-                nxt = prep.pen_order[oidx, oft, pen_next[oidx, oft]]
+                if pen_pick is not None:
+                    hi = ((inning[oidx] >= 7)
+                          & (np.abs(score[oidx, 0].astype(np.int32)
+                                    - score[oidx, 1]) <= 2))
+                    nxt = pen_pick(oidx, oft, hi)
+                else:
+                    nxt = prep.pen_order[oidx, oft, pen_next[oidx, oft]]
+                    pen_next[oidx, oft] = np.minimum(
+                        pen_next[oidx, oft] + 1,
+                        prep.pen_order.shape[2] - 1)
                 has = nxt >= 0
                 cur_pit[oidx[has], oft[has]] = nxt[has]
-                pen_next[oidx, oft] = np.minimum(
-                    pen_next[oidx, oft] + 1, prep.pen_order.shape[2] - 1)
                 stint_outs[oidx, oft] = 0
         pit = cur_pit[a, ft]
 
@@ -359,17 +456,36 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
         zp = z_pit[a, ft]
         mult[:, CI["K"]] *= np.exp(zp)
         mult[:, ONBASE] *= np.exp(-0.5 * zp)[:, None]
+        # starter-only K-form draw; renormalization compensates
+        mult[:, CI["K"]] *= np.exp(z_k[a, ft] * starter_in[a, ft])
+        # base-state (stretch) conditioning: league K/BB offsets with
+        # runners on vs empty + per-pitcher stretch-delta deviation
+        if stre is not None:
+            on_now = (bases[a] >= 0).any(axis=1)
+            kadj = np.where(
+                on_now, stre["dk_on"] + stre["b1k"] * stretch_z[pit],
+                stre["dk_off"])
+            mult[:, CI["K"]] *= np.exp(kadj)
+            mult[:, CI["BB"]] *= np.exp(
+                np.where(on_now, stre["db_on"], stre["db_off"]))
         P = P * mult
         P /= P.sum(axis=1, keepdims=True)
         cls = _sample_rows(P, rng.random(a.size))
 
-        # ---- 5. batted-ball type when in play
+        # ---- 5. batted-ball type when in play (class-conditional
+        # under the contact tree: P(bb | outcome), 5-dim a2vec)
         bb = np.zeros(a.size, dtype=np.int8)
         inplay = np.isin(cls, [CI["1B"], CI["2B"], CI["3B"], CI["HR"],
                                CI["IPO"]])
         if inplay.any():
-            P2 = prep.a2vec[pit[inplay], bat_axis(batter_row[inplay]),
-                            tto[inplay]]
+            if prep.a2vec.ndim == 5:
+                P2 = prep.a2vec[pit[inplay],
+                                bat_axis(batter_row[inplay]),
+                                tto[inplay], cls[inplay]]
+            else:
+                P2 = prep.a2vec[pit[inplay],
+                                bat_axis(batter_row[inplay]),
+                                tto[inplay]]
             bb[inplay] = _sample_rows(P2, rng.random(int(inplay.sum())))
 
         # bookkeeping common to every outcome
@@ -389,6 +505,18 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
         pruns = np.zeros(a.size, dtype=np.int8)
         prbi = np.zeros(a.size, dtype=np.int8)
         pearn = np.zeros(a.size, dtype=np.int8)
+        # identity-tilt bucket: lead-runner speed/value net of OF arm on
+        # hits; batter GIDP propensity on GB outs with a runner on first
+        hitm = np.isin(cls, [CI["1B"], CI["2B"], CI["3B"]])
+        dpm = ((cls == CI["IPO"]) & (bb_code == 1) & ((st & 1) > 0)
+               & (outs[a] < 2))
+        lead = np.where(bases[a, 2] >= 0, bases[a, 2],
+                        np.where(bases[a, 1] >= 0, bases[a, 1],
+                                 bases[a, 0]))
+        zsel = np.where(lead >= 0, run_z[np.maximum(lead, 0)],
+                        run_z[batter_row]) + arm_eff[ft]
+        zsel = np.where(dpm, dp_z[batter_row], zsel)
+        bucket = np.where(hitm | dpm, np.digitize(zsel, TILT_EDGES), 2)
         u = rng.random(a.size)
         for k in np.unique(key):
             grp = key == k
@@ -397,13 +525,15 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
                 entry = _fallback_pattern(int(k), pat,
                                           empty_key_fallback)
             cum, arr = entry
-            pick = np.searchsorted(cum, u[grp], side="right")
-            pick = np.minimum(pick, len(arr) - 1)
-            dests[grp] = arr[pick, :4]
-            oadd[grp] = arr[pick, 4]
-            pruns[grp] = arr[pick, 5]
-            prbi[grp] = arr[pick, 6]
-            pearn[grp] = arr[pick, 7]
+            for b in np.unique(bucket[grp]):
+                sub = grp & (bucket == b)
+                pick = np.searchsorted(cum[b], u[sub], side="right")
+                pick = np.minimum(pick, len(arr) - 1)
+                dests[sub] = arr[pick, :4]
+                oadd[sub] = arr[pick, 4]
+                pruns[sub] = arr[pick, 5]
+                prbi[sub] = arr[pick, 6]
+                pearn[sub] = arr[pick, 7]
 
         # ---- walk-off capping: bottom of 9th+ non-HR hit that scores
         # more than needed only counts the winning run
@@ -416,6 +546,16 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
             pruns[cap] = need[cap]
             prbi[cap] = np.minimum(prbi[cap], pruns[cap])
             pearn[cap] = np.minimum(pearn[cap], pruns[cap])
+            # official scoring: only the winning run counts — demote the
+            # trailing dest==4 movements (lead runner scores first) so
+            # the per-player R ledger matches the capped scoreboard
+            ci = np.flatnonzero(cap)
+            dsub = dests[ci][:, [3, 2, 1, 0]].astype(np.int8)
+            ksc = np.cumsum((dsub == 4).astype(np.int16), axis=1)
+            demote = (dsub == 4) & (ksc > need[ci][:, None])
+            fill = np.where(np.arange(4)[None, :] == 3, 1, 9)
+            dsub = np.where(demote, fill, dsub).astype(np.int8)
+            dests[ci[:, None], np.array([3, 2, 1, 0])[None, :]] = dsub
 
         _apply_pattern(a, bt, cls, dests, oadd, pruns, prbi, pearn,
                        bases, resp, outs, score, tensor, batter_row, pit)
@@ -436,7 +576,7 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
             _end_half(over, inning, half, outs, bases, resp, score,
                       runs_f5, runs_i1, bat_ptr, done, stint_outs,
                       cur_pit, starter_in, pen_next, prep, rng, tensor,
-                      REG, rules, active, bench)
+                      REG, rules, active, bench, pen_pick)
 
     leftover = int((~done).sum())
     if leftover:
@@ -463,7 +603,7 @@ def _fallback_pattern(k, pat, cache):
             cache[k] = pat[cand]
             return pat[cand]
     arr = np.array([[1, 9, 9, 9, 0, 0, 0, 0]], dtype=np.int8)
-    cache[k] = (np.array([1.0]), arr)
+    cache[k] = (np.ones((NB, 1)), arr)
     return cache[k]
 
 
@@ -548,7 +688,8 @@ def _apply_pattern(a, bt, cls, dests, oadd, pruns, prbi, pearn, bases,
 
 def _end_half(mask, inning, half, outs, bases, resp, score, runs_f5,
               runs_i1, bat_ptr, done, stint_outs, cur_pit, starter_in,
-              pen_next, prep, rng, tensor, REG, rules, active, bench):
+              pen_next, prep, rng, tensor, REG, rules, active, bench,
+              pen_pick=None):
     idx = np.flatnonzero(mask)
     was_top = half[idx] == 0
     top_done = idx[was_top]
@@ -572,11 +713,18 @@ def _end_half(mask, inning, half, outs, bases, resp, score, runs_f5,
         leave = rng.random(ridx.size) < exit_p
         if leave.any():
             lidx, lfld = ridx[leave], rfld[leave]
-            nxt = prep.pen_order[lidx, lfld, pen_next[lidx, lfld]]
+            if pen_pick is not None:
+                hi = ((inning[lidx] >= 7)
+                      & (np.abs(score[lidx, 0].astype(np.int32)
+                                - score[lidx, 1]) <= 2))
+                nxt = pen_pick(lidx, lfld, hi)
+            else:
+                nxt = prep.pen_order[lidx, lfld, pen_next[lidx, lfld]]
+                pen_next[lidx, lfld] = np.minimum(
+                    pen_next[lidx, lfld] + 1,
+                    prep.pen_order.shape[2] - 1)
             has = nxt >= 0
             cur_pit[lidx[has], lfld[has]] = nxt[has]
-            pen_next[lidx, lfld] = np.minimum(
-                pen_next[lidx, lfld] + 1, prep.pen_order.shape[2] - 1)
             stint_outs[lidx, lfld] = 0
 
     outs[idx] = 0

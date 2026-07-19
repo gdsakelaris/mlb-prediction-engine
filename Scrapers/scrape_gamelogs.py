@@ -56,7 +56,12 @@ HEADERS = {
 
 GAME_COLS = ["GamePk", "Season", "Date", "DayNight", "AwayTeam", "HomeTeam",
              "AwayScore", "HomeScore", "Venue", "Temp", "Condition",
-             "WindSpeed", "WindDir"]
+             "WindSpeed", "WindDir", "GameType"]
+
+# Regular season + the four postseason rounds (Wild Card, Division,
+# League Championship, World Series). One engine, season continuing —
+# postseason rows are ordinary evidence stamped with GameType.
+GAME_TYPES = "R,F,D,L,W"
 
 # One canonical name per physical park across all years and all CSVs
 # (renames, sponsor wrappers, stale/case variants). Keep in sync with
@@ -121,9 +126,10 @@ def team_abbrevs(season):
 
 
 def season_schedule(season):
-    """Final regular-season games: [(gamePk, date, dayNight, venue, scores, team ids)]."""
+    """Final games (regular + postseason): schedule dicts incl. GameType."""
     data = get_json(f"{API}/schedule",
-                    {"sportId": 1, "season": season, "gameType": "R"})
+                    {"sportId": 1, "season": season,
+                     "gameType": GAME_TYPES})
     games, seen = [], set()
     for day in data.get("dates", []):
         for g in day.get("games", []):
@@ -136,6 +142,7 @@ def season_schedule(season):
             games.append({
                 "GamePk": pk,
                 "Date": g["officialDate"],
+                "GameType": g.get("gameType", "R"),
                 "DayNight": g.get("dayNight", ""),
                 "Venue": g.get("venue", {}).get("name", ""),
                 "AwayScore": g["teams"]["away"].get("score", ""),
@@ -173,6 +180,7 @@ def parse_boxscore(game, box, abbrevs, season):
         "AwayScore": game["AwayScore"], "HomeScore": game["HomeScore"],
         "Venue": game["Venue"], "Temp": temp, "Condition": cond,
         "WindSpeed": speed, "WindDir": wdir,
+        "GameType": game.get("GameType", "R"),
     }
 
     bat_rows, pit_rows = [], []
@@ -200,12 +208,9 @@ def parse_boxscore(game, box, abbrevs, season):
     return game_row, bat_rows, pit_rows
 
 
-def fetch_season(season, workers):
-    """Fetch and parse a whole season. Returns dict of the three row lists."""
-    abbrevs = team_abbrevs(season)
-    games = season_schedule(season)
-    print(f"{season}: {len(games)} final games, fetching boxscores...", flush=True)
-
+def fetch_boxscores(games, abbrevs, season, workers):
+    """Fetch+parse boxscores for a list of schedule games. Raises on any
+    failure (partial seasons must never be cached)."""
     game_rows, bat_rows, pit_rows, failed = [], [], [], []
 
     def work(game):
@@ -230,13 +235,55 @@ def fetch_season(season, workers):
 
     if failed:
         raise RuntimeError(f"{season}: {len(failed)} boxscores failed, e.g. {failed[:3]}")
+    return game_rows, bat_rows, pit_rows
 
-    # deterministic order: by date then gamePk
-    game_rows.sort(key=lambda r: (r["Date"], r["GamePk"]))
-    order = {r["GamePk"]: i for i, r in enumerate(game_rows)}
-    bat_rows.sort(key=lambda r: (order[r["GamePk"]], r["Home"], str(r["BattingOrder"] or "999"), r["PlayerId"]))
-    pit_rows.sort(key=lambda r: (order[r["GamePk"]], r["Home"], -int(r["GS"] or 0), r["PlayerId"]))
-    return {"games": game_rows, "batting": bat_rows, "pitching": pit_rows}
+
+def sort_rows(data):
+    """Deterministic order: games by date then gamePk; box rows follow."""
+    data["games"].sort(key=lambda r: (r["Date"], r["GamePk"]))
+    order = {r["GamePk"]: i for i, r in enumerate(data["games"])}
+    data["batting"].sort(key=lambda r: (order[r["GamePk"]], r["Home"], str(r["BattingOrder"] or "999"), r["PlayerId"]))
+    data["pitching"].sort(key=lambda r: (order[r["GamePk"]], r["Home"], -int(r["GS"] or 0), r["PlayerId"]))
+    return data
+
+
+def fetch_season(season, workers):
+    """Fetch and parse a whole season. Returns dict of the three row lists."""
+    abbrevs = team_abbrevs(season)
+    games = season_schedule(season)
+    print(f"{season}: {len(games)} final games, fetching boxscores...", flush=True)
+    game_rows, bat_rows, pit_rows = fetch_boxscores(games, abbrevs, season,
+                                                    workers)
+    return sort_rows({"games": game_rows, "batting": bat_rows,
+                      "pitching": pit_rows})
+
+
+def upgrade_cache(season, data, workers):
+    """Bring a cached (pre-GameType, regular-season-only) season up to the
+    current contract: stamp GameType on every row and pull any postseason
+    games the cache is missing. Returns (data, changed)."""
+    have = {r["GamePk"] for r in data["games"]}
+    needs_type = any("GameType" not in r for r in data["games"])
+    # Cheap check first: an up-to-date cache with GameType stamped and no
+    # schedule call needed only when nothing is missing — but we can't know
+    # what's missing without the schedule, so one schedule call per season.
+    sched = season_schedule(season)
+    type_map = {g["GamePk"]: g["GameType"] for g in sched}
+    missing = [g for g in sched if g["GamePk"] not in have]
+    if not missing and not needs_type:
+        return data, False
+    if missing:
+        print(f"{season}: fetching {len(missing)} missing games "
+              f"(postseason backfill)...", flush=True)
+        abbrevs = team_abbrevs(season)
+        g_rows, b_rows, p_rows = fetch_boxscores(missing, abbrevs, season,
+                                                 workers)
+        data["games"].extend(g_rows)
+        data["batting"].extend(b_rows)
+        data["pitching"].extend(p_rows)
+    for r in data["games"]:
+        r.setdefault("GameType", type_map.get(r["GamePk"], "R"))
+    return sort_rows(data), True
 
 
 def main():
@@ -257,6 +304,17 @@ def main():
             with open(cache_file, encoding="utf-8") as f:
                 data = json.load(f)
             print(f"{season}: loaded {len(data['games'])} games from cache")
+            try:
+                data, changed = upgrade_cache(season, data, args.workers)
+            except Exception as e:
+                print(f"{season}: cache upgrade FAILED ({e})",
+                      file=sys.stderr)
+                sys.exit(1)
+            if changed:
+                with open(cache_file, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+                print(f"{season}: cache upgraded "
+                      f"({len(data['games'])} games incl. postseason)")
         else:
             try:
                 data = fetch_season(season, args.workers)

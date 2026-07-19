@@ -3,10 +3,10 @@
 Discovers scrape_*.py in this directory and runs each one with its default
 output (all default to Data/). The pitch-arsenal scraper runs twice (pitcher
 and batter views). build_ballparks.py is intentionally excluded: park
-dimensions and elevations don't change daily. Tools/2_scrape_odds.py lives
+dimensions and elevations don't change daily. "Tools/2) Scrape Odds.py" lives
 outside this directory on purpose: betting lines must be captured near game
 time (closing lines), not in this morning data job — run it alongside
-Tools/1_get_todays_games.py near first pitch.
+"Tools/1) Get Todays Games.py" near first pitch.
 
 Each scraper is fault-isolated: one failing doesn't stop the rest, and the
 exit code is non-zero if anything failed.
@@ -49,11 +49,11 @@ STATUS_FILE = SCRIPTS_DIR.parent / "Logs" / "last_run_status.json"
 
 
 # names that must NOT run in the 6 AM data job even if a copy ever lands in
-# this directory (the odds scraper lives at Tools/2_scrape_odds.py and is
+# this directory (the odds scraper lives at "Tools/2) Scrape Odds.py" and is
 # run by hand near first pitch): betting lines are captured near game time
 # (closing lines), and a morning run would grab opening/empty markets and
 # waste the odds-API quota.
-EXCLUDE = {"scrape_odds.py", "2_scrape_odds.py"}
+EXCLUDE = {"scrape_odds.py", "2_scrape_odds.py", "2) Scrape Odds.py"}
 
 # which Data/ files each job owns (backed up before the run, validated after)
 JOB_FILES = {

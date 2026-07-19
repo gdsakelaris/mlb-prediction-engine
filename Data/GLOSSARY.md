@@ -44,9 +44,9 @@ to 2010 for translation history).
 | mlb_arm_strength.csv | scrape_arm_strength.py |
 | milb_game_batting.csv / milb_game_pitching.csv | scrape_milb_gamelogs.py (one run writes both) |
 | milb_pitch_daily_pitchers.csv / milb_pitch_daily_batters.csv | scrape_pitches_milb.py (writes both; `--backfill` once) |
-| mlb_odds.csv | Tools/2_scrape_odds.py (near game time — never in the 6 AM job) |
-| mlb_weather_forecast.csv | Tools/1_get_todays_games.py (archives each served forecast) |
-| slates/ (JSON archive) | Tools/1_get_todays_games.py (archives each served slate) |
+| mlb_odds.csv | "Tools/2) Scrape Odds.py" (near game time — never in the 6 AM job) |
+| mlb_weather_forecast.csv | "Tools/1) Get Todays Games.py" (archives each served forecast) |
+| slates/ (JSON archive) | "Tools/1) Get Todays Games.py" (archives each served slate) |
 
 All scrapers write into `Data/` by default. `Scrapers/update_all.py` runs every
 scraper (everything except build_ballparks.py) for a one-command daily
@@ -244,9 +244,12 @@ season. `%` = share of pitches the batter saw of that type; positive run
 values favor the **batter**. Join to the pitcher file on `PitchType` + `Year`
 to build batter-vs-arsenal matchups.
 
-## mlb_games.csv — every regular-season game
-One row per final regular-season game (MLB Stats API). Doubleheaders are two
-rows (distinct `GamePk`), suspended games appear once on their official date.
+## mlb_games.csv — every game (regular season + postseason)
+One row per final game (MLB Stats API), regular season AND the four
+postseason rounds since 2015 (backfilled 2026-07-19). Doubleheaders are
+two rows (distinct `GamePk`), suspended games appear once on their
+official date. PBP, linescores, umpires, and weather follow this table
+automatically, so postseason coverage propagates to all of them.
 
 | Column | Meaning |
 |---|---|
@@ -261,6 +264,7 @@ rows (distinct `GamePk`), suspended games appear once on their official date.
 | Condition | Sky/roof condition text (Clear, Cloudy, Dome, Roof Closed, …) |
 | WindSpeed | Wind speed, mph |
 | WindDir | Wind direction text (Out To CF, In From LF, L To R, Calm, …) |
+| GameType | `R` regular, `F` Wild Card, `D` Division Series, `L` LCS, `W` World Series. One engine, season continuing — postseason rows are ordinary evidence; slice the skill ledger by GameType to measure October drift |
 
 ## mlb_game_batting.csv — per-game batting lines
 One row per batter per game appearance (includes pinch-hitters/runners).
@@ -327,7 +331,9 @@ stabilizing skills in baseball; none of this is in box scores or the
 batted-ball file. `--backfill` also archives the raw pitches to
 `Data/raw_pitches/pitches_{year}.parquet` (~117 MB/season, every Savant
 detail column) so future schema changes re-aggregate from disk
-(`--from-raw`) instead of re-downloading.
+(`--from-raw`) instead of re-downloading. Coverage includes POSTSEASON
+pitches since 2015 (hfGT R|F|D|L|W; one-time `--postseason-backfill`
+ran 2026-07-19, ~131k pitches; incremental runs keep both in sync).
 
 | Column | Meaning |
 |---|---|
@@ -506,7 +512,7 @@ before his MLB numbers exist. `--backfill` archives raw pitches to
 `--from-raw`).
 
 ## mlb_odds.csv — sportsbook lines (open + close)
-Written by `Tools/2_scrape_odds.py`. One row per (Date, PlayerId, Market,
+Written by `Tools/2) Scrape Odds.py`. One row per (Date, PlayerId, Market,
 Line, Book): `OverPrice`/`UnderPrice`/`CapturedAt` hold the LATEST capture
 (the closing side), `OpenOverPrice`/`OpenUnderPrice`/`OpenCapturedAt` the
 EARLIEST — so line movement between the first and last capture of each
@@ -514,12 +520,12 @@ line stays measurable. Grading and model-vs-market ROI only — **never a
 feature input**.
 
 ## mlb_weather_forecast.csv — served pre-game forecasts
-Archived by `Tools/1_get_todays_games.py` at serve time so the
+Archived by `Tools/1) Get Todays Games.py` at serve time so the
 forecast-vs-actual weather gap stays measurable.
 
 ## Data/slates/ — as-served slate archive
 `slate_<date>_<time>.json` snapshots written by
-`Tools/1_get_todays_games.py` on every run: the exact lineups, starters,
+`Tools/1) Get Todays Games.py` on every run: the exact lineups, starters,
 umpire, weather, per-side lineup provenance (`*_lineup_src`: mlb / full /
 top / none) and next scheduled off-days served pregame. todays_games.json
 itself is overwritten daily; this archive is what honest as-of-day

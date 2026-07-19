@@ -61,7 +61,7 @@ SPECS = {
     "mlb_games.csv": dict(
         required_cols=["GamePk", "Season", "Date", "DayNight", "AwayTeam",
                        "HomeTeam", "AwayScore", "HomeScore", "Venue", "Temp",
-                       "Condition", "WindSpeed", "WindDir"],
+                       "Condition", "WindSpeed", "WindDir", "GameType"],
         key=["GamePk"], max_dup_frac=0.0, date_col="Date", fresh_days=6,
         numeric=[("GamePk", 0.0), ("AwayScore", 0.02), ("HomeScore", 0.02)],
         min_rows=13000, shrink_tol=0.999, season_col="Season"),

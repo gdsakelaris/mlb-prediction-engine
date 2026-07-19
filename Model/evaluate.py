@@ -440,9 +440,28 @@ def _odds_y(gb, gp, games_df, pk, pid, market, line):
     return None if stat is None or pd.isna(stat) else int(stat > line)
 
 
+def _gate_fingerprint(n_sims):
+    """Cache key part that invalidates on any serving-stack change."""
+    import os
+    parts = [f"s{n_sims}"]
+    for f_ in ("manifest.json", "output_calibrators.joblib",
+               "residual_heads.joblib", "latent.json"):
+        p = ART / f_
+        parts.append(str(int(os.path.getmtime(p))) if p.exists()
+                     else "0")
+    return "|".join(parts)
+
+
+GATE_CACHE_COLS = ["key", "family", "Date", "y", "p_model", "p_close",
+                   "p_open"]
+
+
 def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
                 alpha=0.05):
-    """Sample-based market-viability gate vs the captured odds store."""
+    """Sample-based market-viability gate vs the captured odds store.
+    Slates are re-simmed only when the serving stack or that date's
+    captured odds changed since the last run (gate_rows_cache.parquet);
+    unchanged slates load their graded rows from the cache."""
     P = PR.Predictor()
     odds = pd.read_csv(O.DEFAULT_STORE, encoding="utf-8-sig",
                        low_memory=False)
@@ -451,11 +470,29 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
     lineups, starters, umps, wx = B._spec_frames(P)
     gb, gp = _load_actuals()
 
+    fp = _gate_fingerprint(n_sims)
+    cache_path = ART / "gate_rows_cache.parquet"
+    cache = (pd.read_parquet(cache_path) if cache_path.exists()
+             else pd.DataFrame(columns=GATE_CACHE_COLS))
+    new_frames, seen_keys = [], set()
+
     rows = []
     for date, day_odds in odds.groupby("Date"):
         day_games = games[games.Date == pd.Timestamp(date)]
         if day_games.empty:
             continue
+        osig = int(pd.util.hash_pandas_object(
+            day_odds[["PlayerId", "Market", "Line", "OverPrice",
+                      "UnderPrice", "OpenOverPrice", "OpenUnderPrice"]]
+            .astype(str)).sum() % 10 ** 12)
+        key = f"{date}|{fp}|{len(day_odds)}|{osig}"
+        seen_keys.add(key)
+        hit = cache[cache.key == key] if len(cache) else cache
+        if len(hit):
+            rows.extend(hit[GATE_CACHE_COLS[1:]].to_dict("records"))
+            print(f"  {date}: {len(hit)} rows from cache", flush=True)
+            continue
+        day_list = []
         # replay the slate once; map players/games to sim results
         by_pid, by_home = {}, {}
         for _, g in day_games.iterrows():
@@ -530,9 +567,24 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
                 y = _odds_y(gb, gp, games, pk, pid, market, line)
             if y is None:
                 continue
-            rows.append(dict(family=fam, Date=date, y=y,
-                             p_model=p_model, p_close=fair,
-                             p_open=fair_open))
+            day_list.append(dict(family=fam, Date=date, y=y,
+                                 p_model=p_model, p_close=fair,
+                                 p_open=fair_open))
+        rows.extend(day_list)
+        if day_list:
+            new_frames.append(
+                pd.DataFrame(day_list).assign(key=key))
+
+    # persist: rows for the current fingerprint only (a stack change
+    # invalidates everything), atomically
+    keep = cache[cache.key.isin(seen_keys)] if len(cache) else cache
+    merged = pd.concat([keep] + new_frames, ignore_index=True) \
+        if new_frames else keep
+    if len(merged):
+        F.write_artifact(cache_path,
+                         lambda p: merged[GATE_CACHE_COLS].to_parquet(
+                             p, index=False), backup=False)
+
     df = pd.DataFrame(rows)
     if df.empty:
         print("no gradable prices in range")
