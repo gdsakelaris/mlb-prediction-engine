@@ -20,3 +20,5 @@ Pillow==11.3.0
 lightgbm==4.6.0
 xgboost==3.0.5
 cupy-cuda12x==14.1.1
+# only imported by train.py --tune (lazy); daily job never loads it
+optuna==4.5.0
