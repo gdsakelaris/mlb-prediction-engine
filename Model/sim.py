@@ -146,7 +146,10 @@ class GamePrep:
                     [n_sims, 2, max_pen] as pitcher indices (-1 = none)
     sb_att/sb_suc:  [18, n_pitchers] steal-of-2B attempt/success prob for
                     the lineup player as runner vs that pitcher's battery
-                    (outs adjustment folded by predict)
+                    at the (outs=1, close-game) baseline
+    sb_state:       [4] = (outs0, outs2, sc_far logit deltas, era
+                    attempt scale) — live outs/score conditioning of
+                    sb_att at sim time; None = frozen baseline (legacy)
     pattern bank:   flat arrays keyed by (class, bb, state, outs)
     latent sigmas:  dict(sigma_env, sigma_pitcher, sigma_hr, sigma_k)
                     sigma_k is a per-game per-STARTER strikeout-form
@@ -352,6 +355,19 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
             idx = a[can]
             r_row = bases[idx, 0]
             p_att = prep.sb_att[r_row, cur_pit[idx, fld_t[idx]]]
+            st = getattr(prep, "sb_state", None)
+            if st is not None:
+                # recover the model logit (matrix stores scale*sigmoid at
+                # outs=1/close), shift by the live state, re-scale
+                base = np.clip(p_att / st[3], 1e-6, 1 - 1e-6)
+                lg = np.log(base / (1 - base))
+                o = outs[idx]
+                lg = (lg + np.where(o == 0, st[0], 0.0)
+                      + np.where(o == 2, st[1], 0.0))
+                far = np.abs(score[idx, 0].astype(np.int32)
+                             - score[idx, 1]) > 2
+                lg = lg + np.where(far, st[2], 0.0)
+                p_att = np.clip(st[3] / (1.0 + np.exp(-lg)), 0.0, 0.95)
             go = rng.random(idx.size) < p_att
             if go.any():
                 gidx = idx[go]

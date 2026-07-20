@@ -300,10 +300,12 @@ def fit_hazard(cal_year):
                 cal_year=cal_year, metrics=dict(logloss=ll, base=base))
 
 
-SB_ATT_FEATS = ["SprintSpeed", "sb_allowed_rate", "cs_rate", "PopTime",
-                "CSAA", "outs", "score_close", "era_new", "lhp"]
+SB_ATT_FEATS = ["SprintSpeed", "speed_miss", "speed2", "sb_allowed_rate",
+                "cs_rate", "PopTime", "CSAA", "outs", "outs1",
+                "score_close", "era_new", "lhp", "post"]
 SB_SUC_FEATS = ["SprintSpeed", "cs_rate", "PopTime", "CSAA", "lhp",
-                "era_new"]
+                "era_new", "post"]
+SB_SPEED_C = 27.3        # sprint-speed center for the quadratic term
 
 
 def fit_sb(cal_year):
@@ -311,6 +313,15 @@ def fit_sb(cal_year):
     sb["score_close"] = (sb["score_diff"].abs() <= 2).astype(float)
     sb["era_new"] = (sb["Season"] >= 2023).astype(float)
     sb["lhp"] = (sb["p_throws"].astype(str) == "L").astype(float)
+    # missing sprint speed (rookies/callups) attempts 23% MORE than the
+    # median-imputed rate; both speed tails over-forecast on a pure
+    # linear term; attempt rate peaks at 1 out (non-monotone)
+    sb["speed_miss"] = sb["SprintSpeed"].isna().astype(float)
+    sb["speed2"] = (sb["SprintSpeed"] - SB_SPEED_C) ** 2
+    sb["outs1"] = (sb["outs"] == 1).astype(float)
+    if "post" not in sb.columns:           # pre-rebuild sb_table
+        sb["post"] = 0
+    sb["post"] = sb["post"].astype(float)
     tr = sb["Season"] <= cal_year          # small models: use through cal
     pipe = lambda feats: Pipeline([        # noqa: E731
         ("imp", SimpleImputer(strategy="median")),
@@ -338,15 +349,31 @@ def fit_sb(cal_year):
             sb.loc[rows, SB_SUC_FEATS])[:, 1].mean()
         shifts[era] = float(logit(scale[era]["success_true"])
                             - logit(mean_model))
+    # sim-time state conditioning: exact raw-scale logit deltas off the
+    # serve baseline (outs=1, score_close=1) so the engines can stop
+    # blowout innings stealing like one-run games
+    sc_, lr_ = att.named_steps["sc"], att.named_steps["lr"]
+    braw = {f: float(lr_.coef_[0][i] / sc_.scale_[i])
+            for i, f in enumerate(SB_ATT_FEATS)}
+    att_state = dict(outs0=-braw["outs"] - braw["outs1"],
+                     outs2=braw["outs"] - braw["outs1"],
+                     sc_far=-braw["score_close"])
     _banner("D — stolen-base attempt/success")
     _kv("opportunities", f"{tr.sum():,}")
     _kv("attempt rate", f"{sb.loc[tr, 'attempt'].mean():.3%}  "
         f"(mean pred {p_att.mean():.3%})")
     _kv("success shifts", str({k: round(v, 3)
                                for k, v in shifts.items()}))
+    _kv("state logit", str({k: round(v, 3)
+                            for k, v in att_state.items()}))
+    ps_i = SB_SUC_FEATS.index("post")
+    b_suc_post = float(suc.named_steps["lr"].coef_[0][ps_i]
+                       / suc.named_steps["sc"].scale_[ps_i])
+    _kv("post coef (att/suc)", f"{braw['post']:+.3f} / {b_suc_post:+.3f}")
     return dict(attempt=att, success=suc, att_features=SB_ATT_FEATS,
                 suc_features=SB_SUC_FEATS, scale=scale,
-                success_logit_shift=shifts)
+                success_logit_shift=shifts, att_state_logit=att_state,
+                speed_center=SB_SPEED_C)
 
 
 def fit_latent():

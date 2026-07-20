@@ -434,23 +434,42 @@ class App(tk.Tk):
         self._load_slate_file(path, silent=silent)
 
     def _load_slate_from_file(self):
-        """Pick any slate JSON (todays_games.json shape) — archived or
-        regenerated slates from Data/slates — and load it. The served
-        workbook is named from the slate's own date, so old slates file
-        themselves under the right day in Predictions/."""
+        """Pick slate JSONs (todays_games.json shape) — archived or
+        regenerated slates from Data/slates. One file loads into the
+        slate for editing; several batch-predict back-to-back, each
+        producing its own workbook. The served workbook is named from
+        the slate's own date, so old slates file themselves under the
+        right day in Predictions/."""
         slates_dir = DATA_DIR / "slates"
-        path = filedialog.askopenfilename(
-            title="Load slate JSON",
+        paths = filedialog.askopenfilenames(
+            title="Load slate JSON(s) — select several to batch-predict",
             initialdir=str(slates_dir if slates_dir.is_dir() else DATA_DIR),
             filetypes=[("Slate JSON", "*.json"), ("All files", "*.*")])
-        if path:
-            self._load_slate_file(Path(path))
+        if not paths:
+            return
+        if len(paths) == 1:
+            self._load_slate_file(Path(paths[0]))
+        else:
+            self._batch_predict([Path(p) for p in paths])
+
+    @staticmethod
+    def _read_slate_specs(path):
+        """Parse a slate JSON into predict-ready specs: earliest first
+        pitch first (the workbook sheets keep this order), lineups
+        tuple-ified. Raises on an unreadable file; the returned list is
+        empty when the file has no games."""
+        import json
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        specs = payload.get("games", [])
+        specs.sort(key=lambda s: s.get("start_et") or "99:99")
+        for spec in specs:
+            spec["away_lineup"] = [tuple(x) for x in spec.get("away_lineup", [])]
+            spec["home_lineup"] = [tuple(x) for x in spec.get("home_lineup", [])]
+        return specs, payload
 
     def _load_slate_file(self, path, silent=False):
-        import json
         try:
-            payload = json.loads(Path(path).read_text(encoding="utf-8"))
-            specs = payload.get("games", [])
+            specs, payload = self._read_slate_specs(path)
         except Exception as e:
             if not silent:
                 messagebox.showerror("Load failed", str(e))
@@ -461,11 +480,7 @@ class App(tk.Tk):
                                     f"{Path(path).name} has no games.")
             return
         self._clear_slate()
-        # earliest first pitch first — the workbook sheets keep this order
-        specs.sort(key=lambda s: s.get("start_et") or "99:99")
         for spec in specs:
-            spec["away_lineup"] = [tuple(x) for x in spec.get("away_lineup", [])]
-            spec["home_lineup"] = [tuple(x) for x in spec.get("home_lineup", [])]
             self.slate.append(spec)
             self.lb_slate.insert("end", self._slate_row_text(spec))
         scraped = str(payload.get("scraped_at", ""))[:16].replace("T", " ")
@@ -473,8 +488,7 @@ class App(tk.Tk):
         self.status.set(f"Loaded {len(specs)} games ({date}) from "
                         f"{Path(path).name}"
                         f"{f' (scraped {scraped})' if scraped else ''}. "
-                        f"Click a game to load/edit it; Predict runs the "
-                        f"whole slate.")
+                        f"Click a game to load/edit it")
 
     # ----------------------------------------------------------- layout
 
@@ -668,10 +682,10 @@ class App(tk.Tk):
                    command=lambda: self._move_slate(1)).pack(fill="x", pady=1)
         ttk.Button(sb, text="Clear slate",
                    command=self._clear_slate).pack(fill="x", pady=1)
-        ttk.Button(sb, text="Load slate from file…",
-                   command=self._load_slate_from_file).pack(fill="x", pady=1)
         ttk.Button(sb, text="Load today's file",
                    command=self._load_todays_file).pack(fill="x", pady=1)
+        ttk.Button(sb, text="📄",
+                   command=self._load_slate_from_file).pack(fill="x", pady=1)
 
     # ------------------------------------------------------- interaction
 
@@ -999,6 +1013,55 @@ class App(tk.Tk):
         else:
             self.status.set("Ready.")
             messagebox.showerror("Prediction failed", payload)
+
+    # ---------------------------------------------------- batch predict
+
+    def _batch_predict(self, paths):
+        """Serve several slate files back-to-back on the worker thread.
+        Each file gets its own workbook exactly as if it were loaded and
+        predicted alone; the slate list in the window is untouched."""
+        if self.pred is None:
+            messagebox.showinfo(
+                "Still loading",
+                "Models are still loading — try again once the status "
+                "bar says Ready.")
+            return
+        self.btn_predict["state"] = "disabled"
+        self._pred_state = None
+        self._batch_msg = f"Batch: starting {len(paths)} slates..."
+        self._jobs.put(lambda: self._batch_run(paths))
+        self.after(200, self._poll_batch)
+
+    def _batch_run(self, paths):
+        from predict import save_excel_slate
+        saved, failed = [], []
+        for i, path in enumerate(paths, 1):
+            try:
+                self._batch_msg = (f"Batch {i}/{len(paths)}: {path.name} "
+                                   f"— predicting...")
+                specs, _ = self._read_slate_specs(path)
+                if not specs:
+                    failed.append(f"{path.name}: no games")
+                    continue
+                out = self.pred.predict_slate(specs)
+                saved.append(save_excel_slate(specs, out))
+            except Exception as e:
+                failed.append(f"{path.name}: {e}")
+        self._pred_state = ("ok", (saved, failed))
+
+    def _poll_batch(self):
+        if self._pred_state is None:
+            self.status.set(self._batch_msg)
+            self.after(200, self._poll_batch)
+            return
+        _state, (saved, failed) = self._pred_state
+        self.btn_predict["state"] = "normal"
+        tail = f", {len(failed)} failed" if failed else ""
+        self.status.set(f"Batch done: {len(saved)} workbook(s) saved"
+                        f"{tail}. Last: {saved[-1] if saved else '—'}")
+        if failed:
+            messagebox.showwarning("Batch finished with errors",
+                                   "\n".join(failed))
 
 
 if __name__ == "__main__":

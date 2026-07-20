@@ -1366,7 +1366,8 @@ def build_sb_table(pa):
     # row from pa_table — those attempts are real but unmatched here, so
     # store per-era scale factors the serve path multiplies onto the
     # attempt model (true attempt-PAs from PBP / matched attempt-PAs)
-    games = read_csv("mlb_games.csv", usecols=["GamePk", "Season"])
+    games = read_csv("mlb_games.csv",
+                     usecols=["GamePk", "Season", "GameType"])
     games["game_pk"] = _num(games["GamePk"])
     ev_all = ev.merge(games[["game_pk", "Season"]], on="game_pk",
                       how="left")
@@ -1385,6 +1386,12 @@ def build_sb_table(pa):
                 ev_all.loc[mask_true, "success"].mean()), 4),
         }
     (STORES / "sb_scale.json").write_text(json.dumps(scale, indent=1))
+
+    # postseason flag — October attempt selectivity runs opposite to
+    # success selectivity, so the models condition on it explicitly
+    opp = opp.merge(games[["game_pk", "GameType"]], on="game_pk",
+                    how="left")
+    opp["post"] = opp["GameType"].isin(["F", "D", "L", "W"]).astype(int)
 
     sprint = read_csv("mlb_sprint_speed.csv",
                       usecols=["Year", "PlayerId", "SprintSpeed"])
@@ -1411,7 +1418,7 @@ def build_sb_table(pa):
                     suffixes=("", "_c"))
     keep = ["game_pk", "at_bat_number", "Date", "Season", "r1",
             "PitcherId", "CatcherId", "p_throws", "outs", "score_diff",
-            "inning", "attempt", "success", "SprintSpeed",
+            "inning", "post", "attempt", "success", "SprintSpeed",
             "sb_allowed_rate", "cs_rate", "PopTime", "CSAA"]
     keep = [c for c in keep if c in opp.columns]
     opp[keep].to_parquet(STORES / "sb_table.parquet", index=False)

@@ -156,6 +156,20 @@ def _load_raw():
             "parks": parks, "umps": umps}
 
 
+def spec_postseason(spec):
+    """Postseason flag for the SB models: explicit game_type when the
+    spec carries it (replays stamp it from mlb_games), else the October
+    heuristic for live slates (wild-card games in late September before
+    the schedule scrape catches up are the only miss)."""
+    gt = str(spec.get("game_type") or "")
+    if gt:
+        return float(gt in ("F", "D", "L", "W"))
+    try:
+        return float(pd.Timestamp(spec["date"]).month >= 10)
+    except (KeyError, ValueError):
+        return 0.0
+
+
 class Predictor:
     def __init__(self, progress=None):
         tick = progress or (lambda m: None)
@@ -316,10 +330,58 @@ class Predictor:
         # is evaluated there with the stint's completed outs
         return tab
 
+    def _il_unavailable(self, date):
+        """PlayerId -> IL PlaceDate for stints active on `date` (as-of
+        safe: placements are announced pregame). Open stints (no
+        ActDate — season-enders never get one) stay active; a game-log
+        appearance after PlaceDate overrides in _pen_for."""
+        il = getattr(self, "_il_cache", None)
+        if il is None:
+            try:
+                il = pd.read_csv(DATA / "mlb_il.csv",
+                                 encoding="utf-8-sig",
+                                 usecols=["PlayerId", "PlaceDate",
+                                          "ActDate"])
+                il["PlaceDate"] = pd.to_datetime(il["PlaceDate"])
+                il["ActDate"] = pd.to_datetime(il["ActDate"])
+            except FileNotFoundError:
+                il = pd.DataFrame(columns=["PlayerId", "PlaceDate",
+                                           "ActDate"])
+            self._il_cache = il
+            self._il_on_cache = {}
+        d = pd.Timestamp(date)
+        if d not in self._il_on_cache:
+            on = il[(il.PlaceDate <= d)
+                    & (il.ActDate.isna() | (il.ActDate > d))]
+            self._il_on_cache[d] = dict(
+                zip(on.PlayerId.astype(int), on.PlaceDate))
+        return self._il_on_cache[d]
+
+    def _pit_team_last(self, date):
+        """PlayerId -> (team, last appearance Date) across ALL teams in
+        the 30 days before `date` — catches mid-window trades that the
+        per-team usage logs can't see."""
+        cache = getattr(self, "_ptl_cache", None)
+        if cache is None:
+            cache = {}
+            self._ptl_cache = cache
+        d = pd.Timestamp(date)
+        if d not in cache:
+            gp = self.stores.raw["gp"]
+            win = gp[(gp.Date >= d - pd.Timedelta(days=30))
+                     & (gp.Date < d)]
+            last = win.sort_values("Date").groupby("PlayerId").tail(1)
+            cache[d] = {int(p): (t, dt) for p, t, dt in
+                        zip(last.PlayerId, last.Team, last.Date)}
+        return cache[d]
+
     def _pen_for(self, team_abbrev, date):
         """Available relievers with usage weights: roster bullpen minus
         arms that threw on both of the last two days (or 25+ pitches
-        yesterday)."""
+        yesterday), minus arms on the IL or last seen pitching for
+        another club (historical replays reconstruct availability from
+        IL spans + game logs; the roster snapshot only exists for
+        today)."""
         cache = getattr(self, "_gp_team_cache", None)
         if cache is None:
             gp_all = self.stores.raw["gp"]
@@ -344,14 +406,31 @@ class Predictor:
         used_both = set(y1.PlayerId) & set(y2.PlayerId)
         out = []
         counts = recent.groupby("PlayerId").size()
+        il_on = self._il_unavailable(d)
+        team_last = self._pit_team_last(d)
+        last_app = recent.groupby("PlayerId").Date.max()
+
+        def _available(pid):
+            place = il_on.get(pid)
+            if place is not None and not (
+                    pid in last_app.index and last_app[pid] >= place):
+                return False        # on IL, nothing pitched since
+            tl = team_last.get(pid)
+            if tl is not None and tl[0] != team_abbrev:
+                return False        # last seen with another club
+            return True
+
         for pid in pen_ids:
             if pid in used_both or np1.get(pid, 0) >= 25:
+                continue
+            if not _available(pid):
                 continue
             out.append((pid, 1.0 + counts.get(pid, 0)))
         # game-log fallback when the depth chart is thin
         if len(out) < 5:
             for pid, n in counts.sort_values(ascending=False).items():
-                if pid not in {p for p, _ in out} and len(out) < MAX_PEN:
+                if pid not in {p for p, _ in out} and len(out) < MAX_PEN \
+                        and _available(int(pid)):
                     out.append((int(pid), 1.0 + n))
         out.sort(key=lambda t: -t[1])
         return out[:MAX_PEN]
@@ -607,7 +686,9 @@ class Predictor:
         # ---- steal matrices (runner PLAYER ROW vs every pitcher row)
         sb_att, sb_suc = self._sb_matrices(players, pit_rows,
                                            bat_rows_all, date, season,
-                                           away, home)
+                                           away, home,
+                                           post=spec_postseason(spec))
+        sb_state = self._sb_state(season)
 
         pen_order = np.zeros((1, 2, MAX_PEN), dtype=np.int16) - 1
         pen_order[0, 0, :len(pen_rows_away)] = pen_rows_away
@@ -634,7 +715,8 @@ class Predictor:
             n_players=n_players, starters=[18, 19], avec=avec,
             a2vec=a2vec, haz_grid=haz,
             relief_exit=self._relief_exit, pen_order=pen_order,
-            sb_att=sb_att, sb_suc=sb_suc, patterns=self.patterns,
+            sb_att=sb_att, sb_suc=sb_suc, sb_state=sb_state,
+            patterns=self.patterns,
             latent=lat, bench_rows=bench_rows,
             part_haz=self.part_haz, bat_side=bat_side,
             pit_throws=pit_throws, slot_is_c=slot_is_c,
@@ -757,7 +839,7 @@ class Predictor:
         return p.reshape(41, 11)
 
     def _sb_matrices(self, players, pit_rows, bat_rows_all, date, season,
-                     away, home):
+                     away, home, post=0.0):
         n_players = len(players)
         sprint = self.fstores["sprint"]
         yr = season
@@ -798,6 +880,7 @@ class Predictor:
             "post2023" if era_new else "pre2023"]
         scale = self.sb["scale"][
             "post2023" if era_new else "pre2023"]["attempt_scale"]
+        spc = self.sb.get("speed_center", 27.3)
         rows_a, rows_s, pos = [], [], []
         for brow in bat_rows_all:
             bpid = players[brow]
@@ -807,18 +890,21 @@ class Predictor:
                 fld = away if (prow == 18 or
                                20 <= prow < 20 + MAX_PEN) else home
                 lhp = float(str(self._throws.get(ppid, "R")) == "L")
+                sspd = (spd.get(bpid, np.nan) if bpid >= 0 else np.nan)
                 rows_a.append(dict(
-                    SprintSpeed=spd.get(bpid, np.nan)
-                    if bpid >= 0 else np.nan,
+                    SprintSpeed=sspd,
+                    speed_miss=float(np.isnan(sspd)),
+                    speed2=(sspd - spc) ** 2,
                     sb_allowed_rate=sbr.get(ppid, np.nan),
                     cs_rate=csr.get(ppid, np.nan),
                     PopTime=team_pop(fld), CSAA=np.nan,
-                    outs=1, score_close=1.0, era_new=era_new, lhp=lhp))
+                    outs=1, outs1=1.0, score_close=1.0,
+                    era_new=era_new, lhp=lhp, post=post))
                 rows_s.append(dict(
                     SprintSpeed=spd.get(bpid, np.nan),
                     cs_rate=csr.get(ppid, np.nan),
                     PopTime=team_pop(fld), CSAA=np.nan, lhp=lhp,
-                    era_new=era_new))
+                    era_new=era_new, post=post))
                 pos.append((brow, prow))
         A = pd.DataFrame(rows_a)[self.sb["att_features"]]
         S_ = pd.DataFrame(rows_s)[self.sb["suc_features"]]
@@ -831,6 +917,18 @@ class Predictor:
             att[brow, prow] = a_
             suc[brow, prow] = s_
         return att, suc
+
+    def _sb_state(self, season):
+        """Sim-time steal-state vector [outs0, outs2, sc_far, scale]:
+        raw logit deltas off the (outs=1, close-game) serve baseline
+        plus the era attempt scale — None for pre-state artifacts."""
+        st = self.sb.get("att_state_logit")
+        if not st:
+            return None
+        era = "post2023" if season >= 2023 else "pre2023"
+        return np.array([st["outs0"], st["outs2"], st["sc_far"],
+                         self.sb["scale"][era]["attempt_scale"]],
+                        dtype=np.float32)
 
     # ------------------------------------------------------ slate run
 
@@ -1471,39 +1569,51 @@ def main():
     Usage:
         python Model/predict.py --serve             # full slate, 20k sims
         python Model/predict.py --serve --sims 4000 # faster smoke test
+        python Model/predict.py --serve --json Data/slates/a.json \
+            Data/slates/b.json   # batch: one workbook per slate file
     """
     import argparse
     ap = argparse.ArgumentParser(description=main.__doc__)
     ap.add_argument("--serve", action="store_true",
                     help="serve the slate headlessly (GUI-equivalent)")
     ap.add_argument("--sims", type=int, default=N_SIMS)
-    ap.add_argument("--json", default=str(DATA / "todays_games.json"))
+    ap.add_argument("--json", nargs="+",
+                    default=[str(DATA / "todays_games.json")],
+                    help="one or more slate JSONs; each gets its own "
+                         "workbook (named from its own date)")
     args = ap.parse_args()
     if not args.serve:
         ap.error("nothing to do: pass --serve")
 
-    payload = json.loads(Path(args.json).read_text(encoding="utf-8"))
-    games = payload.get("games") or []
-    if not games:
-        print("no games in the slate file; nothing to serve")
-        return
-    specs = sorted(games, key=lambda g: (g.get("start_et") or "99:99",
-                                         g.get("away_team") or ""))
-    for s in specs:
-        for side in ("away", "home"):
-            s[f"{side}_lineup"] = [tuple(x) for x in
-                                   (s.get(f"{side}_lineup") or [])]
+    P = None  # models load once, first slate that has games
+    served = 0
+    for jpath in args.json:
+        payload = json.loads(Path(jpath).read_text(encoding="utf-8"))
+        games = payload.get("games") or []
+        if not games:
+            print(f"{jpath}: no games in the slate file; skipping")
+            continue
+        specs = sorted(games, key=lambda g: (g.get("start_et") or "99:99",
+                                             g.get("away_team") or ""))
+        for s in specs:
+            for side in ("away", "home"):
+                s[f"{side}_lineup"] = [tuple(x) for x in
+                                       (s.get(f"{side}_lineup") or [])]
 
-    P = Predictor(progress=lambda m: print(m, flush=True))
-    out = P.predict_slate(specs, n_sims=args.sims,
-                          progress=lambda m: print(m, flush=True))
-    path = save_excel_slate(specs, out)
-    n_conf = sum(1 for s in specs
-                 if s.get("away_lineup_src", "mlb") == "mlb"
-                 and s.get("home_lineup_src", "mlb") == "mlb")
-    print(f"served {len(specs)} games at {args.sims} sims "
-          f"({n_conf} confirmed-lineup, {len(specs) - n_conf} projected) "
-          f"-> {path}")
+        if P is None:
+            P = Predictor(progress=lambda m: print(m, flush=True))
+        out = P.predict_slate(specs, n_sims=args.sims,
+                              progress=lambda m: print(m, flush=True))
+        path = save_excel_slate(specs, out)
+        n_conf = sum(1 for s in specs
+                     if s.get("away_lineup_src", "mlb") == "mlb"
+                     and s.get("home_lineup_src", "mlb") == "mlb")
+        print(f"served {len(specs)} games at {args.sims} sims "
+              f"({n_conf} confirmed-lineup, {len(specs) - n_conf} "
+              f"projected) -> {path}")
+        served += 1
+    if len(args.json) > 1:
+        print(f"batch complete: {served}/{len(args.json)} slates served")
 
 
 if __name__ == "__main__":

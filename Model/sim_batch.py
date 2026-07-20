@@ -102,6 +102,9 @@ class BatchPrep:
             np.stack([p.sb_att for p in preps]), dtype=f32)
         self.sb_suc = xp.asarray(
             np.stack([p.sb_suc for p in preps]), dtype=f32)
+        sbs = [getattr(p, "sb_state", None) for p in preps]
+        self.sb_state = (xp.asarray(np.stack(sbs), dtype=f32)
+                         if all(s is not None for s in sbs) else None)
         self.bench = xp.asarray(
             np.stack([np.asarray(p.bench_rows) for p in preps]),
             dtype=np.int16)
@@ -407,6 +410,18 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
             pit_i = cur_pit[idx, (1 - half[idx]).astype(xp.int16)
                             ].astype(xp.int32)
             p_att = bp.sb_att[gidx[idx], r_row, pit_i]
+            if bp.sb_state is not None:
+                st = bp.sb_state[gidx[idx]]
+                base = xp.clip(p_att / st[:, 3], 1e-6, 1 - 1e-6)
+                lg = xp.log(base / (1 - base))
+                o = outs[idx]
+                lg = (lg + xp.where(o == 0, st[:, 0], 0.0)
+                      + xp.where(o == 2, st[:, 1], 0.0))
+                far = xp.abs(score[idx, 0].astype(xp.int32)
+                             - score[idx, 1]) > 2
+                lg = lg + xp.where(far, st[:, 2], 0.0)
+                p_att = xp.clip(st[:, 3] / (1.0 + xp.exp(-lg)),
+                                0.0, 0.95).astype(xp.float32)
             go = rng.random(int(idx.size), dtype=xp.float32) < p_att
             if bool(go.any()):
                 gidx2 = idx[go]
@@ -1023,6 +1038,8 @@ def _sb_matrices(P, resolved):
                     and pd.notna(r.PopTime.iloc[0]) else np.nan)
 
         era_new = float(season >= 2023)
+        post = PR.spec_postseason(rv["spec"])
+        spc = P.sb.get("speed_center", 27.3)
         n = 0
         for brow in rv["bat_rows_all"]:
             bpid = players[brow]
@@ -1032,22 +1049,27 @@ def _sb_matrices(P, resolved):
                                or 20 <= prow < 20 + PR.MAX_PEN) else \
                     home
                 lhp = float(str(P._throws.get(ppid, "R")) == "L")
+                sspd = (spd.get(bpid, np.nan) if bpid >= 0 else np.nan)
                 rows_a.append((
-                    spd.get(bpid, np.nan) if bpid >= 0 else np.nan,
+                    sspd, float(np.isnan(sspd)), (sspd - spc) ** 2,
                     sbr.get(ppid, np.nan), csr.get(ppid, np.nan),
-                    team_pop(fld), np.nan, 1, 1.0, era_new, lhp))
+                    team_pop(fld), np.nan, 1, 1.0, 1.0, era_new, lhp,
+                    post))
                 rows_s.append((
                     spd.get(bpid, np.nan), csr.get(ppid, np.nan),
-                    team_pop(fld), np.nan, lhp, era_new))
+                    team_pop(fld), np.nan, lhp, era_new, post))
                 n += 1
         sizes.append(n)
-    A = pd.DataFrame(rows_a, columns=["SprintSpeed", "sb_allowed_rate",
+    A = pd.DataFrame(rows_a, columns=["SprintSpeed", "speed_miss",
+                                      "speed2", "sb_allowed_rate",
                                       "cs_rate", "PopTime", "CSAA",
-                                      "outs", "score_close", "era_new",
-                                      "lhp"])[P.sb["att_features"]]
+                                      "outs", "outs1", "score_close",
+                                      "era_new", "lhp",
+                                      "post"])[P.sb["att_features"]]
     S2 = pd.DataFrame(rows_s, columns=["SprintSpeed", "cs_rate",
                                        "PopTime", "CSAA", "lhp",
-                                       "era_new"])[P.sb["suc_features"]]
+                                       "era_new",
+                                       "post"])[P.sb["suc_features"]]
     pa_all = P.sb["attempt"].predict_proba(A)[:, 1]
     ps_raw = P.sb["success"].predict_proba(S2)[:, 1]
     out = []
@@ -1094,6 +1116,7 @@ def prepare_games(P, specs, n_sims=4000):
             n_players=rv["n_players"], starters=[18, 19], avec=avec,
             a2vec=a2vec, haz_grid=haz, relief_exit=P._relief_exit,
             pen_order=pen_order, sb_att=att, sb_suc=suc,
+            sb_state=P._sb_state(rv["season"]),
             patterns=P.patterns, latent=lat,
             bench_rows=rv["bench_rows"], part_haz=P.part_haz,
             bat_side=rv["bat_side"], pit_throws=rv["pit_throws"],

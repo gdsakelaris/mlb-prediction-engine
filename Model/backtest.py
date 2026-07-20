@@ -49,6 +49,18 @@ def _spec_frames(P):
     return lineups, starters, umps, wx
 
 
+def _dh_pks(P):
+    """GamePks belonging to a same-day doubleheader. The schedule keeps
+    no game number — two rows sharing a date+matchup IS the flag."""
+    pks = getattr(P, "_dh_pks", None)
+    if pks is None:
+        g = P.stores.raw["games"]
+        dup = g.duplicated(["Date", "AwayTeam", "HomeTeam"], keep=False)
+        pks = {int(p) for p in g.GamePk[dup]}
+        P._dh_pks = pks
+    return pks
+
+
 def build_spec(P, game_row, lineups, starters, umps, wx):
     """One mlb_games row -> a serve-path spec with what was knowable."""
     pk = game_row.GamePk
@@ -64,6 +76,8 @@ def build_spec(P, game_row, lineups, starters, umps, wx):
         wind_dir=game_row.WindDir, condition=game_row.Condition,
         humidity=wx.Humidity.get(pk), pressure=wx.Pressure.get(pk),
         hp_ump_id=umps.get(pk),
+        game_type=str(getattr(game_row, "GameType", "") or ""),
+        is_dh=int(pk) in _dh_pks(P),
     )
     for side, team in (("away", game_row.AwayTeam),
                        ("home", game_row.HomeTeam)):
@@ -113,7 +127,8 @@ def sim_sample(P, sample, latent, n_sims=1000):
         prep, meta = preps[pk]
         prep.latent = latent
         res = sim.run(prep, n_sims=n_sims, seed=pk % 99991,
-                      season=int(g.Season))
+                      season=int(g.Season),
+                      is_dh_game=pk in _dh_pks(P))
         t, s = res["tensor"], sim.SIDX
         tot = res["score"].sum(axis=1)
         rows.append(dict(
