@@ -245,7 +245,7 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
     pen_used = (xp.zeros((N, 2, bp.pen_hi.shape[2]), dtype=bool)
                 if lev else None)
 
-    def pick_pen(idx, side, hi_mask):
+    def pick_pen(idx, side, hi_mask, due_stand=None):
         s32 = side.astype(xp.int32)
         order = xp.where(hi_mask[:, None], bp.pen_hi[gidx[idx], s32],
                          bp.pen_lo[gidx[idx], s32])
@@ -255,6 +255,17 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
         ok = (order >= 0) & ~pen_used[idx[:, None], s32[:, None], slots]
         pos = ok.argmax(axis=1).astype(xp.int32)
         anyok = ok.any(axis=1)
+        if due_stand is not None:
+            rows_ok = xp.clip(order, 0,
+                              bp.pit_throws.shape[1] - 1).astype(
+                                  xp.int32)
+            hands = bp.pit_throws[gidx[idx][:, None], rows_ok]
+            match = (ok & (hands == due_stand[:, None])
+                     & (due_stand[:, None] != 2))
+            match[:, S_.PLATOON_WIN:] = False
+            m_any = match.any(axis=1)
+            pos = xp.where(m_any, match.argmax(axis=1).astype(xp.int32),
+                           pos)
         chosen = xp.where(anyok, order[xp.arange(int(idx.size)), pos],
                           -1).astype(xp.int16)
         cslot = xp.clip(chosen.astype(xp.int32) - 20 - 8 * s32, 0,
@@ -299,7 +310,15 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
                     hi = ((inning[lidx] >= 7)
                           & (xp.abs(score[lidx, 0].astype(xp.int32)
                                     - score[lidx, 1]) <= 2))
-                    nxt = pick_pen(lidx, lfld, hi)
+                    # due batter = other side's pointer (static during
+                    # the intervening half-inning)
+                    btf = (1 - lfld).astype(xp.int16)
+                    s18d = (bat_ptr[lidx, btf].astype(xp.int16)
+                            + 9 * btf).astype(xp.int32)
+                    due = xp.where(active[lidx, s18d],
+                                   bp.bat_side[gidx[lidx], s18d],
+                                   2).astype(xp.int8)
+                    nxt = pick_pen(lidx, lfld, hi, due)
                 else:
                     nxt = bp.pen[gidx[lidx], lfld,
                                  pen_next[lidx, lfld].astype(xp.int32)]
@@ -474,7 +493,12 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
                     hi = ((inning[oidx] >= 7)
                           & (xp.abs(score[oidx, 0].astype(xp.int32)
                                     - score[oidx, 1]) <= 2))
-                    nxt = pick_pen(oidx, oft, hi)
+                    s18d = (slot[chk][out_now].astype(xp.int16)
+                            + 9 * bt[chk][out_now]).astype(xp.int32)
+                    due = xp.where(active[oidx, s18d],
+                                   bp.bat_side[gidx[oidx], s18d],
+                                   2).astype(xp.int8)
+                    nxt = pick_pen(oidx, oft, hi, due)
                 else:
                     nxt = bp.pen[gidx[oidx], oft,
                                  pen_next[oidx, oft].astype(xp.int32)]
@@ -809,6 +833,9 @@ def _resolve_game(P, spec, n_sims):
     ctx = spec.get("_ctx") or {}
     elo_a = ctx.get("away_elo", np.nan)
     elo_h = ctx.get("home_elo", np.nan)
+    tcx = tuple(ctx.get(f"{s}_{c}", np.nan)
+                for c in ("travel_km", "tz_shift", "day_after_night")
+                for s in ("away", "home"))
     if not (elo_a == elo_a) and spec.get("game_pk") is not None \
             and P.fstores.get("teamctx") is not None:
         tcm = getattr(P, "_elo_by_pk", None)
@@ -817,7 +844,15 @@ def _resolve_game(P, spec, n_sims):
             tcm = {int(k): (float(av), float(hv)) for k, av, hv in
                    zip(tc.GamePk, tc.away_elo, tc.home_elo)}
             P._elo_by_pk = tcm
+            P._tcx_by_pk = {
+                int(k): tuple(map(float, v)) for k, *v in zip(
+                    tc.GamePk,
+                    tc.away_travel_km, tc.home_travel_km,
+                    tc.away_tz_shift, tc.home_tz_shift,
+                    tc.away_day_after_night, tc.home_day_after_night)}
         elo_a, elo_h = tcm.get(int(spec["game_pk"]), (np.nan, np.nan))
+        tcx = getattr(P, "_tcx_by_pk", {}).get(
+            int(spec["game_pk"]), (np.nan,) * 6)
     fm_side = {away: P._fielder_map(bat_away),
                home: P._fielder_map(bat_home)}
     meta = dict(players=players,
@@ -833,7 +868,7 @@ def _resolve_game(P, spec, n_sims):
                 pen_rows_home=pen_rows_home, bat_rows_all=bat_rows_all,
                 pen_order=pen_order, bat_side=bat_side,
                 pit_throws=pit_throws, slot_is_c=slot_is_c, meta=meta,
-                elo=(elo_a, elo_h), fm_side=fm_side)
+                elo=(elo_a, elo_h), tcx=tcx, fm_side=fm_side)
 
 
 def _matchup_frame(P, resolved):
@@ -860,6 +895,7 @@ def _matchup_frame(P, resolved):
                     (brow == rv["bench_rows"][1])
                 stand = P._stand(bpid, pthrows)
                 elo_a, elo_h = rv["elo"]
+                ta, th, za, zh, na_, nh = rv.get("tcx", (np.nan,) * 6)
                 for tto in (1, 2, 3):
                     rows.append((date, season, bpid, ppid, stand,
                                  pthrows, tto, int(bat_is_home), p_team,
@@ -875,6 +911,12 @@ def _matchup_frame(P, resolved):
                                  rest_by_pid[ppid],
                                  elo_h if bat_is_home else elo_a,
                                  elo_a if bat_is_home else elo_h,
+                                 th if bat_is_home else ta,
+                                 ta if bat_is_home else th,
+                                 zh if bat_is_home else za,
+                                 za if bat_is_home else zh,
+                                 nh if bat_is_home else na_,
+                                 na_ if bat_is_home else nh,
                                  fm[3], fm[4], fm[5], fm[6], fm[7],
                                  fm[8], fm[9]))
         blocks.append(rows)
@@ -882,7 +924,9 @@ def _matchup_frame(P, resolved):
             "p_throws", "tto", "home_bat", "fld_team", "Venue",
             "DayNight", "Temp", "WindSpeed", "WindDir", "Condition",
             "Humidity", "Pressure", "HpUmpId", "rest_p",
-            "b_elo", "p_elo", "fielder_3", "fielder_4", "fielder_5",
+            "b_elo", "p_elo", "b_travel_km", "p_travel_km",
+            "b_tz_shift", "p_tz_shift", "b_day_after_night",
+            "p_day_after_night", "fielder_3", "fielder_4", "fielder_5",
             "fielder_6", "fielder_7", "fielder_8", "fielder_9"]
     rdf = pd.DataFrame([r for b in blocks for r in b], columns=cols)
     rdf["Date"] = pd.to_datetime(rdf["Date"])
@@ -948,6 +992,7 @@ def _hazard_grids(P, resolved):
     for rv in resolved:
         d = rv["date"]
         d64 = np.datetime64(d)
+        post = float(PR.spec_postseason(rv["spec"]))
         for si, prow in enumerate((18, 19)):
             ppid = rv["players"][prow]
             team = rv["away"] if si == 0 else rv["home"]
@@ -1002,7 +1047,8 @@ def _hazard_grids(P, resolved):
                 season_idx=rv["season"] - 2015,
                 gap_days=gap_days, ramp=ramp, prev_short=prev_short,
                 il_ret30=il_ret30, outs_sd=outs_sd,
-                pen_np3=P._pen_np3(team, d))))
+                pen_np3=P._pen_np3(team, d), post=post,
+                team_hook=P._team_hook(team, d))))
     rows = pd.concat(frames, ignore_index=True)
     Xh = rows[P.hz["features"]].astype(np.float32)
     p = P.hz["iso"].predict(P.hz["model"].predict_proba(Xh)[:, 1])

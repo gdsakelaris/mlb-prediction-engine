@@ -126,6 +126,10 @@ ONBASE = np.array([CI[c] for c in ("BB", "HBP", "1B", "2B", "3B", "HR")])
 HITS = {CI["1B"]: "B1", CI["2B"]: "B2", CI["3B"]: "B3", CI["HR"]: "HR"}
 
 MAX_INNINGS = 19
+PLATOON_WIN = 3          # pen entry: a same-hand arm within the first
+                         # N slots of the leverage order jumps the queue
+                         # (3-batter-minimum era: matching is real but
+                         # managers don't reach past the top of the pen)
 
 
 def rules_for(season, is_dh_game=False):
@@ -252,14 +256,23 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
         pen_lo = np.asarray(pen_lo, dtype=np.int16)
         pen_used = np.zeros((S, 2, pen_hi.shape[1]), dtype=bool)
 
-    def _pick_pen(idx, side, hi_mask):
-        """First unused arm in the leverage-matched order; -1 = none."""
+    def _pick_pen(idx, side, hi_mask, due_stand=None):
+        """First unused arm in the leverage-matched order; -1 = none.
+        Platoon: a same-hand arm (vs a non-switch due batter) within
+        the first PLATOON_WIN order slots jumps the queue."""
         order = np.where(hi_mask[:, None], pen_hi[side], pen_lo[side])
         npen = order.shape[1]
         slots = np.clip(order - 20 - 8 * side[:, None], 0, npen - 1)
         ok = (order >= 0) & ~pen_used[idx[:, None], side[:, None], slots]
         pos = ok.argmax(axis=1)
         anyok = ok.any(axis=1)
+        if due_stand is not None:
+            hands = pit_throws[np.clip(order, 0, None)]
+            match = (ok & (hands == due_stand[:, None])
+                     & (due_stand[:, None] != 2))
+            match[:, PLATOON_WIN:] = False
+            m_any = match.any(axis=1)
+            pos = np.where(m_any, match.argmax(axis=1), pos)
         chosen = np.where(anyok, order[np.arange(idx.size), pos],
                           -1).astype(np.int16)
         cslot = np.clip(chosen - 20 - 8 * side, 0, npen - 1)
@@ -420,7 +433,11 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
                     hi = ((inning[oidx] >= 7)
                           & (np.abs(score[oidx, 0].astype(np.int32)
                                     - score[oidx, 1]) <= 2))
-                    nxt = pen_pick(oidx, oft, hi)
+                    s18d = (slot[chk][out_now].astype(np.int16)
+                            + 9 * bt[chk][out_now])
+                    due = np.where(active[oidx, s18d], bat_side[s18d],
+                                   2).astype(np.int8)
+                    nxt = pen_pick(oidx, oft, hi, due)
                 else:
                     nxt = prep.pen_order[oidx, oft, pen_next[oidx, oft]]
                     pen_next[oidx, oft] = np.minimum(
@@ -733,7 +750,17 @@ def _end_half(mask, inning, half, outs, bases, resp, score, runs_f5,
                 hi = ((inning[lidx] >= 7)
                       & (np.abs(score[lidx, 0].astype(np.int32)
                                 - score[lidx, 1]) <= 2))
-                nxt = pen_pick(lidx, lfld, hi)
+                # due batter = the OTHER side's pointer (it does not
+                # advance during the intervening half-inning)
+                bs = getattr(prep, "bat_side", None)
+                due = None
+                if bs is not None:
+                    btf = (1 - lfld).astype(np.int16)
+                    s18d = (bat_ptr[lidx, btf].astype(np.int16)
+                            + 9 * btf)
+                    due = np.where(active[lidx, s18d], bs[s18d],
+                                   2).astype(np.int8)
+                nxt = pen_pick(lidx, lfld, hi, due)
             else:
                 nxt = prep.pen_order[lidx, lfld, pen_next[lidx, lfld]]
                 pen_next[lidx, lfld] = np.minimum(

@@ -35,7 +35,7 @@ import features as F      # noqa: E402
 ART = F.ART
 PREREG = ART / "prereg"
 FROZEN = ["output_calibrators.joblib", "residual_heads.joblib",
-          "latent.json"]
+          "latent.json", "xgb_params.json"]
 
 PROTOCOL = {
     "primary": "per-family logloss gain vs de-vigged close on captured "
@@ -111,8 +111,48 @@ def check(quiet=False):
     return doc, bad + new
 
 
+def supersede(n_sims, min_n):
+    """Close the open window NOW because an improvement wave is about
+    to land: grade start..today while the hashes are still intact,
+    stamp the freeze superseded, and leave the partial record on file.
+    Refreeze discipline: supersede at offline-validated milestones,
+    NEVER on interim results — and every truncated window's record
+    survives here (no silent discards)."""
+    doc, fp = _latest_freeze()
+    if doc.get("superseded"):
+        sys.exit(f"{fp.name} already superseded {doc['superseded']}")
+    _, violations = check(quiet=False)
+    start, end = doc["window_start"], doc["window_end"]
+    today = date.today().isoformat()
+    gend = min(end, today)
+    import evaluate as E
+    df, rep = E.market_gate(start, gend, n_sims=n_sims, min_n=min_n)
+    led = E.skill_ledger(start, gend)
+    report = dict(
+        graded=today, window=[start, end], graded_through=gend,
+        status=(("VOIDED: " + "; ".join(violations)) if violations
+                else f"SUPERSEDED (graded {start}..{gend})"),
+        n_prices=int(len(df)) if df is not None else 0,
+        families=rep.to_dict(orient="records")
+        if rep is not None and len(rep) else [],
+        ledger=(led.to_dict(orient="records")
+                if hasattr(led, "to_dict") else None),
+    )
+    out = PREREG / f"report_{start}_{end}_superseded.json"
+    out.write_text(json.dumps(report, indent=1))
+    doc["superseded"] = today
+    fp.write_text(json.dumps(doc, indent=1))
+    print(f"\nreport written: {out}  status={report['status']}")
+    print(f"{fp.name} marked superseded — declare the next window "
+          f"with --freeze once the new stack is live")
+
+
 def grade(n_sims, min_n, force=False):
     doc, violations = check(quiet=False)
+    if doc.get("superseded"):
+        sys.exit(f"window superseded {doc['superseded']} — its partial "
+                 "record is the *_superseded.json report; freeze the "
+                 "next window instead")
     start, end = doc["window_start"], doc["window_end"]
     if date.today().isoformat() <= end and not force:
         sys.exit(f"window ends {end} — grading early would un-register "
@@ -142,6 +182,11 @@ if __name__ == "__main__":
     ap.add_argument("--freeze", action="store_true")
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--grade", action="store_true")
+    ap.add_argument("--supersede", action="store_true",
+                    help="close the open window at a milestone: grade "
+                         "start..today, mark the freeze superseded "
+                         "(partial record kept), ready for the next "
+                         "--freeze")
     ap.add_argument("--start",
                     default=(date.today() + timedelta(days=1)
                              ).isoformat())
@@ -158,5 +203,8 @@ if __name__ == "__main__":
         check()
     elif args.grade:
         grade(args.sims, args.min_n, force=args.force)
+    elif args.supersede:
+        supersede(args.sims, args.min_n)
     else:
-        ap.error("pass one of --freeze / --check / --grade")
+        ap.error("pass one of --freeze / --check / --grade / "
+                 "--supersede")

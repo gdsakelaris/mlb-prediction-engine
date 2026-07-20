@@ -56,14 +56,35 @@ DESIGN_CAL_YEAR = 2024
 BBTYPES = F.BBTYPES
 
 
-def make_clf(max_iter=300, eval_metric="mlogloss"):
-    """XGBoost estimator factory (CUDA histogram trees)."""
+def _xgb_overrides():
+    """Tuned T1/T3 hyperparameters from artifacts/xgb_params.json
+    (written by --tune). Absent or unreadable -> {} and the hand-set
+    defaults stand."""
+    p = ART / "xgb_params.json"
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text()).get("params", {})
+    except Exception:
+        return {}
+
+
+def make_clf(max_iter=300, eval_metric="mlogloss", tuned=False,
+             params=None):
+    """XGBoost estimator factory (CUDA histogram trees). `params` wins
+    outright (Optuna trials); else `tuned=True` applies the persisted
+    xgb_params.json overrides (the PA tree only — hazard/A2 keep the
+    hand-set defaults by scope)."""
+    kw = dict(n_estimators=max_iter, learning_rate=0.08,
+              grow_policy="lossguide", max_leaves=63, max_depth=0,
+              min_child_weight=100, reg_lambda=1.0,
+              subsample=1.0, colsample_bytree=1.0)
+    if params is not None:
+        kw.update(params)
+    elif tuned:
+        kw.update(_xgb_overrides())
     return XGBClassifier(
-        n_estimators=max_iter, learning_rate=0.08,
-        grow_policy="lossguide", max_leaves=63, max_depth=0,
-        min_child_weight=100, reg_lambda=1.0,
-        subsample=1.0, colsample_bytree=1.0,
-        tree_method="hist", device="cuda",
+        **kw, tree_method="hist", device="cuda",
         early_stopping_rounds=15, eval_metric=eval_metric,
         n_jobs=-1, random_state=7, verbosity=0)
 
@@ -204,7 +225,7 @@ def fit_a1_tree(pa, X, cal_year, a2d):
             f"{len(feats)} features)")
     _kv("train rows", f"{tr.sum():,}")
     t0 = time.time()
-    t1 = make_clf()
+    t1 = make_clf(tuned=True)
     _fit_es(t1, Xf[tr], y1[tr])
     s1 = VectorScaler().fit(t1.predict_proba(Xf[ca]), y1[ca])
     _kv("fit time", f"{time.time() - t0:.0f}s")
@@ -223,7 +244,7 @@ def fit_a1_tree(pa, X, cal_year, a2d):
         d3[bb_idx.values == j, j - 1] = 1.0
     X3 = np.column_stack([Xf, d3])
     t0 = time.time()
-    t3 = make_clf()
+    t3 = make_clf(tuned=True)
     _fit_es(t3, X3[tr3], y3[tr3])
     s3 = VectorScaler().fit(t3.predict_proba(X3[ca3]), y3[ca3])
     _kv("fit time", f"{time.time() - t0:.0f}s")
@@ -252,11 +273,96 @@ def fit_a1_tree(pa, X, cal_year, a2d):
                              batter_marginal=ll_marg))
 
 
+def tune_a1(pa, X, a2d, n_trials):
+    """Optuna TPE sweep over the T1/T3 XGBoost hyperparameters.
+    Objective: composite 8-class logloss on the DESIGN cal year (2024)
+    — the serve calibration year stays untouched by design decisions.
+    Scope guard: tunes ONLY the PA-tree estimators. Latent knobs belong
+    to backtest.moment_match_latent (moment targets, not logloss) and
+    anything fit on calib_rows is gate-adjacent and off limits.
+    Winner -> artifacts/xgb_params.json (trial 0 is the hand-set
+    defaults, so the persisted best can never be worse than them)."""
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    y8 = pa["label"].map({c: i for i, c in enumerate(CLASSES)}).values
+    tr = (pa["Season"] < DESIGN_CAL_YEAR).values
+    ca = (pa["Season"] == DESIGN_CAL_YEAR).values
+    Xf = X.astype(np.float32).to_numpy()
+    t1_map = {"K": 0, "BB": 1, "HBP": 2}
+    y1 = pa["label"].map(lambda c: t1_map.get(c, 3)).values
+    inplay = pa["bb_type"].isin(BBTYPES).values
+    bb_idx = pa["bb_type"].map(
+        {b: i for i, b in enumerate(BBTYPES)}).fillna(0).astype(int)
+    y3 = pa["label"].map(
+        {c: i for i, c in enumerate(F.T3_CLASSES)}).values
+    tr3, ca3 = tr & inplay, ca & inplay
+    d3 = np.zeros((len(pa), 3), dtype=np.float32)
+    for j in range(1, 4):
+        d3[bb_idx.values == j, j - 1] = 1.0
+    X3 = np.column_stack([Xf, d3])
+    p2c = a2d["scaler"].transform(a2d["model"].predict_proba(Xf[ca]))
+
+    def objective(trial):
+        prm = dict(
+            learning_rate=trial.suggest_float(
+                "learning_rate", 0.03, 0.16, log=True),
+            max_leaves=trial.suggest_int("max_leaves", 31, 255,
+                                         log=True),
+            min_child_weight=trial.suggest_float(
+                "min_child_weight", 20.0, 600.0, log=True),
+            reg_lambda=trial.suggest_float("reg_lambda", 0.3, 20.0,
+                                           log=True),
+            subsample=trial.suggest_float("subsample", 0.7, 1.0),
+            colsample_bytree=trial.suggest_float(
+                "colsample_bytree", 0.5, 1.0),
+            n_estimators=trial.suggest_int("n_estimators", 250, 700,
+                                           log=True))
+        t0 = time.time()
+        t1 = make_clf(params=prm)
+        _fit_es(t1, Xf[tr], y1[tr])
+        s1 = VectorScaler().fit(t1.predict_proba(Xf[ca]), y1[ca])
+        t3 = make_clf(params=prm)
+        _fit_es(t3, X3[tr3], y3[tr3])
+        s3 = VectorScaler().fit(t3.predict_proba(X3[ca3]), y3[ca3])
+        p1c = s1.transform(t1.predict_proba(Xf[ca]))
+        p3c = np.stack(
+            [s3.transform(t3.predict_proba(_t3_matrix(Xf[ca], bi)))
+             for bi in range(4)], axis=1)
+        p8, _ = F.tree_compose(p1c, p2c, p3c)
+        ll = log_loss(y8[ca], p8, labels=list(range(len(CLASSES))))
+        print(f"  trial {trial.number:>3}  ll {ll:.5f}  "
+              f"({time.time() - t0:.0f}s)  {trial.params}", flush=True)
+        return ll
+
+    _banner(f"A1 TREE — Optuna sweep ({n_trials} trials, "
+            f"design cal {DESIGN_CAL_YEAR})")
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=optuna.samplers.TPESampler(seed=7))
+    study.enqueue_trial(dict(
+        learning_rate=0.08, max_leaves=63, min_child_weight=100.0,
+        reg_lambda=1.0, subsample=1.0, colsample_bytree=1.0,
+        n_estimators=300))
+    study.optimize(objective, n_trials=n_trials)
+    d0 = float(study.trials[0].value)
+    best = study.best_trial
+    _kv("defaults logloss", f"{d0:.5f}")
+    _kv("best logloss", f"{float(best.value):.5f}   (gain "
+        f"{d0 - float(best.value):+.5f})")
+    out = dict(params=best.params, logloss=float(best.value),
+               defaults_logloss=d0, gain=d0 - float(best.value),
+               cal_year=DESIGN_CAL_YEAR, n_trials=len(study.trials),
+               tuned=date.today().isoformat())
+    F.write_artifact(ART / "xgb_params.json",
+                     lambda p: p.write_text(json.dumps(out, indent=2)))
+    print(f"  -> {ART / 'xgb_params.json'}", flush=True)
+
+
 HAZ_FEATS = ["bf", "cum_pitches", "tto", "inning", "outs", "score_diff",
              "k_so_far", "br_so_far", "runs_so_far", "rest_p",
              "leash_np", "leash_bf", "leash_starts", "season_idx",
              "gap_days", "ramp", "prev_short", "il_ret30", "outs_sd",
-             "pen_np3"]
+             "pen_np3", "post", "team_hook"]
 
 
 def fit_hazard(cal_year):
@@ -399,6 +505,11 @@ def main():
     ap.add_argument("--no-write", action="store_true",
                     help="fit + report only; leave artifacts untouched "
                          "(trial runs)")
+    ap.add_argument("--tune", type=int, default=0, metavar="N",
+                    help="Optuna sweep of the T1/T3 XGB hyperparams "
+                         "(N trials on the design split), write "
+                         "artifacts/xgb_params.json, exit — no serve "
+                         "artifacts touched")
     ap.add_argument("--flat", action="store_true",
                     help="train the flat 8-class A1 instead of the "
                          "contact tree (A/B baseline; the 2026-07-19 "
@@ -418,7 +529,8 @@ def main():
         if rc != 0:
             sys.exit("store rebuild failed; not fitting on stale stores")
 
-    cal_year = DESIGN_CAL_YEAR if args.design_eval else SERVE_CAL_YEAR
+    cal_year = (DESIGN_CAL_YEAR if (args.design_eval or args.tune)
+                else SERVE_CAL_YEAR)
     stores = F.load_stores()
     pa = pd.read_parquet(STORES / "pa_table.parquet")
     _banner("FEATURE ASSEMBLY")
@@ -429,6 +541,9 @@ def main():
     _kv("assembly time", f"{time.time() - t0:.0f}s")
 
     a2 = fit_a2(pa, X, cal_year)
+    if args.tune:
+        tune_a1(pa, X, a2, args.tune)
+        return
     a1 = (fit_a1_flat(pa, X, cal_year) if args.flat
           else fit_a1_tree(pa, X, cal_year, a2))
     hz = fit_hazard(cal_year)

@@ -48,6 +48,10 @@ PRED_DIR = ROOT / "Predictions"
 
 N_SIMS = 20000
 MAX_PEN = 8
+TIRED_NP = 20            # a pen arm that threw >= this many pitches
+                         # YESTERDAY drops behind every fresh arm in
+                         # both entry orders (threw-both-of-last-two-
+                         # days / 25+ NP arms are excluded upstream)
 
 K_LINES = [3.5, 4.5, 5.5, 6.5, 7.5, 8.5]
 OUT_LINES = [14.5, 15.5, 16.5, 17.5, 18.5]
@@ -551,11 +555,27 @@ class Predictor:
                     stats = {int(p): (float(r.sv), float(r.hld),
                                       float(r.outs))
                              for p, r in g.iterrows()}
-            rows = [(r, *stats.get(int(players[r]), (0.0, 0.0, 3.0)))
+            # arms that threw TIRED_NP+ pitches yesterday drop behind
+            # every fresh arm in both orders (managers hold them back
+            # short of true unavailability, which _pen_for handles)
+            tired = set()
+            if sub is not None and prows:
+                y1 = sub[(sub.Date == d - pd.Timedelta(days=1))
+                         & (pd.to_numeric(sub.GS, errors="coerce")
+                            == 0)]
+                if len(y1):
+                    npv = pd.to_numeric(y1.NP,
+                                        errors="coerce").fillna(0)
+                    tired = {int(p) for p, v in zip(y1.PlayerId, npv)
+                             if v >= TIRED_NP}
+            rows = [(r, *stats.get(int(players[r]), (0.0, 0.0, 3.0)),
+                     int(players[r]) in tired)
                     for r in prows]
-            hi = sorted(rows, key=lambda t: -(2.0 * t[1] + t[2]))
+            hi = sorted(rows,
+                        key=lambda t: (t[4], -(2.0 * t[1] + t[2])))
             lo = sorted(rows,
-                        key=lambda t: -(t[3] - 0.5 * (t[1] + t[2])))
+                        key=lambda t: (t[4],
+                                       -(t[3] - 0.5 * (t[1] + t[2]))))
             pen_hi[side, :len(hi)] = [r for r, *_ in hi]
             pen_lo[side, :len(lo)] = [r for r, *_ in lo]
 
@@ -625,6 +645,13 @@ class Predictor:
         ctx = spec.get("_ctx") or {}
         elo_a = ctx.get("away_elo", np.nan)
         elo_h = ctx.get("home_elo", np.nan)
+        cx_b = {}   # schedule-spot A1 features, keyed by bat_is_home
+        for hb in (0, 1):
+            own, opp = ("home", "away") if hb else ("away", "home")
+            cx_b[hb] = {
+                f"{pre}_{c}": ctx.get(f"{sd}_{c}", np.nan)
+                for c in ("travel_km", "tz_shift", "day_after_night")
+                for pre, sd in (("b", own), ("p", opp))}
         fm_side = {away: self._fielder_map(bat_away),
                    home: self._fielder_map(bat_home)}
 
@@ -661,6 +688,7 @@ class Predictor:
                         rest_p=self._rest(ppid, date),
                         b_elo=(elo_h if bat_is_home else elo_a),
                         p_elo=(elo_a if bat_is_home else elo_h),
+                        **cx_b[int(bat_is_home)],
                         **{f"fielder_{i}": fm_side[p_team][i]
                            for i in range(3, 10)},
                     ))
@@ -679,9 +707,11 @@ class Predictor:
 
         # ---- hazard grids for the two starters
         haz = np.zeros((2, 41, 11))
+        post_g = float(spec_postseason(spec))
         for si, (prow, ppid, team) in enumerate(
                 ((18, sp_away, away), (19, sp_home, home))):
-            haz[si] = self._hazard_grid(ppid, date, season, team)
+            haz[si] = self._hazard_grid(ppid, date, season, team,
+                                        post=post_g)
 
         # ---- steal matrices (runner PLAYER ROW vs every pitcher row)
         sb_att, sb_suc = self._sb_matrices(players, pit_rows,
@@ -770,7 +800,62 @@ class Predictor:
         return float(pd.to_numeric(rec.NP, errors="coerce")
                      .fillna(0).sum())
 
-    def _hazard_grid(self, ppid, date, season, team=None):
+    def _league_start_outs(self, season):
+        """League mean starter outs for a season (cached); NaN when the
+        season isn't (sufficiently) in the game logs."""
+        cache = getattr(self, "_lg_outs_cache", None)
+        if cache is None:
+            cache = self._lg_outs_cache = {}
+        if season not in cache:
+            gp = self.stores.raw["gp"]
+            gs = gp[(pd.to_numeric(gp.GS, errors="coerce") == 1)
+                    & (gp.Date.dt.year == season)]
+            if len(gs) < 500:
+                cache[season] = np.nan
+            else:
+                ipn = pd.to_numeric(gs.IP, errors="coerce").fillna(0)
+                outs = (ipn.astype(int) * 3
+                        + np.round((ipn % 1) * 10))
+                cache[season] = float(outs.mean())
+        return cache[season]
+
+    def _team_hook(self, team, date):
+        """As-of team hook tendency (mirrors hazard_table.team_hook):
+        season-to-date mean starter outs blended K_HOOK starts with the
+        club's prior season (itself shrunk K_HOOK_PREV toward league),
+        centered on the prior-season league mean. 0 = average leash."""
+        gp = getattr(self, "_gp_team_cache", {}).get(team)
+        if gp is None:
+            return np.nan
+        d = pd.Timestamp(date)
+        cache = getattr(self, "_hook_cache", None)
+        if cache is None:
+            cache = self._hook_cache = {}
+        key = (team, str(d.date()))
+        if key in cache:
+            return cache[key]
+        lg = self._league_start_outs(d.year - 1)
+        if lg != lg:
+            cache[key] = np.nan
+            return np.nan
+
+        def _outs_sum(fr):
+            ipn = pd.to_numeric(fr.IP, errors="coerce").fillna(0)
+            return float((ipn.astype(int) * 3
+                          + np.round((ipn % 1) * 10)).sum())
+
+        gs = pd.to_numeric(gp.GS, errors="coerce") == 1
+        prv = gp[gs & (gp.Date.dt.year == d.year - 1)]
+        cur = gp[gs & (gp.Date >= pd.Timestamp(d.year, 1, 1))
+                 & (gp.Date < d)]
+        pmean = ((_outs_sum(prv) + F.K_HOOK_PREV * lg)
+                 / (len(prv) + F.K_HOOK_PREV))
+        th = ((_outs_sum(cur) + F.K_HOOK * pmean)
+              / (len(cur) + F.K_HOOK)) - lg
+        cache[key] = float(th)
+        return cache[key]
+
+    def _hazard_grid(self, ppid, date, season, team=None, post=0.0):
         leash = self.fstores.get("panel_leash")
         lz = None
         if leash is not None:
@@ -832,7 +917,10 @@ class Predictor:
             season_idx=season - 2015,
             gap_days=gap_days, ramp=ramp, prev_short=prev_short,
             il_ret30=il_ret30, outs_sd=outs_sd,
-            pen_np3=(self._pen_np3(team, date) if team else np.nan)))
+            pen_np3=(self._pen_np3(team, date) if team else np.nan),
+            post=float(post),
+            team_hook=(self._team_hook(team, date) if team
+                       else np.nan)))
         Xh = rows[self.hz["features"]].astype(np.float32)
         p = self.hz["iso"].predict(
             self.hz["model"].predict_proba(Xh)[:, 1])

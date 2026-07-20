@@ -111,6 +111,14 @@ def replay_rows(start, end, n_sims=4000, max_games=None, progress=True):
     lines and game markets — the raw material for grading, calibration
     and the gate."""
     P = PR.Predictor()
+    # RAW rows by contract: replay ledgers feed fit_calibrators and
+    # ab_compare, so the serve-time calibrators and heads must NOT be
+    # baked in — a fit on already-calibrated rows composes on itself
+    # and the written map is then wrong on raw serve probabilities
+    # (the 2026-07-20 phantom +0.21 A/B artifact). The CLV gate path
+    # (market_gate) keeps its own single _cal application.
+    P.calib = {}
+    P.heads = None
     games = P.stores.raw["games"]
     span = games[(games.Date >= pd.Timestamp(start))
                  & (games.Date <= pd.Timestamp(end))]
@@ -222,6 +230,8 @@ def replay_rows_batch(start, end, n_sims=4000, chunk=64, progress=True,
     throughput."""
     import sim_batch
     P = PR.Predictor()
+    P.calib = {}     # RAW rows by contract — see replay_rows
+    P.heads = None
     games = P.stores.raw["games"]
     span = games[(games.Date >= pd.Timestamp(start))
                  & (games.Date <= pd.Timestamp(end))]
@@ -578,11 +588,16 @@ def _odds_y(gb, gp, games_df, pk, pid, market, line):
 
 
 def _gate_fingerprint(n_sims):
-    """Cache key part that invalidates on any serving-stack change."""
+    """Cache key part that invalidates on any serving-stack change.
+    Model artifacts are fingerprinted DIRECTLY (not just via
+    manifest.json) so standalone refits — e.g. a bare fit_sb that
+    bypasses the manifest — still invalidate the cache."""
     import os
     parts = [f"s{n_sims}"]
     for f_ in ("manifest.json", "output_calibrators.joblib",
-               "residual_heads.joblib", "latent.json"):
+               "residual_heads.joblib", "latent.json",
+               "a1_model.joblib", "a2_model.joblib",
+               "hazard_model.joblib", "sb_models.joblib"):
         p = ART / f_
         parts.append(str(int(os.path.getmtime(p))) if p.exists()
                      else "0")

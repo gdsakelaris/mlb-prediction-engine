@@ -123,6 +123,11 @@ CARRY_OPP_W = 0.2        # opposite-field wind still helps a little
 # mined from the old model's remaining families)
 TREND_HL = 30.0          # fast half-life; trend = fast rate - 90d rate
 HRQ_K = 10.0             # career HRs of shrinkage for HR EV/distance
+K_HOOK = 25.0            # starts of shrinkage for the in-season team
+                         # hook tendency (how long a club lets starters
+                         # go) toward the club's prior-season blend
+K_HOOK_PREV = 40.0       # starts of shrinkage for that prior-season
+                         # club mean toward the league mean
 LG_SPRINT = 27.0         # ft/s league sprint speed (leg-hit pivot)
 SEA_LVL_FT = 0.005       # ft of HR carry per ft of park elevation
 PORCH_REF = 330.0        # nominal pull-fence distance porch terms center on
@@ -635,9 +640,18 @@ def build_bat_tracking_table():
                             "SwingLength": "bt_swlen",
                             "HardSwingRate": "bt_hardsw",
                             "SquaredUpPerSwing": "bt_squp"})
+    # year-over-year deltas vs the player's own prior tracked season —
+    # a bat-speed decline is a leading indicator the level alone hides
+    # (consecutive tracked seasons only; era edges stay NaN)
+    bt = bt.sort_values(["PlayerId", "Year"])
+    grp = bt.groupby("PlayerId")
+    gap = grp["Year"].diff()
+    for c in ("bt_speed", "bt_swlen", "bt_hardsw", "bt_squp"):
+        bt[c + "_d"] = grp[c].diff().where(gap == 1.0)
     bt[["Year", "PlayerId", "bt_speed", "bt_swlen", "bt_hardsw",
-        "bt_squp"]].to_parquet(STORES / "bat_tracking.parquet",
-                               index=False)
+        "bt_squp", "bt_speed_d", "bt_swlen_d", "bt_hardsw_d",
+        "bt_squp_d"]].to_parquet(STORES / "bat_tracking.parquet",
+                                 index=False)
     print(f"bat_tracking: {len(bt):,} player-years", flush=True)
 
 
@@ -1774,7 +1788,7 @@ def build_hazard_table(pa):
     # recency — the variance-wideners the leash averages can't see
     gpf = read_csv("mlb_game_pitching.csv",
                    usecols=["GamePk", "PlayerId", "GS", "Date", "NP",
-                            "IP"])
+                            "IP", "Team"])
     st = gpf[_num(gpf["GS"]) == 1].copy()
     st["Date"] = pd.to_datetime(st["Date"])
     ipf = _num(st["IP"]).fillna(0)
@@ -1787,8 +1801,31 @@ def build_hazard_table(pa):
     st["ramp"] = (g2["np_g"].shift(1) < RAMP_NP).astype(float)
     st["prev_short"] = (g2["outs_g"].shift(1)
                         <= SHORT_START_OUTS).astype(float)
+    # as-of team hook tendency: how long this club has been letting
+    # starters go — season-to-date mean starter outs (strictly earlier
+    # starts), blended over K_HOOK starts with the club's full PRIOR
+    # season (itself shrunk K_HOOK_PREV starts toward the league), and
+    # centered on the prior-season league mean so 0 = average leash.
+    # First data season has no prior league mean -> NaN (XGB-native).
+    st["season"] = st["Date"].dt.year
+    lg_season = st.groupby("season")["outs_g"].mean()
+    st["lg_prev"] = st["season"].map(
+        {s: lg_season.get(s - 1, np.nan) for s in lg_season.index})
+    tprev = (st.groupby(["Team", "season"])["outs_g"]
+             .agg(["sum", "count"]).reset_index())
+    tprev["season"] = tprev["season"] + 1
+    st = st.merge(tprev, on=["Team", "season"], how="left")
+    st["t_prev"] = ((st["sum"].fillna(0.0)
+                     + K_HOOK_PREV * st["lg_prev"])
+                    / (st["count"].fillna(0.0) + K_HOOK_PREV))
+    st = st.sort_values(["Team", "season", "Date", "GamePk"])
+    g3 = st.groupby(["Team", "season"])
+    cum_o = (g3["outs_g"].cumsum() - st["outs_g"]).values
+    cum_n = g3.cumcount().values
+    st["team_hook"] = ((cum_o + K_HOOK * st["t_prev"].values)
+                       / (cum_n + K_HOOK)) - st["lg_prev"].values
     reg = st[["GamePk", "PlayerId", "Date", "gap_days", "ramp",
-              "prev_short"]].copy()
+              "prev_short", "team_hook"]].copy()
     reg["GamePk"] = _num(reg["GamePk"])
     il = pd.read_parquet(STORES / "il_stints.parquet")
     ilr = reg.sort_values("Date").rename(columns={"Date": "d_"})
@@ -1845,9 +1882,9 @@ def build_hazard_table(pa):
         ["injury", "ph"], default="hook")
 
     reg = ilj[["GamePk", "PlayerId", "gap_days", "ramp", "prev_short",
-               "il_ret30", "cause"]]
+               "il_ret30", "cause", "team_hook"]]
     reg.columns = ["game_pk", "PitcherId", "gap_days", "ramp",
-                   "prev_short", "il_ret30", "cause"]
+                   "prev_short", "il_ret30", "cause", "team_hook"]
     sub = sub.merge(reg, on=["game_pk", "PitcherId"], how="left")
     sub["cause"] = sub["cause"].where(sub["removed"] == 1, "")
 
@@ -1870,15 +1907,25 @@ def build_hazard_table(pa):
                                   sub["home_pen_np3"],
                                   sub["away_pen_np3"])
 
+    # postseason flag: October managers hook starters faster at the
+    # same (bf, runs) state — the known pout October over-forecast
+    gt = read_csv("mlb_games.csv", usecols=["GamePk", "GameType"])
+    gt["game_pk"] = _num(gt["GamePk"])
+    sub = sub.merge(gt[["game_pk", "GameType"]].drop_duplicates(
+        "game_pk"), on="game_pk", how="left")
+    sub["post"] = (sub["GameType"].astype(str)
+                   .isin(["F", "D", "L", "W"]).astype(float))
+
     keep = ["game_pk", "Date", "Season", "PitcherId", "at_bat_number",
             "bf", "cum_pitches", "tto", "inning", "outs", "score_diff",
             "k_so_far", "br_so_far", "runs_so_far", "rest_p", "removed",
             "gap_days", "ramp", "prev_short", "il_ret30", "cause",
-            "pen_np3"]
+            "pen_np3", "post", "team_hook"]
     sub[keep].to_parquet(STORES / "hazard_table.parquet", index=False)
     mix = sub.loc[sub.removed == 1, "cause"].value_counts(normalize=True)
     print(f"hazard_table: {len(sub):,} starter-BF rows, removal rate "
-          f"{sub.removed.mean():.3%}, cause mix "
+          f"{sub.removed.mean():.3%}, post share {sub.post.mean():.3%}, "
+          f"team_hook sd {sub.team_hook.std():.3f}, cause mix "
           f"{ {k: round(float(v), 4) for k, v in mix.items()} }",
           flush=True)
 
@@ -2039,10 +2086,14 @@ def load_stores():
                    usecols=["Year", "PlayerId", "SprintSpeed"])
     spr["Year"] = _num(spr["Year"]) + 1
     s["sprint"] = spr
-    # team-strength context (Elo) — may not exist mid-first-build
+    # team-strength + schedule-spot context — may not exist
+    # mid-first-build
     tc_p = STORES / "team_game_context.parquet"
     s["teamctx"] = (pd.read_parquet(
-        tc_p, columns=["GamePk", "away_elo", "home_elo"])
+        tc_p, columns=["GamePk", "away_elo", "home_elo",
+                       "away_travel_km", "home_travel_km",
+                       "away_tz_shift", "home_tz_shift",
+                       "away_day_after_night", "home_day_after_night"])
         if tc_p.exists() else None)
     # player-grain OAA, prior-season consumption (actual fielders)
     oaa_p = DATA / "mlb_oaa_players.csv"
@@ -2490,8 +2541,10 @@ def assemble_features(rows, stores):
     j = rows[["BatterId", "Season"]].merge(
         bt, left_on=["BatterId", "Season"],
         right_on=["PlayerId", "Year"], how="left")
-    for c in ("bt_speed", "bt_swlen", "bt_hardsw", "bt_squp"):
-        out[c] = j[c].values
+    for c in ("bt_speed", "bt_swlen", "bt_hardsw", "bt_squp",
+              "bt_speed_d", "bt_swlen_d", "bt_hardsw_d", "bt_squp_d"):
+        out[c] = (j[c].values if c in j.columns
+                  else np.full(n, np.nan))    # pre-rebuild stores
 
     # ---- pull tendency + wind-carry-to-pull-side interaction
     m = merge_asof_panel(rows, stores["panel_bat_pull"], ["BatterId"],
@@ -2640,9 +2693,17 @@ def assemble_features(rows, stores):
     # rows carry b_elo/p_elo (predict injects from slate_context);
     # training rows carry game_pk and join the team-context store.
     b_elo = p_elo = None
+    tcx_cols = ("travel_km", "tz_shift", "day_after_night")
     if "b_elo" in rows.columns:
         b_elo = pd.to_numeric(rows["b_elo"], errors="coerce")
         p_elo = pd.to_numeric(rows["p_elo"], errors="coerce")
+        for c in tcx_cols:
+            for pre in ("b_", "p_"):
+                col = pre + c
+                out[col] = (pd.to_numeric(rows[col],
+                                          errors="coerce").values
+                            if col in rows.columns
+                            else np.full(n, np.nan))
     elif "game_pk" in rows.columns and stores.get("teamctx") is not None:
         tc = stores["teamctx"]
         j = rows[["game_pk", "home_bat"]].merge(
@@ -2650,6 +2711,15 @@ def assemble_features(rows, stores):
         hb = _num(j["home_bat"]).fillna(0).values == 1
         b_elo = pd.Series(np.where(hb, j["home_elo"], j["away_elo"]))
         p_elo = pd.Series(np.where(hb, j["away_elo"], j["home_elo"]))
+        for c in tcx_cols:
+            out["b_" + c] = np.where(hb, _num(j["home_" + c]),
+                                     _num(j["away_" + c]))
+            out["p_" + c] = np.where(hb, _num(j["away_" + c]),
+                                     _num(j["home_" + c]))
+    for c in tcx_cols:                    # branch-independent backfill
+        for pre in ("b_", "p_"):
+            if pre + c not in out:
+                out[pre + c] = np.full(n, np.nan)
     if b_elo is not None:
         out["b_team_elo"] = (b_elo - 1500.0).values
         out["p_team_elo"] = (p_elo - 1500.0).values
