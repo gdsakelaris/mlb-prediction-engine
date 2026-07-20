@@ -8,6 +8,7 @@ Data/*
 # Python
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # Run outputs
 Logs/

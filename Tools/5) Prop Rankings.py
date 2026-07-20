@@ -508,6 +508,39 @@ def _family_boot(preps, Wm, vsclose=np.nan):
     return sc
 
 
+# ---------------------------------------------------------- provenance
+def _provenance():
+    """Ledger provenance line: replay window, row vintage, and whether
+    the ENGINE artifacts have been retrained since the rows were made.
+    The board silently outlives retrains — and during a frozen
+    forward-test window the ledger CANNOT legally refresh (a
+    --fit-calibrators rerun would rewrite the frozen calibrators) — so
+    the board states what it reflects instead of implying live."""
+    import datetime as dt
+    rows_p = ART / "calib_rows.parquet"
+    parts = []
+    try:
+        d = pd.read_parquet(rows_p, columns=["Date"])["Date"]
+        parts.append(f"ledger {pd.Timestamp(d.min()).date()}.."
+                     f"{pd.Timestamp(d.max()).date()} "
+                     f"({pd.Series(d).nunique()} slates)")
+    except Exception:                                   # noqa: BLE001
+        parts.append("ledger window unreadable")
+    rows_mt = rows_p.stat().st_mtime
+    parts.append("replayed " + dt.datetime.fromtimestamp(rows_mt)
+                 .strftime("%Y-%m-%d %H:%M"))
+    # calibrators/heads are FIT FROM these rows (always newer — fine);
+    # staleness = the ENGINE moving on without a re-replay
+    newer = [f.split("_")[0] for f in
+             ("a1_model.joblib", "a2_model.joblib",
+              "hazard_model.joblib", "sb_models.joblib")
+             if (ART / f).exists()
+             and (ART / f).stat().st_mtime > rows_mt + 60]
+    parts.append("engine retrained since ledger: "
+                 + (", ".join(newer) if newer else "no"))
+    return "; ".join(parts)
+
+
 # ------------------------------------------------------------ build table
 def build_table(boot=BOOT_B):
     rows_p = ART / "calib_rows.parquet"
@@ -515,6 +548,20 @@ def build_table(boot=BOOT_B):
         raise SystemExit("calib_rows.parquet missing — run a replay "
                          "(evaluate.py --fit-calibrators) first")
     df = pd.read_parquet(rows_p)
+    # served = family Platt + residual head; the board grades the Platt
+    # stage (cross-fit), so surface each active head's held-out gain as
+    # display context — positive means serving beats the board's view
+    heads_gain = {}
+    hr_p = ART / "heads_report.csv"
+    if hr_p.exists():
+        try:
+            hrep = pd.read_csv(hr_p)
+            heads_gain = {
+                str(r.family): float(r.gain) for r in hrep.itertuples()
+                if getattr(r, "best_iter", 0) > 0
+                and np.isfinite(getattr(r, "gain", np.nan))}
+        except Exception:                               # noqa: BLE001
+            pass
     # p_cal = day-block cross-fit family Platt (honest out-of-sample view
     # of the served calibration; the live joblib would be in-sample here)
     parts = []
@@ -598,6 +645,7 @@ def build_table(boot=BOOT_B):
             "Acc": m["acc"],
             "GateN": gv.get("n", np.nan),
             "VsClose": gv.get("vs_close", np.nan),
+            "HeadGain": heads_gain.get(fam, np.nan),
             "Notes": play_note(m),
         })
     return _rank_and_tier(pd.DataFrame(rows))
@@ -623,7 +671,7 @@ _DIAG_ORDER = ["LogLoss", "LLBase", "Edge%", "Brier", "BrierBase",
                "MAE", "MAEBase", "MAEGain", "Bias", "MeanPred",
                "MeanAct", "Disp", "DispCal", "DispObs", "Acc"]
 COLS = (["#", "Market", "Key", "Class", "Tier", "Score", "Score_lo", "N"]
-        + _DIAG_ORDER + ["GateN", "VsClose", "Notes"])
+        + _DIAG_ORDER + ["GateN", "VsClose", "HeadGain", "Notes"])
 
 
 def _rank_and_tier(df):
@@ -784,11 +832,22 @@ LEGEND = [
      "the other pillars renormalize, so a rarely-scraped family is "
      "unproven vs the market, not punished. The only market-referenced "
      "numbers on the board — everything else is internal measurement."),
+    ("HeadGain", "DISPLAY-ONLY. Held-out log-loss improvement of the "
+     "family's residual head — the correction the serve path stacks ON "
+     "TOP of the family Platt stage this board grades. Positive = the "
+     "actually-served number is slightly better than the board states "
+     "for this family; blank = no active head. Not in the Score: the "
+     "heads are graded by the CLV gate on served probabilities."),
     ("Notes", "Data-driven usage guidance derived from the diagnostics — "
      "calibration trust (price bets directly vs trust picks more than "
      "prices), selection power (follow the list deep / top 3-10 only / "
      "no selection power, gated on the odds-ratio lift), and shading "
      "direction from the calibration slope."),
+    ("Data provenance", "Filled at write time — the ledger window this "
+     "board was built from, when it was replayed, and whether the "
+     "engine has retrained since (during a frozen forward-test window "
+     "the ledger deliberately does not refresh; the board reflects the "
+     "stack as of its replay date)."),
 ]
 
 
@@ -799,10 +858,11 @@ _ND = [("Score", 0), ("Score_lo", 0), ("N", 0),
        ("Brier", 4), ("BrierBase", 4), ("ECE", 4), ("Bias", 2),
        ("MAE", 3), ("MAEBase", 3), ("MAEGain", 3), ("AUC", 3),
        ("Top10%", 1), ("LogLoss", 4), ("LLBase", 4), ("MeanAct", 2),
-       ("MeanPred", 2), ("Acc", 3), ("GateN", 0), ("VsClose", 4)]
+       ("MeanPred", 2), ("Acc", 3), ("GateN", 0), ("VsClose", 4),
+       ("HeadGain", 4)]
 
 
-def save_excel(df, path):
+def save_excel(df, path, provenance=None):
     """Rankings + Legend, serve-workbook styling (navy header, centered,
     thin borders, frozen header, filter arrows)."""
     import openpyxl
@@ -814,9 +874,11 @@ def save_excel(df, path):
     for c, nd in _ND:
         if c in xl:
             xl[c] = xl[c].round(nd)
+    legend = [(t, provenance if t == "Data provenance" and provenance
+               else m) for t, m in LEGEND]
     with pd.ExcelWriter(path, engine="openpyxl") as xw:
         xl.to_excel(xw, sheet_name="Rankings", index=False)
-        pd.DataFrame(LEGEND, columns=["Term", "Meaning"]).to_excel(
+        pd.DataFrame(legend, columns=["Term", "Meaning"]).to_excel(
             xw, sheet_name="Legend", index=False)
 
     wb = openpyxl.load_workbook(path)
@@ -878,7 +940,8 @@ _FMT = {"Score": ".0f", "Score_lo": ".0f", "N": ".0f",
         "ECE": ".4f", "Bias": "+.3f", "MAE": ".3f", "MAEBase": ".3f",
         "MAEGain": ".3f", "AUC": ".3f", "Top10%": ".1f",
         "LogLoss": ".4f", "LLBase": ".4f", "MeanAct": ".2f",
-        "MeanPred": ".2f", "Acc": ".3f", "GateN": ".0f", "VsClose": ".4f"}
+        "MeanPred": ".2f", "Acc": ".3f", "GateN": ".0f",
+        "VsClose": ".4f", "HeadGain": "+.4f"}
 
 
 def _fmt(frame):
@@ -971,13 +1034,15 @@ def main():
               "haircut yet.")
         print()
 
-    save_excel(df, Path(args.out))
+    prov = _provenance()
+    save_excel(df, Path(args.out), provenance=prov)
     counts = df["Tier"].value_counts().to_dict()
     tiers = " | ".join(f"{t} {counts.get(t, 0)}"
                        for _, t in PROB_TIER_CUTS if counts.get(t, 0))
     print(f"Prop rankings (Score v5): {len(df)} families scored, "
           f"{int(df['N'].sum()):,} graded rows")
     print(f"  tiers: {tiers}")
+    print(f"  {prov}")
     print(f"  written to {args.out}  (-v for the full table)")
 
 

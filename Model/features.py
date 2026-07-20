@@ -1715,6 +1715,140 @@ def build_stretch_table(pa):
           flush=True)
 
 
+def build_pen_fatigue(pa):
+    """pen_fatigue.json: per-class log-odds shift on reliever outcomes
+    per unit fatigue f = min(np1,40)/20 + 0.5*min(np2,40)/20 (np1/np2 =
+    pitches thrown 1/2 days ago). Fit by offset-logistic MLE over relief
+    PAs restricted to the serving-relevant region (arms the availability
+    filter would still allow: np1 < 25, not used both prior days), with
+    shrunken pitcher-season baselines as offsets. Study 2026-07-20
+    (Logs/pen_fatigue_study_2026-07-20.log): only BB clears |z|>=2 in
+    region — serve applies significant coefficients only."""
+    gp = read_csv("mlb_game_pitching.csv",
+                  usecols=["Date", "PlayerId", "GS", "NP"])
+    gp["Date"] = pd.to_datetime(gp["Date"])
+    gp["NP"] = _num(gp["NP"]).fillna(0)
+    rel = gp[_num(gp["GS"]).fillna(0) == 0]
+    npday = rel.groupby(["PlayerId", "Date"]).NP.sum()
+    rpa = pa[["PitcherId", "Date", "Season", "label"]].merge(
+        rel[["PlayerId", "Date"]].drop_duplicates(),
+        left_on=["PitcherId", "Date"], right_on=["PlayerId", "Date"])
+    for lag, col in ((1, "np1"), (2, "np2")):
+        ix = pd.MultiIndex.from_arrays(
+            [rpa.PitcherId, rpa.Date - pd.Timedelta(days=lag)])
+        rpa[col] = npday.reindex(ix).fillna(0).to_numpy()
+    rpa = rpa[(rpa.np1 < 25) & ~((rpa.np1 > 0) & (rpa.np2 > 0))]
+    f = (np.minimum(rpa.np1, 40) / 20.0
+         + 0.5 * np.minimum(rpa.np2, 40) / 20.0).to_numpy()
+    out = {"n_pa": int(len(rpa)), "beta": {}, "se": {}, "z": {}}
+    for cls in ("K", "BB", "HR"):
+        y = (rpa.label == cls).to_numpy(dtype=np.float64)
+        lg_ = float(y.mean())
+        agg = (pd.DataFrame(dict(p=rpa.PitcherId, s=rpa.Season, y=y))
+               .groupby(["p", "s"])["y"].agg(["sum", "count"]))
+        base = ((agg["sum"] + 150.0 * lg_) / (agg["count"] + 150.0))
+        b = base.reindex(pd.MultiIndex.from_arrays(
+            [rpa.PitcherId, rpa.Season])).to_numpy()
+        off = np.log(b / (1 - b))
+        beta = 0.0
+        for _ in range(50):
+            p = 1 / (1 + np.exp(-(off + beta * f)))
+            step = np.sum(f * (y - p)) / np.sum(f * f * p * (1 - p))
+            beta += step
+            if abs(step) < 1e-10:
+                break
+        p = 1 / (1 + np.exp(-(off + beta * f)))
+        se = 1 / np.sqrt(np.sum(f * f * p * (1 - p)))
+        out["beta"][cls] = round(float(beta), 4)
+        out["se"][cls] = round(float(se), 4)
+        out["z"][cls] = round(float(beta / se), 2)
+    (STORES / "pen_fatigue.json").write_text(json.dumps(out, indent=1))
+    print(f"pen_fatigue: {out}", flush=True)
+
+
+def build_pen_choice(pa):
+    """pen_choice.json: empirical pmf over the ENGINE's pen-order rank
+    of the manager's actual first reliever in, split by the sim's
+    hi/lo-leverage entry context (inning>=7 & |margin|<=2). Study
+    2026-07-20 (Logs/pen_choice_study_2026-07-20.log): the deterministic
+    rank-1 pick matches reality ~13.6% vs ~12.7% uniform — entry choice
+    is near-flat, so the sim samples entry rank from this pmf instead
+    (B6). First-reliever pmf is applied to every entry (approximation:
+    later entries are unobserved against a shrinking eligible set)."""
+    gp = read_csv("mlb_game_pitching.csv",
+                  usecols=["GamePk", "Date", "PlayerId", "Team", "GS",
+                           "IP", "NP", "SV", "HLD"])
+    gp["Date"] = pd.to_datetime(gp["Date"])
+    for c in ("GS", "IP", "NP", "SV", "HLD"):
+        gp[c] = _num(gp[c]).fillna(0)
+    rel = gp[gp.GS == 0].copy()
+    rel["outs"] = (rel.IP.astype(int) * 3 + np.round((rel.IP % 1) * 10))
+    seq = (pa.sort_values("at_bat_number")
+           .groupby(["game_pk", "fld_team", "PitcherId"],
+                    as_index=False)
+           .agg(first_ab=("at_bat_number", "min"),
+                inn=("inning", "first"), sd=("score_diff", "first"),
+                Date=("Date", "first")))
+    seq = seq.sort_values(["game_pk", "fld_team", "first_ab"])
+    seq["ord"] = seq.groupby(["game_pk", "fld_team"]).cumcount()
+    first_rel = seq[(seq["ord"] == 1)
+                    & (seq.Date >= seq.Date.max()
+                       - pd.Timedelta(days=730))]
+    rel_by_team = {t: s.sort_values("Date")
+                   for t, s in rel.groupby("Team")}
+    counts = {"hi": np.zeros(8), "lo": np.zeros(8)}
+    for row in first_rel.itertuples(index=False):
+        sub = rel_by_team.get(row.fld_team)
+        if sub is None:
+            continue
+        d = pd.Timestamp(row.Date)
+        w30 = sub[(sub.Date >= d - pd.Timedelta(days=30))
+                  & (sub.Date < d)]
+        if not len(w30):
+            continue
+        cn = w30.groupby("PlayerId").size()
+        y1 = w30[w30.Date == d - pd.Timedelta(days=1)]
+        y2 = w30[w30.Date == d - pd.Timedelta(days=2)]
+        np1 = y1.groupby("PlayerId").NP.sum()
+        used_both = set(y1.PlayerId) & set(y2.PlayerId)
+        pen = [p for p, _ in cn.sort_values(ascending=False).items()
+               if p not in used_both and np1.get(p, 0) < 25][:8]
+        if row.PitcherId not in pen:
+            continue
+        w365 = sub[(sub.Date >= d - pd.Timedelta(days=365))
+                   & (sub.Date < d)]
+        ag = w365.groupby("PlayerId").agg(sv=("SV", "sum"),
+                                          hld=("HLD", "sum"),
+                                          o=("outs", "mean"))
+        np2 = y2.groupby("PlayerId").NP.sum()
+
+        def key(p):
+            n1, n2 = np1.get(p, 0), np2.get(p, 0)
+            tier = 2 if (n1 >= 20 or (n1 > 0 and n2 > 0)) else \
+                (1 if n1 >= 10 else 0)
+            return (tier, float(ag.sv.get(p, 0.0)),
+                    float(ag.hld.get(p, 0.0)), float(ag.o.get(p, 3.0)))
+
+        hi_ctx = (row.inn >= 7) and abs(row.sd) <= 2
+        if hi_ctx:
+            order = sorted(pen, key=lambda p: (
+                key(p)[0], -(2.0 * key(p)[1] + key(p)[2])))
+        else:
+            order = sorted(pen, key=lambda p: (
+                key(p)[0],
+                -(key(p)[3] - 0.5 * (key(p)[1] + key(p)[2]))))
+        counts["hi" if hi_ctx else "lo"][order.index(row.PitcherId)] += 1
+    out = {}
+    for k in ("hi", "lo"):
+        n = counts[k].sum()
+        out[k] = [round(float(v), 5) for v in counts[k] / max(n, 1)]
+        out[f"n_{k}"] = int(n)
+    (STORES / "pen_choice.json").write_text(json.dumps(out, indent=1))
+    print(f"pen_choice: n_hi={out['n_hi']} n_lo={out['n_lo']} "
+          f"hi_top1={out['hi'][0]:.3f} lo_top1={out['lo'][0]:.3f}",
+          flush=True)
+
+
 def build_catcher_wp(pa):
     """catcher_wp.parquet: per (Season, CatcherId) EB-shrunk WP+PB rate
     per runner-on PA (prior seasons only), replacing the league pre_wp
@@ -3061,6 +3195,8 @@ def main():
         build_advance_tilt(pa, rz, dp_opp, arm_team)
         build_stretch_table(pa)
         build_catcher_wp(pa)
+        build_pen_fatigue(pa)
+        build_pen_choice(pa)
     if "teamctx" in steps:      # before hazard: pen_np3 feeds the leash
         build_team_context()
     if "hazard" in steps:

@@ -1,14 +1,13 @@
 # Staking Layer — Pre-Registered Design
 
-Declared: 2026-07-19 (before the forward-test window 2026-07-20 → 2026-08-16).
-Status: **DESIGN ONLY — paper trading.** No real-money staking until the
-forward test grades (`python Model/forwardtest.py --grade` after 2026-08-16)
-and the promotion criteria in §7 are met.
+Declared: 2026-07-19. Status: **DESIGN ONLY — paper trading.**
 
-Every number in this document is pre-registered. None of them may be changed
-in response to results observed inside the forward-test window before grading.
-Changing them voids the paper-trade record the same way a Model code edit
-voids the forward test.
+> **2026-07-20 note:** the pre-registered forward-test regime this document's
+> activation clause referenced was retired (forwardtest.py deleted; standing
+> evaluation is `Model/walkforward.py`, rolling-origin). The §7 promotion
+> criteria are therefore unanchored — if staking is ever activated, re-anchor
+> them first (e.g., to sustained Tools/5 family tiers or a Sunday-gate
+> equivalent). Until then nothing in this document authorizes real money.
 
 ---
 

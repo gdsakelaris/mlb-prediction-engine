@@ -91,8 +91,14 @@ class BatchPrep:
             np.stack([p.a2vec for p in preps]), dtype=f32)
         self.haz = xp.asarray(
             np.stack([p.haz_grid for p in preps]), dtype=f32)
-        self.relief = xp.asarray(
-            np.stack([p.relief_exit for p in preps]), dtype=f32)
+        # relief_exit: legacy league [11] or per-pitcher [n_players, 11]
+        # rows (B4); broadcast legacy games so the batch is uniform 3-D
+        rel = [np.asarray(p.relief_exit, dtype=np.float32)
+               for p in preps]
+        np0 = preps[0].n_players
+        rel = [r if r.ndim == 2 else np.broadcast_to(r, (np0, r.size))
+               for r in rel]
+        self.relief = xp.asarray(np.stack(rel), dtype=f32)
         # pen_order in GamePrep is [n_sims, 2, P] broadcast from one
         # [1, 2, P] row — keep the per-game row only
         self.pen = xp.asarray(
@@ -151,7 +157,16 @@ class BatchPrep:
         part = preps[0].part_haz
         self.part = (xp.asarray(part, dtype=f32)
                      if part is not None else None)
-        self.latent = preps[0].latent
+        rc = getattr(preps[0], "pen_rank_cum", None)
+        self.rank_cum = (xp.asarray(rc, dtype=f32)
+                         if rc is not None else None)
+        # per-game latent params (B11 fix: was preps[0].latent for all)
+        lats = [p.latent or {} for p in preps]
+        self.lat = {
+            k: xp.asarray(np.array([float(l.get(k, 0.0)) for l in lats]),
+                          dtype=f32)
+            for k in ("mu_env", "sigma_env", "sigma_hr",
+                      "sigma_pitcher", "sigma_offense", "sigma_k")}
         self.n_players = preps[0].n_players
         rules = [S_.rules_for(s, d) for s, d in zip(seasons, is_dh)]
         self.reg = xp.asarray(
@@ -166,10 +181,6 @@ class BatchPrep:
 def _sample_dense(xp, cum_rows, u):
     """cum_rows: [n, K] padded cumulative probs; u: [n] -> pick idx."""
     return (u[:, None] > cum_rows).sum(axis=1).astype(xp.int32)
-
-
-def _normal(xp, rng, mu, sigma, size):
-    return mu + sigma * rng.standard_normal(size, dtype=xp.float32)
 
 
 def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
@@ -226,15 +237,17 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
                 val = val.astype(arr.dtype)
             cupyx.scatter_add(arr, idx, val)
 
-    sig = bp.latent
-    z_env = _normal(xp, rng, float(sig.get("mu_env", 0.0)),
-                    float(sig.get("sigma_env", 0.0)), N)
-    z_hr = _normal(xp, rng, 0.0, float(sig.get("sigma_hr", 0.0)), N)
-    z_pit = _normal(xp, rng, 0.0,
-                    float(sig.get("sigma_pitcher", 0.0)), (N, 2))
-    z_off = _normal(xp, rng, 0.0,
-                    float(sig.get("sigma_offense", 0.0)), (N, 2))
-    z_k = _normal(xp, rng, 0.0, float(sig.get("sigma_k", 0.0)), (N, 2))
+    lat = bp.lat
+    z_env = (lat["mu_env"][gidx] + lat["sigma_env"][gidx]
+             * rng.standard_normal(N, dtype=xp.float32))
+    z_hr = lat["sigma_hr"][gidx] * rng.standard_normal(
+        N, dtype=xp.float32)
+    z_pit = lat["sigma_pitcher"][gidx][:, None] * rng.standard_normal(
+        (N, 2), dtype=xp.float32)
+    z_off = lat["sigma_offense"][gidx][:, None] * rng.standard_normal(
+        (N, 2), dtype=xp.float32)
+    z_k = lat["sigma_k"][gidx][:, None] * rng.standard_normal(
+        (N, 2), dtype=xp.float32)
 
     reg_n = bp.reg[gidx]                 # per-row regulation innings
     ghost_n = bp.ghost[gidx]
@@ -253,19 +266,32 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
         slots = xp.clip(order - 20 - 8 * s32[:, None], 0,
                         npen - 1).astype(xp.int32)
         ok = (order >= 0) & ~pen_used[idx[:, None], s32[:, None], slots]
-        pos = ok.argmax(axis=1).astype(xp.int32)
         anyok = ok.any(axis=1)
-        if due_stand is not None:
-            rows_ok = xp.clip(order, 0,
-                              bp.pit_throws.shape[1] - 1).astype(
-                                  xp.int32)
-            hands = bp.pit_throws[gidx[idx][:, None], rows_ok]
-            match = (ok & (hands == due_stand[:, None])
-                     & (due_stand[:, None] != 2))
-            match[:, S_.PLATOON_WIN:] = False
-            m_any = match.any(axis=1)
-            pos = xp.where(m_any, match.argmax(axis=1).astype(xp.int32),
-                           pos)
+        if bp.rank_cum is not None:      # B6: pmf-sampled entry rank
+            cum = bp.rank_cum[xp.where(hi_mask, 0, 1)]
+            cnt = ok.sum(axis=1).astype(xp.int32)
+            k = xp.clip(xp.minimum(cnt, cum.shape[1]) - 1, 0, None)
+            tot = cum[xp.arange(int(idx.size)), k]
+            u = rng.random(int(idx.size), dtype=xp.float32) * tot
+            r = xp.minimum(
+                (u[:, None] > cum).sum(axis=1).astype(xp.int32),
+                xp.maximum(cnt - 1, 0))
+            pos = xp.minimum((xp.cumsum(ok, axis=1) <= r[:, None])
+                             .sum(axis=1), npen - 1).astype(xp.int32)
+        else:
+            pos = ok.argmax(axis=1).astype(xp.int32)
+            if due_stand is not None:
+                rows_ok = xp.clip(order, 0,
+                                  bp.pit_throws.shape[1] - 1).astype(
+                                      xp.int32)
+                hands = bp.pit_throws[gidx[idx][:, None], rows_ok]
+                match = (ok & (hands == due_stand[:, None])
+                         & (due_stand[:, None] != 2))
+                match[:, S_.PLATOON_WIN:] = False
+                m_any = match.any(axis=1)
+                pos = xp.where(m_any,
+                               match.argmax(axis=1).astype(xp.int32),
+                               pos)
         chosen = xp.where(anyok, order[xp.arange(int(idx.size)), pos],
                           -1).astype(xp.int16)
         cslot = xp.clip(chosen.astype(xp.int32) - 20 - 8 * s32, 0,
@@ -301,6 +327,7 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
             rfld = fld[non_start]
             stint_outs[ridx, rfld] += 3
             exit_p = bp.relief[gidx[ridx],
+                               cur_pit[ridx, rfld].astype(xp.int32),
                                xp.clip(stint_outs[ridx, rfld],
                                        0, 10).astype(xp.int32)]
             leave = rng.random(int(ridx.size), dtype=xp.float32) < exit_p
@@ -1157,10 +1184,11 @@ def prepare_games(P, specs, n_sims=4000):
         adj = P._sim_adjusters(rv["players"], rv["season"], rv["away"],
                                rv["home"], rv["date"],
                                rv["pen_rows_away"], rv["pen_rows_home"])
+        P._apply_pen_fatigue(avec, adj["pen_fat_f"])
         lat = dict(P.latent)
         prep = S_.GamePrep(
             n_players=rv["n_players"], starters=[18, 19], avec=avec,
-            a2vec=a2vec, haz_grid=haz, relief_exit=P._relief_exit,
+            a2vec=a2vec, haz_grid=haz, relief_exit=adj["relief_exit"],
             pen_order=pen_order, sb_att=att, sb_suc=suc,
             sb_state=P._sb_state(rv["season"]),
             patterns=P.patterns, latent=lat,
@@ -1171,6 +1199,7 @@ def prepare_games(P, specs, n_sims=4000):
             arm_eff=adj["arm_eff"], stretch=adj["stretch"],
             stretch_z=adj["stretch_z"], pen_hi=adj["pen_hi"],
             pen_lo=adj["pen_lo"], pre_wp=adj["pre_wp"],
+            pen_rank_cum=P._pen_rank_cum,
             pre_pk=P.preevents["pickoff_out_per_pa_runners_on"])
         out.append((prep, rv["meta"]))
     return out

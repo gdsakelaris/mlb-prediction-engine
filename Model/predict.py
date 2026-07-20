@@ -23,6 +23,7 @@ history if SGP pricing is ever wanted.
 
 import datetime as dt
 import json
+import os
 from pathlib import Path
 
 import joblib
@@ -52,6 +53,18 @@ TIRED_NP = 20            # a pen arm that threw >= this many pitches
                          # YESTERDAY drops behind every fresh arm in
                          # both entry orders (threw-both-of-last-two-
                          # days / 25+ NP arms are excluded upstream)
+PEN_FAT_MID = 10         # B3 graded demotion: 10-19 NP yesterday is a
+                         # middle tier between fresh and TIRED_NP
+PEN_EXIT_M = 12          # B4 per-pitcher exit tables: league pseudo-
+                         # stints blended into the pitcher's trailing-
+                         # 365d stint hazard (holdout-tuned,
+                         # Logs/pen_exit_study_2026-07-20.log)
+# A/B gates for the 2026-07-20 pen wave: set to "0" to reproduce the
+# exact pre-wave behavior (paired-replay A sides). PEN_WAVE3 covers
+# B3 (fatigue offsets + graded tiers) + B4 (per-pitcher exit tables);
+# PEN_CHOICE covers B6 (pmf-sampled reliever entry rank).
+PEN_WAVE3 = os.environ.get("PEN_WAVE3", "1") != "0"
+PEN_CHOICE = os.environ.get("PEN_CHOICE", "1") != "0"
 
 K_LINES = [3.5, 4.5, 5.5, 6.5, 7.5, 8.5]
 OUT_LINES = [14.5, 15.5, 16.5, 17.5, 18.5]
@@ -306,6 +319,36 @@ class Predictor:
             "PlayerId"].astype(int))
         tick("computing bullpen availability...")
         self._relief_exit = self._reliever_exit_table()
+        # per-pitcher relief stint outs (B4: pitcher-specific exit
+        # tables) and fatigue coefficients (B3: only |z|>=2 classes
+        # apply; the store records the full fit)
+        gp_rel = gp_[pd.to_numeric(gp_.GS, errors="coerce") == 0]
+        ipn = pd.to_numeric(gp_rel.IP, errors="coerce").fillna(0)
+        outs_ = (ipn.astype(int) * 3
+                 + np.round((ipn % 1) * 10)).astype(int)
+        self._rel_outs = {
+            int(p): (g.Date.to_numpy(), g.o.to_numpy())
+            for p, g in pd.DataFrame(dict(
+                PlayerId=gp_rel.PlayerId, Date=gp_rel.Date,
+                o=outs_)).groupby("PlayerId")}
+        self._pexit_cache = {}
+        self._pen_fat = {}
+        pf = F.STORES / "pen_fatigue.json"
+        if PEN_WAVE3 and pf.exists():
+            d_ = json.loads(pf.read_text())
+            ci = {"K": 0, "BB": 1, "HR": 6}
+            self._pen_fat = {
+                ci[c]: float(b) for c, b in d_["beta"].items()
+                if c in ci and abs(d_["z"].get(c, 0.0)) >= 2.0}
+        # B6: cumulative rank pmfs [hi, lo] for the sim's entry pick
+        self._pen_rank_cum = None
+        pc = F.STORES / "pen_choice.json"
+        if PEN_CHOICE and pc.exists():
+            d_ = json.loads(pc.read_text())
+            if d_.get("n_hi", 0) >= 500 and d_.get("n_lo", 0) >= 500:
+                self._pen_rank_cum = np.cumsum(
+                    np.asarray([d_["hi"], d_["lo"]], dtype=np.float64),
+                    axis=1)
         tick("ready")
 
     # ------------------------------------------------------ helpers
@@ -333,6 +376,46 @@ class Predictor:
         # exit decisions happen at inning breaks; the per-outs exit prob
         # is evaluated there with the stint's completed outs
         return tab
+
+    def _pitcher_exit_table(self, pid, date):
+        """[11] per-outs exit probs for one reliever: trailing-365d
+        stint hazard counts blended with PEN_EXIT_M league pseudo-
+        stints (B4 — closers exit after 3 outs, long men carry
+        multi-inning stints)."""
+        key = (int(pid), pd.Timestamp(date))
+        hit = self._pexit_cache.get(key)
+        if hit is not None:
+            return hit
+        tab = self._relief_exit
+        arr = self._rel_outs.get(int(pid))
+        if arr is not None:
+            d = np.datetime64(pd.Timestamp(date))
+            dates, outs = arr
+            o = outs[(dates >= d - np.timedelta64(365, "D"))
+                     & (dates < d)]
+            if len(o):
+                k = np.arange(11)
+                at_least = (o[:, None] >= k).sum(0)
+                exits = at_least - (o[:, None] > k).sum(0)
+                tab = ((exits + PEN_EXIT_M * tab)
+                       / (at_least + PEN_EXIT_M))
+                tab[0] = 0.0
+        self._pexit_cache[key] = tab
+        return tab
+
+    def _apply_pen_fatigue(self, avec, pen_fat_f):
+        """B3 performance half: multiply fatigued pen arms' class
+        probabilities by exp(beta * f) for the store's significant
+        classes (BB as of the 2026-07-20 fit) and renormalize."""
+        if not self._pen_fat or not pen_fat_f:
+            return
+        for r, f in pen_fat_f.items():
+            if f <= 0:
+                continue
+            v = avec[r]
+            for ci, b in self._pen_fat.items():
+                v[..., ci] *= np.exp(b * f)
+            v /= v.sum(axis=-1, keepdims=True)
 
     def _il_unavailable(self, date):
         """PlayerId -> IL PlaceDate for stints active on `date` (as-of
@@ -528,6 +611,9 @@ class Predictor:
 
         pen_hi = np.full((2, MAX_PEN), -1, dtype=np.int16)
         pen_lo = np.full((2, MAX_PEN), -1, dtype=np.int16)
+        rex = np.tile(self._relief_exit.astype(np.float32),
+                      (len(players), 1))
+        pen_fat_f = {}
         gp_cache = getattr(self, "_gp_team_cache", {})
         d = pd.Timestamp(date)
         for side, team, prows in ((0, away, pen_rows_away),
@@ -555,21 +641,33 @@ class Predictor:
                     stats = {int(p): (float(r.sv), float(r.hld),
                                       float(r.outs))
                              for p, r in g.iterrows()}
-            # arms that threw TIRED_NP+ pitches yesterday drop behind
-            # every fresh arm in both orders (managers hold them back
-            # short of true unavailability, which _pen_for handles)
-            tired = set()
+            # B3 graded demotion: recent pitch counts split arms into
+            # fresh / mid (PEN_FAT_MID+) / heavy (TIRED_NP+ or went
+            # back-to-back) tiers; each tier sorts behind the previous
+            # one in both entry orders (managers hold worked arms back
+            # short of the true unavailability _pen_for handles)
+            np1, np2 = {}, {}
             if sub is not None and prows:
-                y1 = sub[(sub.Date == d - pd.Timedelta(days=1))
-                         & (pd.to_numeric(sub.GS, errors="coerce")
-                            == 0)]
-                if len(y1):
-                    npv = pd.to_numeric(y1.NP,
-                                        errors="coerce").fillna(0)
-                    tired = {int(p) for p, v in zip(y1.PlayerId, npv)
-                             if v >= TIRED_NP}
+                gs0 = pd.to_numeric(sub.GS, errors="coerce") == 0
+                for lag, m_ in ((1, np1), (2, np2)):
+                    yd = sub[(sub.Date == d - pd.Timedelta(days=lag))
+                             & gs0]
+                    if len(yd):
+                        npv = pd.to_numeric(yd.NP,
+                                            errors="coerce").fillna(0)
+                        for p, v in zip(yd.PlayerId, npv):
+                            m_[int(p)] = m_.get(int(p), 0.0) + float(v)
+
+            def _tier(pid):
+                n1, n2 = np1.get(pid, 0.0), np2.get(pid, 0.0)
+                if not PEN_WAVE3:               # legacy binary demotion
+                    return 1 if n1 >= TIRED_NP else 0
+                if n1 >= TIRED_NP or (n1 > 0 and n2 > 0):
+                    return 2
+                return 1 if n1 >= PEN_FAT_MID else 0
+
             rows = [(r, *stats.get(int(players[r]), (0.0, 0.0, 3.0)),
-                     int(players[r]) in tired)
+                     _tier(int(players[r])))
                     for r in prows]
             hi = sorted(rows,
                         key=lambda t: (t[4], -(2.0 * t[1] + t[2])))
@@ -578,10 +676,21 @@ class Predictor:
                                        -(t[3] - 0.5 * (t[1] + t[2]))))
             pen_hi[side, :len(hi)] = [r for r, *_ in hi]
             pen_lo[side, :len(lo)] = [r for r, *_ in lo]
+            if PEN_WAVE3:
+                for r in prows:
+                    pid = int(players[r])
+                    n1, n2 = np1.get(pid, 0.0), np2.get(pid, 0.0)
+                    pen_fat_f[r] = (min(n1, 40.0) / 20.0
+                                    + 0.5 * min(n2, 40.0) / 20.0)
+                    if pid > 0:
+                        rex[r] = self._pitcher_exit_table(pid, d)
 
         return dict(run_z=run_z, dp_z=dp_z, stretch_z=stretch_z,
                     arm_eff=arm_eff, pre_wp=pre_wp, pen_hi=pen_hi,
-                    pen_lo=pen_lo, stretch=self._stretch)
+                    pen_lo=pen_lo, stretch=self._stretch,
+                    relief_exit=(rex if PEN_WAVE3
+                                 else self._relief_exit),
+                    pen_fat_f=pen_fat_f)
 
     def _last_lineup(self, team):
         gb = self.stores.raw["gb"]
@@ -740,11 +849,12 @@ class Predictor:
 
         adj = self._sim_adjusters(players, season, away, home, date,
                                   pen_rows_away, pen_rows_home)
+        self._apply_pen_fatigue(avec, adj["pen_fat_f"])
         lat = dict(self.latent)
         prep = sim.GamePrep(
             n_players=n_players, starters=[18, 19], avec=avec,
             a2vec=a2vec, haz_grid=haz,
-            relief_exit=self._relief_exit, pen_order=pen_order,
+            relief_exit=adj["relief_exit"], pen_order=pen_order,
             sb_att=sb_att, sb_suc=sb_suc, sb_state=sb_state,
             patterns=self.patterns,
             latent=lat, bench_rows=bench_rows,
@@ -755,6 +865,7 @@ class Predictor:
             stretch_z=adj["stretch_z"], pen_hi=adj["pen_hi"],
             pen_lo=adj["pen_lo"],
             pre_wp=adj["pre_wp"],
+            pen_rank_cum=self._pen_rank_cum,
             pre_pk=self.preevents["pickoff_out_per_pa_runners_on"])
         meta = dict(players=players, names=[self._name(p) if p >= 0
                                             else "League Avg"

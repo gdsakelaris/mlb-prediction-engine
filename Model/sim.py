@@ -145,7 +145,11 @@ class GamePrep:
     n_players rows: away batters 0-8, home batters 9-17, then pitchers.
     avec / a2vec:   [n_pitchers, 18, 3(tto)] -> 8 / 4 class probs
     haz_grid:       [2, 41, 11] starter removal prob by (bf, runs)
-    relief_exit:    [11] P(stint ends at inning break | outs in stint)
+    relief_exit:    P(stint ends at inning break | outs in stint):
+                    league [11] or per-pitcher [n_players, 11] (B4)
+    pen_rank_cum:   optional [2, K] cumulative pmfs (hi, lo) over the
+                    entry RANK among still-available pen arms (B6);
+                    absent -> deterministic first-arm + platoon jump
     pen_order:      per sim, per team, the reliever entry order
                     [n_sims, 2, max_pen] as pitcher indices (-1 = none)
     sb_att/sb_suc:  [18, n_pitchers] steal-of-2B attempt/success prob for
@@ -256,23 +260,40 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
         pen_lo = np.asarray(pen_lo, dtype=np.int16)
         pen_used = np.zeros((S, 2, pen_hi.shape[1]), dtype=bool)
 
+    rank_cum = getattr(prep, "pen_rank_cum", None)
+    if rank_cum is not None:
+        rank_cum = np.asarray(rank_cum, dtype=np.float64)
+
     def _pick_pen(idx, side, hi_mask, due_stand=None):
-        """First unused arm in the leverage-matched order; -1 = none.
-        Platoon: a same-hand arm (vs a non-switch due batter) within
-        the first PLATOON_WIN order slots jumps the queue."""
+        """Arm from the leverage-matched order; -1 = none. With a
+        pen_rank_cum store (B6) the entry RANK among still-available
+        arms is sampled per sim from the empirical manager-choice pmf
+        (which subsumes platoon behavior); without it, first unused arm
+        with the deterministic PLATOON_WIN same-hand jump."""
         order = np.where(hi_mask[:, None], pen_hi[side], pen_lo[side])
         npen = order.shape[1]
         slots = np.clip(order - 20 - 8 * side[:, None], 0, npen - 1)
         ok = (order >= 0) & ~pen_used[idx[:, None], side[:, None], slots]
-        pos = ok.argmax(axis=1)
         anyok = ok.any(axis=1)
-        if due_stand is not None:
-            hands = pit_throws[np.clip(order, 0, None)]
-            match = (ok & (hands == due_stand[:, None])
-                     & (due_stand[:, None] != 2))
-            match[:, PLATOON_WIN:] = False
-            m_any = match.any(axis=1)
-            pos = np.where(m_any, match.argmax(axis=1), pos)
+        if rank_cum is not None:
+            cum = rank_cum[np.where(hi_mask, 0, 1)]         # [n, K]
+            cnt = ok.sum(axis=1)
+            k = np.clip(np.minimum(cnt, cum.shape[1]) - 1, 0, None)
+            tot = cum[np.arange(idx.size), k]
+            u = rng.random(idx.size) * tot
+            r = np.minimum((u[:, None] > cum).sum(axis=1),
+                           np.maximum(cnt - 1, 0))
+            pos = np.minimum((np.cumsum(ok, axis=1) <= r[:, None])
+                             .sum(axis=1), npen - 1)
+        else:
+            pos = ok.argmax(axis=1)
+            if due_stand is not None:
+                hands = pit_throws[np.clip(order, 0, None)]
+                match = (ok & (hands == due_stand[:, None])
+                         & (due_stand[:, None] != 2))
+                match[:, PLATOON_WIN:] = False
+                m_any = match.any(axis=1)
+                pos = np.where(m_any, match.argmax(axis=1), pos)
         chosen = np.where(anyok, order[np.arange(idx.size), pos],
                           -1).astype(np.int16)
         cslot = np.clip(chosen - 20 - 8 * side, 0, npen - 1)
@@ -742,7 +763,10 @@ def _end_half(mask, inning, half, outs, bases, resp, score, runs_f5,
         ridx = idx[non_start]
         rfld = fld[non_start]
         stint_outs[ridx, rfld] += 3
-        exit_p = prep.relief_exit[np.clip(stint_outs[ridx, rfld], 0, 10)]
+        so = np.clip(stint_outs[ridx, rfld], 0, 10)
+        ret = np.asarray(prep.relief_exit)
+        exit_p = (ret[cur_pit[ridx, rfld], so] if ret.ndim == 2
+                  else ret[so])
         leave = rng.random(ridx.size) < exit_p
         if leave.any():
             lidx, lfld = ridx[leave], rfld[leave]
