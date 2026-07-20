@@ -61,7 +61,27 @@ transplants below; line refs are into `Desktop\MLB\Model\features.py` unless not
   ≈ −6.7 pts. **W4.12 confirmed necessary.** pbb's head fully repairs its family (BB>1.5
   top-10 gap → +1.0 pt holdout); tot heads fine. pytest 30/30 green.
 
-### W4-B. A1 discrimination, batter-first (features → retrain → paired A/B + walkforward)
+### W4-B. A1 discrimination — SHIPPED 2026-07-20 (KEEP on no-harm tie + targeted goal-board gains)
+
+**Recon finding:** W4.4 core log5s (`mx_k5/bb5/hr5/hit5`), W4.9 (per-TTO `pt_` rates), and W4.11
+(BvP `bvp_xw_resid`/`bvp_hr_resid`, exact K=30/50 design) already existed at HEAD — memory/TODO
+were stale; only the genuinely missing pieces were built. **Implemented:** W4.5 on-deck
+protection (`_derive_ondeck` from PA stream at train, lineup slot+1 at serve in both engines;
+`od_` shrunk rates + `od_obp/od_slg` + `mx_pitch_around`), W4.6 current-season bat tracking
+(`panel_bat_track` from raw-pitch bat speed 2024+; `btk_speed/fast/swlen` + `btk_speed_dd`
+drift vs prior-season baseline), W4.7 ump products (`mx_ump_k/bb/calledk`), W4.8 pitcher venue
+splits (`panel_pit_out_loc` + `pv_` rates), W4.10 park XBH (`pf_2B` consumption was MISSING +
+`mx_park_2b/3b`), W4.4b contact log5s (`mx_gb5/air5/brl5/xw5` + `mx_pullair`; `bq_air/pq_air`
+now emitted). Features 223→276.
+
+**Verdict (Logs/w4b_cycle_2026-07-20.log):** paired A/B on 1.71M shared rows = no-harm TIE
+(ALL +0.00001; hr +0.00025 ci_lo>0 raw, BH-tie). Goal board: targeted columns up — Double
+top-10 +1.0 pt, HR +0.9, 4+ TB +0.9, H+R+RBI 4+ +1.0, Run +1.0, Triple AUC +.003; give-back
+Hit −1.3 / 2+ Hits −0.7 (~1.5 SE, WATCH next A/B). Walkforward stable all folds (+.028..+.032
+vs league). pytest 30/30. Calibrators + heads refreshed on the new ledger (pout head +0.0045);
+serve smoke PASS. Arm-A baseline: `artifacts/rows_prew4b.parquet`.
+
+Original item list (statuses above):
 
 - [ ] **W4.4** `mix_*` outcome log5 products (batter rate × starter-allowed rate: k/bb/hr/hit/
   gb/ld/pullair + contact-quality air/brl/xwcon; old `3102-3113`). Near-universal keep-list

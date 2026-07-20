@@ -921,11 +921,15 @@ def _matchup_frame(P, resolved):
                 bat_is_home = (brow >= 9) if brow < 18 else \
                     (brow == rv["bench_rows"][1])
                 stand = P._stand(bpid, pthrows)
+                od_pid = (players[(brow + 1) % 9] if brow < 9 else
+                          players[9 + (brow - 8) % 9] if brow < 18
+                          else -1)
                 elo_a, elo_h = rv["elo"]
                 ta, th, za, zh, na_, nh = rv.get("tcx", (np.nan,) * 6)
                 for tto in (1, 2, 3):
                     rows.append((date, season, bpid, ppid, stand,
-                                 pthrows, tto, int(bat_is_home), p_team,
+                                 pthrows, od_pid, tto,
+                                 int(bat_is_home), p_team,
                                  spec.get("venue") or "",
                                  spec.get("day_night") or "day",
                                  spec.get("temp"),
@@ -948,7 +952,8 @@ def _matchup_frame(P, resolved):
                                  fm[8], fm[9]))
         blocks.append(rows)
     cols = ["Date", "Season", "BatterId", "PitcherId", "stand",
-            "p_throws", "tto", "home_bat", "fld_team", "Venue",
+            "p_throws", "OnDeckId", "tto", "home_bat", "fld_team",
+            "Venue",
             "DayNight", "Temp", "WindSpeed", "WindDir", "Condition",
             "Humidity", "Pressure", "HpUmpId", "rest_p",
             "b_elo", "p_elo", "b_travel_km", "p_travel_km",

@@ -780,10 +780,15 @@ class Predictor:
                 bat_is_home = (brow >= 9) if brow < 18 else \
                     (brow == bench_rows[1])
                 stand = self._stand(bpid, pthrows)
+                # on-deck = next lineup slot, same side (bench -> none)
+                od_pid = (players[(brow + 1) % 9] if brow < 9 else
+                          players[9 + (brow - 8) % 9] if brow < 18
+                          else -1)
                 for tto in (1, 2, 3):
                     rows.append(dict(
                         Date=date, Season=season, BatterId=bpid,
                         PitcherId=ppid, stand=stand, p_throws=pthrows,
+                        OnDeckId=od_pid,
                         tto=tto, home_bat=int(bat_is_home),
                         fld_team=p_team, Venue=spec.get("venue") or "",
                         DayNight=spec.get("day_night") or "day",

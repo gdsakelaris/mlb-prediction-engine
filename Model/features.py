@@ -439,6 +439,7 @@ def build_outcome_panels(pa):
         ("panel_bat_out", "BatterId", None, DECAY_HL),
         ("panel_bat_out_hand", "BatterId", "p_throws", DECAY_HL),
         ("panel_bat_out_loc", "BatterId", "home_bat", DECAY_HL),
+        ("panel_pit_out_loc", "PitcherId", "home_pit", DECAY_HL),
         ("panel_pit_out", "PitcherId", None, DECAY_HL),
         ("panel_pit_out_hand", "PitcherId", "stand", DECAY_HL),
         ("panel_pit_out_tto", "PitcherId", "tto", DECAY_HL),
@@ -455,6 +456,11 @@ def build_outcome_panels(pa):
             # league-average TTO effect alone
             sub = sub.assign(tto=_num(sub["tto"]).clip(1, 3)
                              .astype("int64"))
+        if hand == "home_pit":
+            # pitcher venue-affinity split (mirror of the batter's):
+            # the pitcher is home exactly when the batter is not
+            sub = sub.assign(home_pit=(1 - _num(sub["home_bat"])
+                                       .fillna(0)).astype("int64"))
         daily = _daily_class_counts(sub, ent, hand)
         ents = [ent] + ([hand] if hand else [])
         panel = decayed_panel(daily, ents, ["pa"] + CLASSES, hl=hl)
@@ -653,6 +659,45 @@ def build_bat_tracking_table():
         "bt_squp_d"]].to_parquet(STORES / "bat_tracking.parquet",
                                  index=False)
     print(f"bat_tracking: {len(bt):,} player-years", flush=True)
+
+
+def build_bat_track_panel():
+    """Current-season bat tracking as a daily decayed panel, from the
+    raw pitch archive's per-swing bat speed / swing length (2024+;
+    Savant logs them on competitive swings). The prior-season
+    bat_tracking table stays the stable baseline — assemble emits the
+    in-season level AND its drift off that baseline."""
+    import pyarrow.parquet as pq
+    frames = []
+    for f in sorted(RAW.glob("pitches_*.parquet")):
+        names = pq.read_schema(f).names
+        if "bat_speed" not in names:
+            continue
+        cols = ["game_date", "batter", "bat_speed", "swing_length"]
+        d = pq.read_table(f, columns=cols).to_pandas()
+        d = d[_num(d["bat_speed"]) > 0]
+        if len(d):
+            frames.append(d)
+    if not frames:
+        print("panel_bat_track: no bat-speed years in the raw archive "
+              "-> skipped", flush=True)
+        return
+    sw = pd.concat(frames, ignore_index=True)
+    sw["Date"] = pd.to_datetime(sw["game_date"])
+    sw["BatterId"] = _num(sw["batter"]).astype("int64")
+    spd = _num(sw["bat_speed"])
+    sw["sw_n"] = 1.0
+    sw["spd_sum"] = spd
+    sw["fast"] = (spd >= 75.0).astype(float)
+    sw["len_sum"] = _num(sw["swing_length"]).fillna(0.0)
+    daily = sw.groupby(["BatterId", "Date"], sort=False)[
+        ["sw_n", "spd_sum", "fast", "len_sum"]].sum().reset_index()
+    panel = decayed_panel(daily, ["BatterId"],
+                          ["sw_n", "spd_sum", "fast", "len_sum"])
+    panel.to_parquet(STORES / "panel_bat_track.parquet", index=False)
+    print(f"panel_bat_track: {len(panel):,} batter-days "
+          f"({sw['Date'].dt.year.min()}-{sw['Date'].dt.year.max()})",
+          flush=True)
 
 
 def build_pull_table():
@@ -2187,6 +2232,31 @@ def _shrunk_rates(out, prefix, pa_col, classes, prior_lookup, k_map,
     return out
 
 
+def _derive_ondeck(rows):
+    """Training-side on-deck id from the PA stream: the lineup is the
+    first nine distinct batters per (game, side); on-deck for the
+    slot-i hitter is the slot-(i+1 mod 9) hitter. Later entrants
+    (pinch hitters, subs) get NaN."""
+    df = rows[["game_pk", "bat_team", "at_bat_number",
+               "BatterId"]].reset_index(drop=True)
+    df["_ord"] = np.arange(len(df))
+    df = df.sort_values(["game_pk", "bat_team", "at_bat_number"],
+                        kind="mergesort")
+    first = ~df.duplicated(["game_pk", "bat_team", "BatterId"])
+    lu = df[first].copy()
+    lu["slot"] = lu.groupby(["game_pk", "bat_team"],
+                            sort=False).cumcount()
+    lu = lu[lu["slot"] < 9][["game_pk", "bat_team", "BatterId", "slot"]]
+    od = lu.rename(columns={"BatterId": "OnDeckId"}).copy()
+    od["slot"] = (od["slot"] - 1) % 9
+    lu = lu.merge(od[["game_pk", "bat_team", "slot", "OnDeckId"]],
+                  on=["game_pk", "bat_team", "slot"], how="left")
+    df = df.merge(lu[["game_pk", "bat_team", "BatterId", "OnDeckId"]],
+                  on=["game_pk", "bat_team", "BatterId"], how="left")
+    df = df.sort_values("_ord")
+    return pd.Series(df["OnDeckId"].values, index=rows.index)
+
+
 def load_stores():
     """Everything assemble_features needs, loaded once."""
     s = {}
@@ -2205,6 +2275,11 @@ def load_stores():
                  "league_env_daily", "panel_bat_out_fast",
                  "panel_pit_out_fast", "park_geo"):
         s[name] = pd.read_parquet(STORES / f"{name}.parquet")
+    # newer panels — tolerate their absence so a pre-rebuild artifact
+    # set still serves (their features go NaN; XGB is missing-native)
+    for name in ("panel_pit_out_loc", "panel_bat_track"):
+        p = STORES / f"{name}.parquet"
+        s[name] = pd.read_parquet(p) if p.exists() else None
     s["eb_k"] = json.loads((STORES / "eb_k.json").read_text())
     s["hrmix_league"] = json.loads(
         (STORES / "hrmix_league.json").read_text())
@@ -2379,6 +2454,8 @@ def assemble_features(rows, stores):
             lower=1e-9)
         out[pref + "gb"] = m[pref + "gb"] / m[pref + "bip"].clip(
             lower=1e-9)
+        out[pref + "air"] = m[pref + "air"] / m[pref + "bip"].clip(
+            lower=1e-9)
         # realized hits minus expected on the same recent contact:
         # positive = running hot (mean-reversion signal)
         out[pref + "luck"] = ((m[pref + "hit"] - m[pref + "xba_sum"])
@@ -2517,7 +2594,7 @@ def assemble_features(rows, stores):
     j = rows[["Venue", "Season"]].merge(
         pf, left_on=["Venue", "Season"], right_on=["Venue", "Year"],
         how="left")
-    for c in ("HR", "1B", "K", "BB", "3B"):
+    for c in ("HR", "1B", "2B", "K", "BB", "3B"):
         out[f"pf_{c}"] = j[f"pf_{c}"].fillna(1.0).values
     uf = stores["ump_factors"]
     j = rows[["HpUmpId", "Season"]].copy()
@@ -2600,6 +2677,21 @@ def assemble_features(rows, stores):
     out["mx_chase"] = out["bm_chase"] * out["pm_chase"]
     out["mx_zone_con"] = out["pm_zone"] * (1.0 - out["bm_zcon"])
     out["mx_calledk"] = (1.0 - out["bm_zsw"]) * out["pm_edge"]
+    # contact-shape and contact-quality log5s (trees can't multiply)
+    out["mx_gb5"] = np.asarray(out["bq_gb"]) * np.asarray(out["pq_gb"])
+    out["mx_air5"] = (np.asarray(out["bq_air"])
+                      * np.asarray(out["pq_air"]))
+    out["mx_brl5"] = (np.asarray(out["bq_barrel"])
+                      * np.asarray(out["pq_barrel"]))
+    out["mx_xw5"] = np.asarray(out["bq_xw"]) * np.asarray(out["pq_xw"])
+    # umpire zone authority x the pitcher/batter axes it acts through
+    out["mx_ump_k"] = np.asarray(out["uf_K"]) * out["p_K_rate"]
+    out["mx_ump_bb"] = np.asarray(out["uf_BB"]) * out["p_BB_rate"]
+    out["mx_ump_calledk"] = (np.asarray(out["uf_K"])
+                             * (1.0 - np.asarray(out["bm_zsw"])))
+    # park extra-base-hit geometry x the batter's hit-type skill
+    out["mx_park_2b"] = np.asarray(out["pf_2B"]) * out["b_2B_rate"]
+    out["mx_park_3b"] = np.asarray(out["pf_3B"]) * out["b_3B_rate"]
 
     # ---- IL recency (batter and pitcher)
     il = stores["il_stints"]
@@ -2680,6 +2772,27 @@ def assemble_features(rows, stores):
         out[c] = (j[c].values if c in j.columns
                   else np.full(n, np.nan))    # pre-rebuild stores
 
+    # ---- bat tracking, current-season decayed (as-of daily panel from
+    # the raw pitch archive): the in-season level plus its drift off
+    # the prior-season baseline — a bat-speed slide shows up here weeks
+    # before the season table rolls over
+    if stores.get("panel_bat_track") is not None:
+        m = merge_asof_panel(rows, stores["panel_bat_track"],
+                             ["BatterId"],
+                             ["sw_n", "spd_sum", "fast", "len_sum"],
+                             "btk_")
+        swn = m["btk_sw_n"].fillna(0.0)
+        has = swn.values > 0
+        out["btk_log_n"] = np.log1p(swn)
+        out["btk_speed"] = np.where(
+            has, m["btk_spd_sum"] / swn.clip(lower=1e-9), np.nan)
+        out["btk_fast"] = np.where(
+            has, m["btk_fast"] / swn.clip(lower=1e-9), np.nan)
+        out["btk_swlen"] = np.where(
+            has, m["btk_len_sum"] / swn.clip(lower=1e-9), np.nan)
+        out["btk_speed_dd"] = out["btk_speed"] - np.asarray(
+            out["bt_speed"])
+
     # ---- pull tendency + wind-carry-to-pull-side interaction
     m = merge_asof_panel(rows, stores["panel_bat_pull"], ["BatterId"],
                          ["air", "pull"], "pl_", hl=PULL_HL)
@@ -2697,6 +2810,9 @@ def assemble_features(rows, stores):
         dome, 0.0,
         _num(rows["WindSpeed"]).fillna(0.0) * ws_.fillna(0.0) * wgt
         * pull_share)
+    # pull-side air hitter vs fly-ball pitcher: the HR-shape collision
+    out["mx_pullair"] = (np.asarray(pull_share)
+                         * np.asarray(out["pq_air"]))
 
     # ---- HR pitch-class matchup: batter HR mix vs THIS arsenal
     m = merge_asof_panel(rows, stores["panel_bat_hrmix"], ["BatterId"],
@@ -2736,6 +2852,48 @@ def assemble_features(rows, stores):
     out.update({c: m[c] for c in m.columns})
     out = _shrunk_rates(out, "bl_", "bl_pa", BAT_RATES, pri_b,
                         stores["eb_k"])
+
+    # ---- pitcher home/road split rates (mirror of the batter split)
+    if stores.get("panel_pit_out_loc") is not None:
+        rows_pv = rows[["PitcherId", "Date", "home_bat"]].copy()
+        rows_pv["hp_key"] = (1 - _num(rows_pv["home_bat"]).fillna(0)
+                             ).astype("int64")
+        pp_ = stores["panel_pit_out_loc"].copy()
+        pp_["hp_key"] = _num(pp_["home_pit"]).astype("int64")
+        m = merge_asof_panel(rows_pv, pp_, ["PitcherId", "hp_key"],
+                             ["pa"] + CLASSES, "pv_")
+        out.update({c: m[c] for c in m.columns})
+        out = _shrunk_rates(out, "pv_", "pv_pa", PIT_RATES, pri_p,
+                            stores["eb_k"])
+
+    # ---- on-deck protection: who bats NEXT shapes THIS PA's pitching
+    # (pitch-around) — a channel the sim cannot generate because A1
+    # never sees the on-deck hitter. Serve rows carry OnDeckId from the
+    # lineup; training rows derive it from the PA stream; anything
+    # without one collapses to the league prior.
+    if "OnDeckId" in rows.columns:
+        od_id = _num(rows["OnDeckId"])
+    elif {"game_pk", "at_bat_number", "bat_team"}.issubset(rows.columns):
+        od_id = _derive_ondeck(rows)
+    else:
+        od_id = pd.Series(np.nan, index=rows.index)
+    rows_od = pd.DataFrame({
+        "BatterId": od_id.fillna(-1).astype("int64"),
+        "Date": rows["Date"].values})
+    m = merge_asof_panel(rows_od, stores["panel_bat_out"], ["BatterId"],
+                         ["pa"] + CLASSES, "od_")
+    out.update({c: m[c] for c in m.columns})
+    out = _shrunk_rates(out, "od_", "od_pa", BAT_RATES, pri_b,
+                        stores["eb_k"])
+    out["od_obp"] = (out["od_BB_rate"] + out["od_1B_rate"]
+                     + out["od_2B_rate"] + out["od_3B_rate"]
+                     + out["od_HR_rate"])
+    out["od_slg"] = (out["od_1B_rate"] + 2 * out["od_2B_rate"]
+                     + 3 * out["od_3B_rate"] + 4 * out["od_HR_rate"])
+    lg_slg = (pri_b["1B"] + 2 * pri_b["2B"] + 3 * pri_b["3B"]
+              + 4 * pri_b["HR"])
+    out["mx_pitch_around"] = ((out["b_HR_rate"] - pri_b["HR"])
+                              * (out["od_slg"] - lg_slg))
 
     # ---- park x handedness HR factor (porch asymmetry)
     phh = stores["park_hand"]
@@ -3171,6 +3329,7 @@ def main():
         build_consistency_panels()
         build_il_table()
         build_bat_tracking_table()
+        build_bat_track_panel()
         build_pull_table()
         build_hrpt_tables()
         build_bat_sched_panel()
