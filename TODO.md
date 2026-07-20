@@ -1,141 +1,164 @@
-# Improvement Queue (running to-do list)
+# Open Items
 
-Triage of the 2026-07-20 ChatGPT repo review, reconciled against what's already built,
-already queued (Wave 2), or already rejected with evidence. Check items off as they land.
+Trimmed 2026-07-20 after the pen wave shipped (B3/B4/B5/B6/B11 + A1/A4/B1 before it — evidence
+and verdicts live in Logs/*_2026-07-20.log and git history of this file).
 
-**Evaluation regime (changed 2026-07-20, user decision):** the freeze/forward-test system is
-RETIRED — too much ceremony, and market-beating proof is not a goal. forwardtest.py DELETED
-2026-07-20 (recoverable from git history); the prereg window `prereg_2026-07-21_2026-08-17` is
-moot and its freeze doc in artifacts/prereg/ is just a historical record.
-**Standing regime: `Model/walkforward.py`** — rolling-origin walk-forward (train ≤Y−2,
-calibrate Y−1, evaluate Y, folds 2022–2026), the production training scheme rolled backward.
-Ship-a-change discipline: paired replay A/B (`evaluate --ab`) + `pytest` green BEFORE a change
-serves; rerun walkforward.py after material model changes. Consequence: Model/*.py edits are no
-longer gated on refreeze milestones — Section B items need only the offline validation above.
+**Ship discipline:** paired replay A/B (`evaluate --ab`) + `pytest` green before a change
+serves; `Model/walkforward.py` (rolling-origin folds 2022–2026) after material changes to the
+trained models. Env gates `PEN_WAVE3` / `PEN_CHOICE` in predict.py reproduce pre-wave behavior
+("0") for future paired A/Bs.
 
----
+## Watch
 
-## A. Freeze-safe — can start any time (no frozen-file edits)
+- [ ] **`per` (starter ER) family lean under PEN_CHOICE** — −0.00046, raw p=.016, BH-tie in both
+  A/B windows; plausibly inherited-runner ER attribution interacting with spread reliever
+  quality. Check it in the next paired A/B; investigate only if it persists.
 
-- [X] **A1. Simulation invariant + parity test suite** (ChatGPT #12) — **DONE 2026-07-20**: `Tests/`
-  (31 tests: 28 fast synthetic + 3 slow golden vs real artifacts, `pytest` / `pytest -m slow`).
-  Ledger conservation identities (the walk-off-bug regression net), season rules (7-inn DH, ghost
-  runner, walk-off legality), pen exhaustion/platoon-jump/rotation, steal accounting,
-  classic-vs-batch CPU AND GPU distribution parity, prepare_games row parity, reproducibility.
-  Suite immediately caught the BatchPrep game0-latent landmine (see B11) — pinned in
-  `test_batch_latent_comes_from_game0`.
+## Blocked (future unblock dates)
 
-- ~~**A2. Serve-time archive wrapper**~~ — built 2026-07-20 (Tools/6), then **RETIRED same day by
-  user decision** along with the freeze apparatus (stashed in session scratchpad). One archive of
-  2026-07-19 exists in `Data/serve_archive/`. If lineup-uncertainty quantification (C2) is ever
-  wanted, this comes back — it was the data-collection half of that item.
-- ~~**A3. Calibration diagnostics report**~~ — built 2026-07-20 (Tools/7), findings recorded, then
-  **RETIRED same day by user decision** (stashed in session scratchpad). Findings stand: NO
-  credible subgroup calibration drift (cluster-robust z by GamePk — independence z's were ~3x
-  inflated; worst cell bk@Fenway z=−3.3, ~chance across 214 cells); b1 has 17% of rows within
-  2 MC-SE of coin flip at 4k replay sims (supports 20k serve sims).
+- [ ] **B2. Forecast-error weather sampling** — sample temp/wind per sim from the historical
+  forecast-error distribution. Blocked: `forecast_error.json` has n=46, `sufficient: false`
+  (checked 2026-07-20). Fold in the roof-open/closed Condition flag when this runs.
+- [ ] **C2. Lineup-uncertainty quantification** — probability-weighted lineup distribution before
+  confirmation. Blocked on slate-archive accrual, **revisit ~late Aug 2026**. The retired Tools/6
+  archive wrapper was the data-collection half — bring it back if this runs.
 
-- [X] **A4. Cross-fitted calibration audit** (ChatGPT #2, audit half) — **DONE 2026-07-20**
-  (Logs/audit_cf_2026-07-20.log, artifacts/audit_cf/report_audit_cf.json). Scoping finding:
-  SERVE_CAL_YEAR=2025 → serving tree trains Season<=2024, so the calib window was NEVER in the
-  model weights — ChatGPT's premise mostly moot by design. Audit (arm B: a1/a2 retrained on
-  pa<=2025-04-30, swap-replay with SHA-verified restore): per-family Platt shifts max |Δp|
-  .004–.026, BUT arm B's scalers anchored on ~1 month of April games → the shifts are an upper
-  bound dominated by small-sample/seasonal scaler noise (systematic intercept pattern = April run
-  environment). **Verdict: no evidence of material calibrator dishonesty; served p carries
-  ~±0.01–0.02 systematic uncertainty from calibration-slice choice. B9 dropped.**
+## Annual retune slot only (do not do mid-season)
 
-## B. Wave 3 candidates — need Model edits
+- [ ] **B7. Per-component Optuna + library bake-off** — separate studies for T1/T3/A2/hazard/SB
+  plus a one-time XGB vs LightGBM/CatBoost/regularized-linear comparison. Wave 1 found a flat
+  plateau (+0.0006); low expected value.
+- [ ] **B8. Multi-fold hyperparam scoring** — when B7 runs, score on aggregate out-of-fold log
+  loss across chronological folds (…→2021 … …→2024) instead of the single 2024 design year.
 
-- [X] **B1. Moist-air density** (ChatGPT #7) — **RESOLVED BY EVIDENCE 2026-07-20, dropped from
-  Wave 3** (Logs/density_study_2026-07-20.log, 27,121 games). ChatGPT's premise was wrong twice:
-  (1) scraped Pressure is already Open-Meteo `surface_pressure` (station-level, elevation
-  embedded — no estimation needed); (2) the humidity correction the P/T proxy misses averages
-  −0.65% (worst −2.0%) vs an 18.4% venue density spread already captured; spearman(proxy, moist)
-  = 0.9972; humidity is ALSO a standalone A1 feature so XGB can learn the residual directly.
-  Surviving sliver: **roof-open/closed state flag** (Condition string exists) — fold into B2's
-  weather work if it ever runs.
-- [ ] **B2. Forecast-error weather sampling** (ChatGPT #7b) — once forecast_error.json matures, sample
-  temp/wind per sim from the historical forecast-error distribution instead of one fixed forecast.
-  Pairs with the Wave 2 lineup-uncertainty item (same "input uncertainty" machinery).
-  *Checked 2026-07-20: still blocked — store has n=46, self-reports `sufficient: false`.*
-- [x] **B3. Continuous pen fatigue** (ChatGPT #5a) — **IMPLEMENTED 2026-07-20** (A/B pending, see
-  below). Study (Logs/pen_fatigue_study_2026-07-20.log, 834k relief PAs, within-pitcher offsets):
-  in the serving-relevant region (np1<25, no back-to-back — the arms availability doesn't already
-  exclude) only BB is real (+0.040 log-odds per 20 NP yesterday, z=+3.7); K is NULL (its decay
-  lives in the 25+/b2b arms `_pen_for` excludes); HR +0.016 ns. Shipped: `pen_fatigue.json` store
-  (features.py build_pen_fatigue, refit each build; only |z|>=2 classes apply), avec class-odds
-  offsets at prep (`_apply_pen_fatigue`), and graded fresh/mid(10+)/heavy(20+ or b2b) demotion
-  tiers replacing the binary TIRED_NP sort key. **A/B VERDICT (pooled 2,975 games, 223 slates,
-  2025-06..09 + 2026-04..07, Logs/pen_wave_ab_verdicts_2026-07-20.log): dead tie with B4
-  (ALL −0.00004, CI [−0.00011, +0.00003], every family TIE) — no harm, realism kept. SHIPPED
-  (PEN_WAVE3 default on).**
-- [x] **B4. Reliever stint length conditioning** (ChatGPT #5c) — **IMPLEMENTED 2026-07-20** (A/B
-  pending). Study (Logs/pen_exit_study_2026-07-20.log): huge pitcher heterogeneity (5th-95th pct
-  mean stint outs 2.6→5.4); trailing-365d per-pitcher hazard blended with M=12 league
-  pseudo-stints (holdout-tuned) beats league-only by 5.2% rel. on held-out per-break exit log
-  loss. Shipped: relief_exit is now per-pitcher [n_players, 11] (predict `_pitcher_exit_table`;
-  sim/sim_batch accept 1-D legacy or 2-D), pinned by test_parity::test_per_pitcher_exit_tables.
-  Game-state (entry-margin) conditioning measured SMALL (±0.13 log-odds at k=3) and mostly
-  pitcher-identity confounded (mop-up long men enter blowouts) — absorbed by per-pitcher tables,
-  intentionally not double-counted. **A/B VERDICT: shipped with B3 (see above — pooled tie, no
-  harm; component-level exit prediction is the win).**
-- [x] **B5. Opener / bulk / tandem / short-rest detection** (ChatGPT #5d) — **RESOLVED 2026-07-20:
-  already covered, no new code.** Verified the served hazard artifact conditions on gap_days
-  (short rest), ramp (low prev NP), prev_short (opener-length last start), il_ret30, outs_sd —
-  the starter-exit side of all four patterns. The pen side (bulk/tandem length) is B4's
-  per-pitcher stints; entry of the long man after an early exit falls out of the lo-leverage
-  order, which sorts by avg-outs merit. ChatGPT's premise (league-wide exit + no usage features)
-  was stale.
-- [x] **B6. Probabilistic manager reliever choice** (ChatGPT #5b) — **RESEARCHED + IMPLEMENTED
-  2026-07-20** (ship gate = A/B win, pending). Study (Logs/pen_choice_study_2026-07-20.log, 7,954
-  first-reliever entries 2024-25): the deterministic rank-1 pick matches the actual first arm in
-  only 13.6% (uniform baseline 12.7%) — manager entry choice is near-flat over our order
-  (pmf 13.6/16.8/17.2/15.5/13.8/10.2/7.5/5.5%). Shipped: `pen_choice.json` store (empirical hi/lo
-  rank pmfs, features.py build_pen_choice), sim/sim_batch `pen_rank_cum` — entry rank sampled per
-  sim from the pmf over still-available arms (subsumes the platoon jump, which only applies in
-  the legacy deterministic path). Pinned by test_parity::test_pen_rank_pmf_pick.
-  **A/B VERDICT — WIN, SHIPPED (PEN_CHOICE default on). Pooled B1-vs-B2 (2,975 games, 223
-  slates): batter-K family B BETTER after BH (+0.00022, CI [+0.00010, +0.00032], p_bh=0.000 —
-  exactly where reliever-identity spread should land) and aggregate CI-positive (+0.00009,
-  CI [+0.00001, +0.00018]). The 2025-only window alone was a lean-positive TIE; 2026 pooling
-  resolved it. WATCH: `per` (starter ER) shows a persistent negative lean (−0.00046, raw p=.016,
-  BH-tie both windows) — plausibly inherited-runner ER attribution interacting with spread
-  reliever quality; revisit if it survives the next A/B.**
-- [ ] **B7. Per-component Optuna + library bake-off** (ChatGPT #3) — at the ANNUAL retune slot only
-  (Wave 1 found a flat plateau, +0.0006 — retunes are annual by policy): separate studies for
-  T1 / T3 / A2 / hazard / SB, and a one-time XGB vs LightGBM/CatBoost/regularized-linear
-  comparison on the design split. Low expected value; do not do mid-season.
-- [ ] **B8. Multi-fold walk-forward for annual retunes** (ChatGPT #2, tuning half) — when B7 runs,
-  score hyperparams on aggregate out-of-fold log loss across chronological folds
-  (…→2021, …→2022, …→2023, …→2024) instead of the single 2024 design year.
-- [ ] **B10. Bench/PH realism** (ChatGPT #6, partial) — actual bench players + platoon-dependent PH
-  selection instead of the generic bench batter after starter exit. Previously deprioritized as
-  negligible EV; revisit only with evidence from A3 diagnostics (late-game prop residuals).
-- [x] **B11. BatchPrep per-game latent** (found by A1 suite 2026-07-20) — **FIXED 2026-07-20**:
-  BatchPrep now stacks per-game latent params (`bp.lat`, indexed by gidx at draw time) instead of
-  broadcasting preps[0].latent. Pinned test flipped to the positive
-  `test_parity.py::test_batch_latent_is_per_game` (mixed-latent batch matches per-game classic).
-  Full suite green (28 fast + 3 golden). No distributional change under the shared-latent
-  production contract — replay A/B not required.
+## Wave 4 — goal-aligned (top-of-sort) improvements (queued 2026-07-20)
 
-## C. Already queued (Wave 2 — unchanged, do not duplicate)
+**Goal metric (user-defined):** sort each workbook column high→low — most of the top 10 should
+hit; cells >50% should hit at their stated rate, monotone the higher they go. Baseline
+diagnostic on the 76-slate replay (2025-05-01..07-15, calibrators applied, heads NOT applied;
+script: session scratchpad `goal_diag.py`): **>50% reliability already tight and monotone**
+(every pooled batter band within ±0.01); **top-10/slate is honest** (most batter columns hit at
+or above stated: 2+ Hits +3.4pts, Single +3.5, H+R+RBI 2+ +4.2). Binding constraint =
+**discrimination** (batter AUCs .56–.70: Double .560, Single .566, Hit .581, HR .638). Sore
+spots: pout high lines (Outs>18.5 stated .559 hit .441 pre-heads; Outs>15.5 top-10 −6.5pts),
+batter BB >50% runs hot (n=203), **Triple never gets replay rows → b3 serves uncalibrated**.
+Old-project mining (sanctioned 2026-07-20): `feature_keep.json` survival evidence backs the
+transplants below; line refs are into `Desktop\MLB\Model\features.py` unless noted.
 
-- [ ] **C1. State-space / dynamic latent skill** (ChatGPT #4) — Kalman-ish posterior mean+variance as
-  A1 inputs; posterior *sampling* in the sim is the ChatGPT addition — fold into the same
-  experiment. Bar: beat design-eval AND replay. Honest prior: EB + multi-horizon + velo/xw + age
-  already approximates it.
-- [ ] **C2. Lineup-uncertainty quantification** (ChatGPT #1/#6) — probability-weighted lineup
-  distribution before confirmation. BLOCKED on slate-archive accrual (~late Aug 2026); A2 above
-  feeds this directly.
+### W4-A. Measurement first — DONE 2026-07-20
 
-## D. Deferred research (no commitment; evidence required to promote)
+- [x] **W4.1** DONE. `evaluate.goal_metrics` / `evaluate.reliability_bands` (single shared
+  implementation): per-market top-10/slate stated-vs-hit, >50% region, and bootstrap-LCB
+  trust depth (odds-ratio-lift 10th-pct LCB ≥ 1.5). Surfaced in Tools/5 (new "Goal Board" +
+  "Reliability" sheets + console ladder; ledger load refactored into `_load_ledger`) and as a
+  ranking-only section at the end of `evaluate --ab` (raw p is order-identical to served p —
+  monotone family calibrators). Validated on the real prewave-vs-current A/B.
+- [x] **W4.2** DONE. Triple added to `BAT_ACTUAL` — b3 rows flow into the next replay; the b3
+  calibrator fits at the next `--fit-calibrators` (pairs with W4.16).
+- [x] **W4.3** DONE. Heads-applied verdict (scratchpad `w43_heads_check.py`): the pout head
+  NARROWS but does not fix the high-line miscalibration — Outs>18.5 >50%-region gap −13.2 →
+  −10.4 pts on the honest holdout (−11.8 → −4.3 full-window/part-in-sample), Outs>15.5 stays
+  ≈ −6.7 pts. **W4.12 confirmed necessary.** pbb's head fully repairs its family (BB>1.5
+  top-10 gap → +1.0 pt holdout); tot heads fine. pytest 30/30 green.
 
-- [ ] **D1. Latent correlation moments** (ChatGPT #9) — add teammate/opponent/prop correlation and
-  tail moments as *diagnostics* to moment_match at n=300+. Main payoff was SGP joint accuracy and
-  SGP was deleted by user decision — promote only if SGP returns or totals-tail residuals justify.
-- [ ] **D2. Port moment_match to sim_batch** — ~8 min/eval per-game engine is the refit bottleneck;
-  do this if latent refit cadence increases.
-- [ ] **D3. Learned advancement-transition model** (ChatGPT #11) — pattern table + speed/arm/DP tilts
-  stay primary; a learned model conditioned on identities/spray/park is heavy for likely-small
-  gain. Keep pattern table as fallback/baseline if ever attempted.
+### W4-B. A1 discrimination, batter-first (features → retrain → paired A/B + walkforward)
+
+- [ ] **W4.4** `mix_*` outcome log5 products (batter rate × starter-allowed rate: k/bb/hr/hit/
+  gb/ld/pullair + contact-quality air/brl/xwcon; old `3102-3113`). Near-universal keep-list
+  survivors; complementary to the arsenal collisions (those are pitch-level, these outcome-level).
+- [ ] **W4.5** On-deck protection as per-PA A1 features: `ctx_behind_slg/obp` (+ decayed) and
+  the `pitch_around` interaction (old `3855-3927`, `3196-3199`). This is a genuine per-PA causal
+  channel the sim CANNOT emerge — A1 never sees who's on deck; affects BB/HR-avoidance.
+- [ ] **W4.6** Current-season decayed bat-tracking panels + deltas (bt_ features are prior-season
+  only today; scraper already pulls current data). Bat speed is the leading batter-power indicator.
+- [ ] **W4.7** Ump × pitcher products: `ump_k_x_pk`, `ump_bb_x_pbb`, `ump_k_x_take` (old
+  `2999-3002`, `3171-3195`; kept on ~15 heads). A1 has both terms separately; trees can't multiply.
+- [ ] **W4.8** Starter venue splits `pvloc_*` (as-of home/road K/HR/ERA per BF, EB-shrunk; old
+  `2241-2248`) — batter side exists (`bl_`), pitcher side doesn't.
+- [ ] **W4.9** Per-pitcher TTO-decay skill (shrunk 3rd-vs-1st-pass degradation; old `1775-1779`).
+  A1 has raw tto; this adds the per-pitcher susceptibility.
+- [ ] **W4.10** `park_x_2b` / `park_x_3b` products (old `3118-3119`, `3158-3161`) — Double is the
+  weakest column (AUC .560) and park geometry for 2B/3B isn't carried today.
+- [ ] **W4.11** BvP shrunk residuals (`bvp_xwoba_resid` K=30, `bvp_hr_resid` K=50, `bvp_n`; old
+  `1738-1772`) — design-eval judged. The "no BvP micro-samples" rule targeted raw rates; the
+  residual-off-own-baseline encoding is the disciplined form and survived selection.
+
+### W4-C. Calibration polish
+
+- [ ] **W4.12** Line-aware pitcher-ladder calibration (per-line offsets + PAV ladder projection),
+  pout first — one shared Platt per family cannot fix a single hot rung (Outs>18.5). Optionally
+  AUTO_CAL-style CV selection Platt-vs-Beta per family (`BetaCal`, old `275-336`; isotonic
+  remains forbidden).
+- [ ] **W4.13** Batter-grain head context: threshold-share histories (`c/s/d_{hrr2,hrr3,hrr4, rbi2,run2}_g_sh`, EB K=40; old `2205-2225`) into the hrr/rbi/r family heads — captures
+  batter-specific within-game clustering the sim's generic correlation misses. Early-stop
+  referees whether it's real.
+
+### W4-D. Bigger swings (evidence-gated)
+
+- [ ] **W4.14** Ensemble pull-forward from B7 (just the bake-off half, not the retune): LightGBM
+  and/or CatBoost T1/T3 alongside XGB, average calibrated logits. Ensembling is the most reliable
+  pure-AUC lever; user's goal is discrimination-bound.
+- [ ] **W4.15** Serve sims 20k→50–100k by routing GUI/headless serve through the sim_batch GPU
+  path — stabilizes top-of-sort ordering (MC-SE shrinks ~2x) at similar wall time.
+
+### W4-E. Second-pass additions (adversarial "what am I not seeing" sweep, 2026-07-20)
+
+- [x] **W4.16** DONE 2026-07-20. Ledger now 1.71M rows / 3,920 games / 298 slates (regular-season
+  2025 + 2026-to-date; 2025 postseason excluded by date window). 20 calibrators refit (slopes
+  .87–1.03; biggest level fixes pbb −0.32, b3 −0.22, pout −0.21, sb −0.20); **b3/Triple
+  calibrated for the first time** (Tools/5 FAMILY_NAMES gained b3); heads retrained — pout head
+  doubled to +0.0044 held-out, **ml head active for the first time** (n=3,920 clears the floor),
+  pbb head collapsed to identity (the fresh calibrator absorbs it — correct division of labor).
+  Serve smoke PASS (15 games); smoke workbook deleted. Baseline snapshot:
+  `artifacts/pre_w416_2026-07-20/`. Post-refresh cross-fit goal board: batter top-10 gaps now
+  −0.8..+1.3 pts (HR +0.8, Single +1.3), trust depth 15 almost everywhere — EXCEPT Double
+  (depth 1, AUC .553 → W4.10) and pout (Outs>15.5 −5.6, >18.5 −9.7 → W4.12). **Refresh
+  cadence (policy): rerun at every wave boundary + ~monthly in-season** (script pattern:
+  snapshot → `replay_rows_batch` 2025 window + 2026-to-date → concat → `write_artifact`
+  calib_rows → `fit_calibrators --reuse-rows` → `heads --train`; ~45 min GPU). WATCH: pooled
+  batter bands 0.80–0.90 run ~1–2 pts hot (n≈1,800) — recheck after W4-B.
+- [ ] **W4.17** Time-decay sample weights in A1 training (2015 PAs should not weigh like 2025
+  PAs; era features capture regime, not relevance) + tune panel HALF-LIVES per stat family on
+  design-eval (90d is a hand-set constant everywhere; K-skill and BABIP-luck decay differently).
+- [ ] **W4.18** Seed-bagged A1 (train T1/T3 at 3-5 seeds, average probabilities) — cheap variance
+  reduction, reliably +AUC at the top of the sort where ordering is tightest. Subsumed by W4.14
+  if the multi-library ensemble ships; do whichever lands first.
+- [ ] **W4.19** Confirmed-lineup re-serve habit + measurement: workbooks served off projected
+  lineups carry avoidable error in every batter column; grade projected-vs-confirmed serves
+  separately (npz product tags already exist) and, on days you can, re-serve once lineups
+  confirm. Process, not code (C2 automates the quantification later).
+- [ ] **W4.20** Roof-state flag (the B1 survivor — open/closed Condition into park/weather
+  features) + verify per-batter platoon-split SKILL panels exist (platoon matchup features are
+  in; per-batter EB-shrunk split skill may not be).
+- [ ] **W4.21 (research)** Within-slate ranking overlay: a LambdaRank-style reranker (or simple
+  isotonic-in-rank blend) trained on within-column ordering only, used to BREAK TIES in display
+  order without touching served probabilities — the goal metric is literally a ranking metric,
+  and nothing in the stack optimizes ranking directly. Evidence-gated; skip if W4-B lifts AUC
+  enough.
+- [ ] **W4.22 (user decision required)** Market-informed serving: the scraped odds are the
+  strongest public predictor in existence and are currently grading-only BY DESIGN (CLV
+  integrity). A dual-output mode — pure-model probabilities for the gate/CLV ledger, an
+  odds-blended column (e.g. logit-average with de-vigged close) for the WORKBOOK — would
+  measurably raise green-cell rates, at the cost of the workbook no longer being "the model's
+  opinion." Philosophy call, not a technical one; do not implement without explicit user choice.
+
+**Rejected on architecture (do NOT transplant):** `xpa_x_*` exposure products, runners-ahead
+RBI-chance ctx, SB opportunity chain — the sim generates exposure/lineup/SB-opportunity
+structure natively; the old game-grain heads needed them, A1+sim does not. **Expectation
+setting:** for low-base columns the top-10 ceiling is bounded by reality (best HR spots ~.28–.32
+true p) — "most of top 10 hitting" is reachable on Hit/K/H+R+RBI 2+/Single/2+ TB, not on
+HR/SB/2+ Runs; there the goal is raising top-10 hit rate toward its ceiling.
+
+## Evidence-gated / deferred research
+
+- [ ] **B10. Bench/PH realism** — actual bench players + platoon-dependent PH selection. Revisit
+  only with evidence of late-game prop residuals.
+- [ ] **C1. State-space / dynamic latent skill** — Kalman-ish posterior mean+variance as A1
+  inputs + posterior sampling in the sim. Bar: beat design-eval AND replay. Honest prior: EB +
+  multi-horizon + velo/xw + age already approximates it.
+- [ ] **D1. Latent correlation moments** — teammate/opponent/prop correlation diagnostics in
+  moment_match at n=300+. Promote only if SGP returns or totals-tail residuals justify.
+- [ ] **D2. Port moment_match to sim_batch** — do if latent refit cadence increases (~8 min/eval
+  per-game engine is the bottleneck).
+- [ ] **D3. Learned advancement-transition model** — pattern table + tilts stay primary; heavy
+  for likely-small gain.

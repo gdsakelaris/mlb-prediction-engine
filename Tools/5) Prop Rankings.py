@@ -85,6 +85,7 @@ FAMILY_NAMES = {
     "bb":   "Batter BB",
     "b1":   "Batter Single",
     "b2":   "Batter Double",
+    "b3":   "Batter Triple",
     "h":    "Batter Hits > x",
     "r":    "Batter Runs > x",
     "rbi":  "Batter RBI > x",
@@ -542,12 +543,25 @@ def _provenance():
 
 
 # ------------------------------------------------------------ build table
-def build_table(boot=BOOT_B):
+def _load_ledger():
+    """calib_rows + day-block cross-fit family Platt p_cal — the honest
+    out-of-sample view of the served calibration (the live joblib would
+    be graded on its own fit rows here)."""
     rows_p = ART / "calib_rows.parquet"
     if not rows_p.exists():
         raise SystemExit("calib_rows.parquet missing — run a replay "
                          "(evaluate.py --fit-calibrators) first")
     df = pd.read_parquet(rows_p)
+    parts = []
+    for _, fam_df in df.groupby("family", sort=False):
+        fam_df = fam_df.copy()
+        fam_df["p_cal"] = _crossfit_pcal(fam_df)
+        parts.append(fam_df)
+    return pd.concat(parts, ignore_index=True)
+
+
+def build_table(boot=BOOT_B, rows=None):
+    df = rows if rows is not None else _load_ledger()
     # served = family Platt + residual head; the board grades the Platt
     # stage (cross-fit), so surface each active head's held-out gain as
     # display context — positive means serving beats the board's view
@@ -562,14 +576,6 @@ def build_table(boot=BOOT_B):
                 and np.isfinite(getattr(r, "gain", np.nan))}
         except Exception:                               # noqa: BLE001
             pass
-    # p_cal = day-block cross-fit family Platt (honest out-of-sample view
-    # of the served calibration; the live joblib would be in-sample here)
-    parts = []
-    for _, fam_df in df.groupby("family", sort=False):
-        fam_df = fam_df.copy()
-        fam_df["p_cal"] = _crossfit_pcal(fam_df)
-        parts.append(fam_df)
-    df = pd.concat(parts, ignore_index=True)
 
     gate = {}
     gp = ART / "gate_rows_cache.parquet"
@@ -649,6 +655,62 @@ def build_table(boot=BOOT_B):
             "Notes": play_note(m),
         })
     return _rank_and_tier(pd.DataFrame(rows))
+
+
+# ------------------------------------------------------------ goal board
+
+BATTER_FAMS = {"hr", "h", "tb", "r", "rbi", "bb", "sb",
+               "b1", "b2", "b3", "hrr", "bk"}
+PITCHER_FAMS = {"pk", "pout", "pha", "pbb", "per"}
+
+
+def build_goal_board(rows):
+    """The workbook-sort test, one row per market/column, plus the >50%
+    reliability ladders — metric implementations live in
+    Model/evaluate.py (shared with the --ab readout)."""
+    import sys
+    sys.path.insert(0, str(ROOT / "Model"))
+    import evaluate as E
+    led = rows[["Date", "market", "family", "p_cal", "y"]].rename(
+        columns={"p_cal": "p"})
+    board = E.goal_metrics(led)
+    fam_of = rows.drop_duplicates("market").set_index("market")["family"]
+    board.insert(1, "family", board["market"].map(fam_of))
+    fam_rank = {f: i for i, f in enumerate(FAMILY_NAMES)}
+    board = board.sort_values(
+        ["family", "base"], ascending=[True, False],
+        key=lambda s: s.map(fam_rank) if s.name == "family" else s)
+    disp = pd.DataFrame({
+        "Market": board["market"], "Family": board["family"],
+        "N": board["n"], "Base%": (100 * board["base"]).round(1),
+        "AUC": board["auc"].round(3),
+        "Top10 Stated%": (100 * board["t10_stated"]).round(1),
+        "Top10 Hit%": (100 * board["t10_hit"]).round(1),
+        "Top10 Gap": (100 * board["t10_gap"]).round(1),
+        "Trust Depth": board["trust_depth"],
+        ">50% N": board["hi_n"],
+        ">50% Stated%": (100 * board["hi_stated"]).round(1),
+        ">50% Hit%": (100 * board["hi_hit"]).round(1),
+        ">50% Gap": (100 * board["hi_gap"]).round(1),
+    })
+    bands = []
+    for scope, fams in (("Batter", BATTER_FAMS),
+                        ("Pitcher", PITCHER_FAMS),
+                        ("Game", {"tot", "tt", "ml"})):
+        b = E.reliability_bands(led[led["family"].isin(fams)])
+        if len(b):
+            b.insert(0, "Scope", scope)
+            bands.append(b)
+    if not bands:
+        return disp, pd.DataFrame()
+    bands = pd.concat(bands, ignore_index=True)
+    bands = pd.DataFrame({
+        "Scope": bands["Scope"], "Band": bands["band"],
+        "N": bands["n"],
+        "Stated%": (100 * bands["stated"]).round(1),
+        "Hit%": (100 * bands["hit"]).round(1),
+        "Gap": (100 * bands["gap"]).round(1)})
+    return disp, bands
 
 
 # ------------------------------------------------------------- sort order
@@ -843,6 +905,21 @@ LEGEND = [
      "prices), selection power (follow the list deep / top 3-10 only / "
      "no selection power, gated on the odds-ratio lift), and shading "
      "direction from the calibration slope."),
+    ("Goal Board (sheet)", "The workbook-sort test, one row per served "
+     "column: sort a column high-to-low — Top10 Stated%/Hit% = the mean "
+     "stated probability and the actual hit rate of each slate's top-10 "
+     "cells (positive Gap = the top of the sort beats its own stated "
+     "number); the >50% columns are the same read on every cell above "
+     "50%. Trust Depth = deepest per-slate top-d whose odds-ratio lift "
+     "over the base rate keeps its slate-block-bootstrap 10th-percentile "
+     "lower bound above 1.5 — how far down the sorted column selection "
+     "power is PROVEN (0 = not even the top pick separates from a blind "
+     "bet at this sample). All on day-block cross-fit calibrated p."),
+    ("Reliability (sheet)", "Pooled stated-vs-hit ladder in 5-point "
+     "bands above 50%, by scope (Batter / Pitcher / Game markets): the "
+     "'cells above 50% should hit at their number, and more often the "
+     "higher they go' check. Gap = Hit% - Stated%, in probability "
+     "points (positive = reality beat the stated number)."),
     ("Data provenance", "Filled at write time — the ledger window this "
      "board was built from, when it was replayed, and whether the "
      "engine has retrained since (during a frozen forward-test window "
@@ -862,9 +939,10 @@ _ND = [("Score", 0), ("Score_lo", 0), ("N", 0),
        ("HeadGain", 4)]
 
 
-def save_excel(df, path, provenance=None):
-    """Rankings + Legend, serve-workbook styling (navy header, centered,
-    thin borders, frozen header, filter arrows)."""
+def save_excel(df, path, provenance=None, goal=None, bands=None):
+    """Rankings + Goal Board + Reliability + Legend, serve-workbook
+    styling (navy header, centered, thin borders, frozen header,
+    filter arrows)."""
     import openpyxl
     from openpyxl.styles import (Alignment, Border, Font, PatternFill,
                                  Side)
@@ -878,6 +956,10 @@ def save_excel(df, path, provenance=None):
                else m) for t, m in LEGEND]
     with pd.ExcelWriter(path, engine="openpyxl") as xw:
         xl.to_excel(xw, sheet_name="Rankings", index=False)
+        if goal is not None and len(goal):
+            goal.to_excel(xw, sheet_name="Goal Board", index=False)
+        if bands is not None and len(bands):
+            bands.to_excel(xw, sheet_name="Reliability", index=False)
         pd.DataFrame(legend, columns=["Term", "Meaning"]).to_excel(
             xw, sheet_name="Legend", index=False)
 
@@ -890,30 +972,39 @@ def save_excel(df, path, provenance=None):
     head_fill = PatternFill("solid", fgColor=NAVY)
     white_bold = Font(color="FFFFFFFF", bold=True)
 
-    ws = wb["Rankings"]
-    widths = [len(str(c)) for c in COLS]
-    for j in range(1, ws.max_column + 1):
-        cell = ws.cell(row=1, column=j)
-        cell.fill = head_fill
-        cell.font = white_bold
-        cell.border = box
-        cell.alignment = center
-    for i in range(2, ws.max_row + 1):
+    def _grid(name, cols):
+        if name not in wb.sheetnames:
+            return
+        ws = wb[name]
+        widths = [len(str(c)) for c in cols]
         for j in range(1, ws.max_column + 1):
-            cell = ws.cell(row=i, column=j)
+            cell = ws.cell(row=1, column=j)
+            cell.fill = head_fill
+            cell.font = white_bold
             cell.border = box
-            cell.alignment = (left_nowrap if COLS[j - 1] == "Notes"
-                              else center)
-            v = cell.value
-            widths[j - 1] = max(widths[j - 1],
-                                len("" if v is None else str(v)))
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = (f"A1:{get_column_letter(ws.max_column)}"
-                          f"{ws.max_row}")
-    for j in range(1, ws.max_column + 1):
-        cap = 80 if COLS[j - 1] == "Notes" else 22
-        ws.column_dimensions[get_column_letter(j)].width = \
-            min(widths[j - 1] + 4, cap)
+            cell.alignment = center
+        for i in range(2, ws.max_row + 1):
+            for j in range(1, ws.max_column + 1):
+                cell = ws.cell(row=i, column=j)
+                cell.border = box
+                cell.alignment = (left_nowrap
+                                  if cols[j - 1] == "Notes" else center)
+                v = cell.value
+                widths[j - 1] = max(widths[j - 1],
+                                    len("" if v is None else str(v)))
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = (f"A1:{get_column_letter(ws.max_column)}"
+                              f"{ws.max_row}")
+        for j in range(1, ws.max_column + 1):
+            cap = 80 if cols[j - 1] == "Notes" else 22
+            ws.column_dimensions[get_column_letter(j)].width = \
+                min(widths[j - 1] + 4, cap)
+
+    _grid("Rankings", COLS)
+    if goal is not None and len(goal):
+        _grid("Goal Board", list(goal.columns))
+    if bands is not None and len(bands):
+        _grid("Reliability", list(bands.columns))
 
     lg = wb["Legend"]
     for j in (1, 2):
@@ -967,7 +1058,9 @@ def main():
                          "board lives in the workbook)")
     args = ap.parse_args()
 
-    df = build_table(boot=args.boot)
+    rows = _load_ledger()
+    df = build_table(boot=args.boot, rows=rows)
+    goal, bands = build_goal_board(rows)
 
     if args.verbose:
         print("\n=== Prediction-family quality rankings — full-season "
@@ -1034,16 +1127,33 @@ def main():
               "haircut yet.")
         print()
 
+    if args.verbose and len(goal):
+        print("\n=== Goal Board — the workbook-sort test per served "
+              "column (cross-fit calibrated p; Trust Depth = proven "
+              "sorted-list depth, bootstrap-LCB odds-ratio gate) ===\n")
+        with pd.option_context("display.width", 220,
+                               "display.max_rows", 200):
+            print(goal.to_string(index=False))
+
     prov = _provenance()
-    save_excel(df, Path(args.out), provenance=prov)
+    save_excel(df, Path(args.out), provenance=prov, goal=goal,
+               bands=bands)
     counts = df["Tier"].value_counts().to_dict()
     tiers = " | ".join(f"{t} {counts.get(t, 0)}"
                        for _, t in PROB_TIER_CUTS if counts.get(t, 0))
     print(f"Prop rankings (Score v5): {len(df)} families scored, "
           f"{int(df['N'].sum()):,} graded rows")
     print(f"  tiers: {tiers}")
+    bb = bands[bands["Scope"] == "Batter"] if len(bands) else bands
+    if len(bb):
+        print("  >50% reliability, batter pooled (stated -> hit):")
+        for _, r in bb.iterrows():
+            print(f"    {r['Band']} n={int(r['N']):6d} "
+                  f"{r['Stated%']:5.1f}% -> {r['Hit%']:5.1f}%  "
+                  f"gap {r['Gap']:+.1f}")
     print(f"  {prov}")
-    print(f"  written to {args.out}  (-v for the full table)")
+    print(f"  written to {args.out}  (Rankings | Goal Board | "
+          f"Reliability | Legend; -v for the full tables)")
 
 
 if __name__ == "__main__":

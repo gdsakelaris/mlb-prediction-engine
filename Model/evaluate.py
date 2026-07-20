@@ -69,6 +69,7 @@ BAT_ACTUAL = {
     "3+ K": lambda r: r.SO >= 3,
     "Single": lambda r: (r.H - r["2B"] - r["3B"] - r.HR) >= 1,
     "Double": lambda r: r["2B"] >= 1,
+    "Triple": lambda r: r["3B"] >= 1,
     "H+R+RBI 2+": lambda r: (r.H + r.R + r.RBI) >= 2,
     "H+R+RBI 3+": lambda r: (r.H + r.R + r.RBI) >= 3,
     "H+R+RBI 4+": lambda r: (r.H + r.R + r.RBI) >= 4,
@@ -547,7 +548,120 @@ def ab_compare(path_a, path_b, start=None, end=None, boot=500,
     print("\nper market (point deltas only, no test):")
     print(mk.sort_values("delta", ascending=False)
           .to_string(index=False))
+
+    # Goal board: ranking-only comparison on raw p — the family
+    # calibrators are monotone, so within-market sort order on raw p IS
+    # the served sort order; stated levels are a calibration question
+    # and are not compared here.
+    ga = goal_metrics(m[["Date", "market"]].assign(p=pa, y=y))
+    gb_ = goal_metrics(m[["Date", "market"]].assign(p=pb, y=y))
+    gsec = ga.merge(gb_, on="market", suffixes=("_a", "_b"))
+    gsec["d_auc"] = (gsec.auc_b - gsec.auc_a).round(4)
+    gsec["d_t10"] = (gsec.t10_hit_b - gsec.t10_hit_a).round(4)
+    gsec = gsec[["market", "n_a", "auc_a", "auc_b", "d_auc",
+                 "t10_hit_a", "t10_hit_b", "d_t10",
+                 "trust_depth_a", "trust_depth_b"]].rename(
+        columns={"n_a": "n"})
+    print("\ngoal board (ranking-only, raw p; top-10/slate hit rate, "
+          "AUC, trust depth; positive delta = B better):")
+    print(gsec.sort_values("d_t10", ascending=False)
+          .to_string(index=False))
     return rep
+
+
+# --------------------------------------- goal-aligned (top-of-sort) board
+
+GOAL_TOP_N = 10          # the workbook-sort test depth
+GOAL_MAX_DEPTH = 15      # deepest trust depth considered
+GOAL_OR_GATE = 1.5       # odds-ratio-lift LCB a depth must clear
+GOAL_BOOT = 300
+
+
+def goal_metrics(df, top_n=GOAL_TOP_N, boot=GOAL_BOOT, seed=7):
+    """Per-market board for the workbook-sort goal: sort a column
+    high->low and the top picks should hit; >50% cells should hit at
+    their stated rate. Expects ledger-style rows (Date/market/p/y).
+    Pass calibrated p for level-true stated columns; the ordering
+    metrics (auc, hit rates, trust_depth) are unchanged by the
+    monotone family calibrators either way.
+
+    trust_depth = deepest per-slate top-d whose odds-ratio lift over
+    the market's base rate holds its slate-block-bootstrap
+    10th-percentile lower bound above GOAL_OR_GATE — how far down the
+    sorted column selection power is PROVEN (0 = not even the top
+    pick separates from a blind bet at this sample)."""
+    from sklearn.metrics import roc_auc_score
+    rng = np.random.default_rng(seed)
+    out = []
+    for mkt, g in df.groupby("market", sort=False):
+        y = g.y.values.astype(float)
+        rate = float(y.mean())
+        auc = (float(roc_auc_score(y, g.p.values))
+               if 0.0 < rate < 1.0 else np.nan)
+        srt = g.sort_values("p", ascending=False)
+        top = srt.groupby("Date", sort=False).head(top_n)
+        hi = g[g.p > 0.5]
+        depth = 0
+        if boot:
+            # per-slate cumulative hits down the sorted column; slates
+            # with fewer than GOAL_MAX_DEPTH rows saturate at their size
+            Hc, Cc, Ht, Ct = [], [], [], []
+            for _, sub in srt.groupby("Date", sort=False):
+                yy = sub.y.values[:GOAL_MAX_DEPTH].astype(float)
+                k = len(yy)
+                cs = np.cumsum(yy) if k else np.zeros(1)
+                h = np.full(GOAL_MAX_DEPTH, float(cs[-1]))
+                c = np.full(GOAL_MAX_DEPTH, float(k))
+                h[:k], c[:k] = cs, np.arange(1, k + 1, dtype=float)
+                Hc.append(h)
+                Cc.append(c)
+                Ht.append(float(sub.y.sum()))
+                Ct.append(float(len(sub)))
+            S = len(Hc)
+            if S >= 8:
+                Hc_, Cc_ = np.array(Hc), np.array(Cc)
+                Ht_, Ct_ = np.array(Ht), np.array(Ct)
+                idx = rng.integers(0, S, size=(boot, S))
+                tc = np.maximum(Cc_[idx].sum(1), 1.0)
+                bc = np.maximum(Ct_[idx].sum(1), 1.0)
+                pr = np.clip(Hc_[idx].sum(1) / tc, 1e-6, 1 - 1e-6)
+                br = np.clip(Ht_[idx].sum(1) / bc, 1e-6, 1 - 1e-6)
+                orl = ((pr / (1 - pr))
+                       / (br / (1 - br))[:, None])
+                ok = np.where(np.quantile(orl, 0.10, axis=0)
+                              >= GOAL_OR_GATE)[0]
+                depth = int(ok.max() + 1) if len(ok) else 0
+        out.append(dict(
+            market=str(mkt), n=len(g), base=round(rate, 4),
+            auc=round(auc, 4) if np.isfinite(auc) else np.nan,
+            t10_stated=round(float(top.p.mean()), 4),
+            t10_hit=round(float(top.y.mean()), 4),
+            t10_gap=round(float(top.y.mean() - top.p.mean()), 4),
+            hi_n=int(len(hi)),
+            hi_stated=(round(float(hi.p.mean()), 4)
+                       if len(hi) else np.nan),
+            hi_hit=(round(float(hi.y.mean()), 4)
+                    if len(hi) else np.nan),
+            hi_gap=(round(float(hi.y.mean() - hi.p.mean()), 4)
+                    if len(hi) else np.nan),
+            trust_depth=depth))
+    return pd.DataFrame(out)
+
+
+def reliability_bands(df, lo=0.5, width=0.05):
+    """Pooled stated-vs-hit ladder from `lo` upward — the '>50% cells
+    hit at their number, more the higher they go' check. Pass
+    calibrated p (raw p makes the levels meaningless)."""
+    rows = []
+    for e in np.arange(lo, 1.0 - 1e-9, width):
+        b = df[(df.p >= e) & (df.p < e + width)]
+        if len(b):
+            rows.append(dict(
+                band=f"[{e:.2f},{e + width:.2f})", n=len(b),
+                stated=round(float(b.p.mean()), 4),
+                hit=round(float(b.y.mean()), 4),
+                gap=round(float(b.y.mean() - b.p.mean()), 4)))
+    return pd.DataFrame(rows)
 
 
 # ------------------------------------------------------- the CLV gate
