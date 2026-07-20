@@ -2,9 +2,11 @@
 REM Morning job (Task Scheduler 6:00 AM, safe to run by hand):
 REM   1. update_all --retrain   scrape + validate everything, retrain models
 REM   2. Sundays only           CLV gate refresh over the captured-odds window
-REM Everything game-day-facing is MANUAL by design (user preference
-REM 2026-07-19): slate fetch, odds capture, serving and grading are run by
-REM hand (Tools/1, Tools/2, GUI or "Model/predict.py --serve", Tools/4).
+REM Serving and grading are MANUAL by design (user preference 2026-07-19):
+REM GUI or "Model/predict.py --serve", Tools/4. Slate fetch + odds capture
+REM (Tools/1, Tools/2) also run by hand, but a noon safety-net task
+REM (Tools\run_noon_slate.cmd, added 2026-07-19) guarantees one slate and
+REM an early odds capture every game day regardless.
 REM Logs to Logs\update_YYYY-MM-DD.log; exit 1 if any step failed.
 
 set "ROOT=%~dp0.."
