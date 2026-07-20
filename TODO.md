@@ -105,10 +105,20 @@ Original item list (statuses above):
 
 ### W4-C. Calibration polish
 
-- [ ] **W4.12** Line-aware pitcher-ladder calibration (per-line offsets + PAV ladder projection),
-  pout first — one shared Platt per family cannot fix a single hot rung (Outs>18.5). Optionally
-  AUTO_CAL-style CV selection Platt-vs-Beta per family (`BetaCal`, old `275-336`; isotonic
-  remains forbidden).
+- [x] **W4.12** DONE 2026-07-20 (pout only, holdout-gated). Study (scratchpad
+  `w412_line_cal_study.py`, fit ≤05-31 / eval 06-01+): per-line Platt beat the family map on
+  **pout +0.00578** holdout ll (Outs>18.5 +0.0156, hot rung eliminated; >15.5 gap −6.6→−2.1);
+  **per −0.00013 / pha −0.00017 REJECTED; pk +0.00018 / pbb +0.00034 within noise — re-assess
+  at future calibration refreshes** (`evaluate.LINE_CAL_FAMS` is the one-line switch).
+  Implementation: per-line Platt under calibrator key `_lines` (market-string keyed);
+  `predict._cal(market=)` line-map-wins lookup; game_frame passes column names + a
+  calibration-stage ladder guard (heads path re-guards independently); bets/gate paths via
+  `_line_market` (odds market → column); heads.py applies the identical maps to its base
+  margin. **Post-ship evidence: pout head collapsed 47 trees/+0.0045 → identity (+0.00001) —
+  the head had been compensating for line-level bias all along**; pout Platt-stage holdout ll
+  0.5479→0.5421. Served Outs>18.5 map a=−0.728. pytest fast+slow green; serve smoke ladder
+  monotone. Note: Tools/5 cross-fit stays family-grain, so its pout rows understate the served
+  stack until line-aware cross-fit is added (display caveat only).
 - [ ] **W4.13** Batter-grain head context: threshold-share histories (`c/s/d_{hrr2,hrr3,hrr4, rbi2,run2}_g_sh`, EB K=40; old `2205-2225`) into the hrr/rbi/r family heads — captures
   batter-specific within-game clustering the sim's generic correlation misses. Early-stop
   referees whether it's real.

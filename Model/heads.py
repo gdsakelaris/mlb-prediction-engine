@@ -138,6 +138,13 @@ def train(min_rows=3000, holdout=0.25, seed=7):
             m = df["family"] == fam
             df.loc[m, "p_cal"] = np.clip(
                 c.predict(df.loc[m, "p"].values), 1e-6, 1 - 1e-6)
+    # per-line maps win over the family map exactly as at serve
+    # (predict._cal) — the head's base margin must match serving
+    for mkt, lc in (cal.get("_lines", {}) or {}).items():
+        m = df["market"] == mkt
+        if m.any():
+            df.loc[m, "p_cal"] = np.clip(
+                lc.predict(df.loc[m, "p"].values), 1e-6, 1 - 1e-6)
 
     heads, report = {}, []
     for fam, sub in df.groupby("family"):

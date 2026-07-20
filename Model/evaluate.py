@@ -312,13 +312,23 @@ def grade_replay(start, end, n_sims=4000, max_games=None):
     return df
 
 
+# families whose per-LINE calibration beat the shared family map on a
+# held-out time split (W4.12 study, 2026-07-20: pout +0.0058 holdout
+# logloss, the Outs>18.5 hot rung eliminated; per/pha were negative,
+# pk/pbb within noise — re-assess them at future calibration refreshes)
+LINE_CAL_FAMS = ("pout",)
+
+
 def fit_calibrators(start, end, n_sims=4000, min_n=500,
                     max_games=None, reuse_rows=False, batched=False):
     """One shared Platt map (logit-space logistic) per family; identity
     (absent) below min_n, on a single-class sample, or on a
-    non-positive slope. Replay rows are cached to
-    artifacts/calib_rows.parquet so a refit after a calibration-code
-    change can skip the replay (--reuse-rows)."""
+    non-positive slope. Families in LINE_CAL_FAMS additionally get one
+    Platt map per LINE (stored under "_lines" keyed by market string;
+    the line map wins at apply time, the family map is the fallback).
+    Replay rows are cached to artifacts/calib_rows.parquet so a refit
+    after a calibration-code change can skip the replay
+    (--reuse-rows)."""
     cache = ART / "calib_rows.parquet"
     if reuse_rows and cache.exists():
         df = pd.read_parquet(cache)
@@ -352,6 +362,26 @@ def fit_calibrators(start, end, n_sims=4000, min_n=500,
         out[fam] = cal
         print(f"  {fam}: n={len(sub):,} logloss {before:.5f} -> "
               f"{after:.5f} (in-sample; a={a:+.3f}, b={b:.3f})")
+    lines = {}
+    for fam in LINE_CAL_FAMS:
+        for mkt, sub in df[df.family == fam].groupby("market"):
+            if len(sub) < max(min_n, 3000) or sub.y.nunique() < 2:
+                continue
+            p = np.clip(sub.p.values, 1e-6, 1 - 1e-6)
+            z = (np.log(p) - np.log1p(-p)).reshape(-1, 1)
+            lr = LogisticRegression(C=1e6, max_iter=1000)
+            lr.fit(z, sub.y.values)
+            a, b = float(lr.intercept_[0]), float(lr.coef_[0][0])
+            if b <= 0:
+                continue
+            cal = F.PlattCal(a, b)
+            before = logloss(sub.y, sub.p)
+            after = logloss(sub.y, cal.predict(sub.p.values))
+            lines[str(mkt)] = cal
+            print(f"  line {mkt}: n={len(sub):,} logloss {before:.5f} "
+                  f"-> {after:.5f} (in-sample; a={a:+.3f}, b={b:.3f})")
+    if lines:
+        out["_lines"] = lines
     # stamp the fit range so downstream evaluation can flag overlap
     # (every consumer looks families up by key, so "_meta" is inert)
     out["_meta"] = dict(fit_start=str(df.Date.min()),
@@ -867,7 +897,8 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
                         continue
                     counts = t[:, row_i, s[col]]
                 p_model = PR._cal(res.get("calib"), fam,
-                                  float((counts > line).mean()))
+                                  float((counts > line).mean()),
+                                  market=PR._line_market(market, line))
                 y = _odds_y(gb, gp, games, pk, pid, market, line)
             if y is None:
                 continue

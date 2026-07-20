@@ -1213,15 +1213,38 @@ MKT_FAM = {"batter_hits": "h", "batter_home_runs": "hr",
            "team_totals": "tt"}
 
 
-def _cal(calib, fam, p):
-    """Apply a family's shared monotone calibrator (identity when the
-    family has none fitted). Output is clamped strictly inside (0, 1):
-    no calibrator may ever emit a hard 0/1 into grading or EV math."""
-    cal = (calib or {}).get(fam)
-    if cal is None or p is None:
+def _cal(calib, fam, p, market=None):
+    """Apply the calibrator for this probability: a per-LINE map when
+    one is fitted for this exact market string (families in
+    evaluate.LINE_CAL_FAMS only), else the family's shared monotone
+    map, else identity. Output is clamped strictly inside (0, 1): no
+    calibrator may ever emit a hard 0/1 into grading or EV math.
+    Per-line maps can cross adjacent rungs, so every ladder consumer
+    runs a non-increasing guard after calibration."""
+    if p is None:
+        return p
+    cal = None
+    if market is not None:
+        cal = (calib or {}).get("_lines", {}).get(market)
+    if cal is None:
+        cal = (calib or {}).get(fam)
+    if cal is None:
         return p
     return float(np.clip(cal.predict(np.array([p]))[0],
                          1e-6, 1 - 1e-6))
+
+
+# odds-API market -> ladder column stem, for per-line calibrator
+# lookups from the bets/gate paths (extend as families join
+# evaluate.LINE_CAL_FAMS)
+_ODDS_LINE_STEM = {"pitcher_outs": "Outs"}
+
+
+def _line_market(market, line):
+    """Workbook column name for an odds-API (market, line) pair when
+    that market's family carries per-line calibrators, else None."""
+    stem = _ODDS_LINE_STEM.get(market)
+    return f"{stem} > {line}" if stem else None
 
 
 def _dec(american):
@@ -1416,7 +1439,17 @@ def game_frame(res):
         for c in row:
             for pref, fam in PIT_FAM.items():
                 if c.startswith(pref):
-                    row[c] = _cal(calib, fam, row[c])
+                    row[c] = _cal(calib, fam, row[c], market=c)
+        # ladder guard at the calibration stage: per-line maps may
+        # cross adjacent rungs (the heads path re-guards after its own
+        # adjustments, but serving without heads must stay coherent)
+        for pref in PIT_FAM:
+            lo = None
+            for c in row:
+                if c.startswith(pref):
+                    if lo is not None and row[c] > lo:
+                        row[c] = lo
+                    lo = row[c]
         pit_rows.append(row)
 
     sc = res["score"]
@@ -1593,7 +1626,8 @@ def build_bets(out, date):
         if counts is None:
             continue
         p_over = _cal(res.get("calib"), MKT_FAM.get(market),
-                      _tail_prob(counts, line))
+                      _tail_prob(counts, line),
+                      market=_line_market(market, line))
         fair = O.sharp_fair(g.to_dict("records"))
         meta = res["meta"]
         name = meta["names"][row_i]
