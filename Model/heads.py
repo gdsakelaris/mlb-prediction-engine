@@ -105,6 +105,22 @@ def _load_rows():
                   suffixes=("", "_uf"))
     df["park_hr"] = df["pf_HR"].fillna(1.0)
     df["ump_r"] = df["uf_R"].fillna(1.0)
+    # batter within-game clustering history (threshold shares) — same
+    # builder the serve path uses; non-batter rows (pitchers, -1 game
+    # rows) collapse to the league prior by construction
+    thr_p = F.STORES / "panel_bat_thresh.parquet"
+    if thr_p.exists():
+        import json
+        rows_t = pd.DataFrame({
+            "BatterId": pd.to_numeric(df["PlayerId"], errors="coerce")
+            .fillna(-1).astype("int64"),
+            "Date": pd.to_datetime(df["Date"])})
+        th = F.thresh_features(
+            rows_t, pd.read_parquet(thr_p),
+            pd.read_parquet(F.STORES / "panel_bat_thresh_car.parquet"),
+            json.loads((F.STORES / "thresh_league.json").read_text()))
+        for c in th.columns:
+            df[c] = th[c].values
     return df
 
 
@@ -123,6 +139,8 @@ def _features(df):
     X["p_dist"] = (df["p_cal"] - 0.5).abs()
     X["park_hr"] = df["park_hr"]
     X["ump_r"] = df["ump_r"]
+    for c in F.TH_FEATS:
+        X[c] = df[c] if c in df.columns else np.nan
     return X
 
 

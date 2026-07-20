@@ -271,6 +271,17 @@ class Predictor:
                         bst=lgb.Booster(model_str=h["booster_str"]),
                         features=h["features"],
                         best_iter=int(h["best_iter"]))
+        # batter threshold-share panels for the heads' clustering
+        # features (absent -> older heads artifacts serve unchanged)
+        self._thresh_panels = None
+        tp = F.STORES / "panel_bat_thresh.parquet"
+        if tp.exists():
+            self._thresh_panels = (
+                pd.read_parquet(tp),
+                pd.read_parquet(F.STORES
+                                / "panel_bat_thresh_car.parquet"),
+                json.loads((F.STORES
+                            / "thresh_league.json").read_text()))
         self._defense = {}
         dp = F.STORES / "defense_team.parquet"
         if dp.exists():
@@ -1185,8 +1196,25 @@ class Predictor:
                 res["heads"] = self.heads
                 res["hctx"] = hctx[gi]
                 res["hdef"] = self._defense
+                res["thr"] = self._thresh_map(meta, spec["date"])
             out.append(res)
         return out
+
+    def _thresh_map(self, meta, date):
+        """As-of threshold-share features for every player row in one
+        game, keyed by id (-1 = the league-prior row that every
+        no-history entity — bench phantoms, game rows — collapses to).
+        Routed through F.thresh_features, the same builder heads
+        training uses."""
+        if self._thresh_panels is None:
+            return None
+        pdl, pcl, lg = self._thresh_panels
+        pids = sorted({int(p) for p in meta["players"]} | {-1})
+        rows = pd.DataFrame({"BatterId": pids,
+                             "Date": pd.Timestamp(date)})
+        th = F.thresh_features(rows, pdl, pcl, lg)
+        return {pid: {c: float(th[c].iloc[i]) for c in th.columns}
+                for i, pid in enumerate(pids)}
 
 
 # -------------------------------------------------------- aggregation
@@ -1268,7 +1296,7 @@ def _line_of(market):
 
 
 def _apply_heads(heads, ctx, deft, season, bat_rows, pit_rows, grow,
-                 away, home):
+                 away, home, thr=None):
     """Residual-head corrections, applied AFTER the family calibrators:
     per market family, a shallow-GBM logit adjustment from team context
     (heads.py --train). Feature construction must mirror
@@ -1321,6 +1349,10 @@ def _apply_heads(heads, ctx, deft, season, bat_rows, pit_rows, grow,
             f["p_dist"] = abs(p - 0.5)
             f["park_hr"] = ctx.get("park_hr", 1.0)
             f["ump_r"] = ctx.get("ump_r", 1.0)
+            if thr is not None:
+                tpid = _cont.get("ID", -1)
+                tpid = -1 if tpid is None else int(tpid)
+                f.update(thr.get(tpid) or thr[-1])
             feats.append(f)
         X = pd.DataFrame(feats)[h["features"]]
         raw = h["bst"].predict(X, num_iteration=h["best_iter"],
@@ -1479,7 +1511,7 @@ def game_frame(res):
     if res.get("heads") and res.get("hctx") is not None:
         _apply_heads(res["heads"], res["hctx"], res.get("hdef") or {},
                      int(meta["season"]), bat_rows, pit_rows, grow,
-                     away, home)
+                     away, home, thr=res.get("thr"))
     return dict(bat=bat_rows, pit=pit_rows, game=grow)
 
 

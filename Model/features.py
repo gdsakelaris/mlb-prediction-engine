@@ -661,6 +661,78 @@ def build_bat_tracking_table():
     print(f"bat_tracking: {len(bt):,} player-years", flush=True)
 
 
+THRESH_K = 40.0                 # EB games-shrink for threshold shares
+CAREER_HL = 36500.0             # "career" horizon = effectively no decay
+TH_STATS = ["g", "hrr2", "hrr3", "hrr4", "rbi2", "run2"]
+TH_FEATS = (["th_hrr2", "th_hrr3", "th_hrr4", "th_rbi2", "th_run2",
+             "thc_hrr2", "thc_hrr3", "thc_hrr4", "thc_rbi2",
+             "thc_run2", "th_log_g"])
+
+
+def build_thresh_panel():
+    """Batter within-game clustering history: per-game rates of
+    clearing the exact prop thresholds (H+R+RBI >= 2/3/4, 2+ RBI,
+    2+ Runs), in a 90d-decayed and a career horizon. A cleanup hitter's
+    hits/runs/RBI arrive together in ways the marginal rates miss —
+    consumed by the residual heads, never by A1 (game grain)."""
+    gb = read_csv("mlb_game_batting.csv",
+                  usecols=["GamePk", "PlayerId", "PA", "H", "R", "RBI"])
+    for c in gb.columns:
+        gb[c] = _num(gb[c])
+    games = read_csv("mlb_games.csv", usecols=["GamePk", "Date"])
+    games["Date"] = pd.to_datetime(games["Date"])
+    games["GamePk"] = _num(games["GamePk"])
+    df = gb[gb["PA"].fillna(0) > 0].merge(games, on="GamePk",
+                                          how="inner")
+    hrr = df["H"].fillna(0) + df["R"].fillna(0) + df["RBI"].fillna(0)
+    df["g"] = 1.0
+    df["hrr2"] = (hrr >= 2).astype(float)
+    df["hrr3"] = (hrr >= 3).astype(float)
+    df["hrr4"] = (hrr >= 4).astype(float)
+    df["rbi2"] = (df["RBI"].fillna(0) >= 2).astype(float)
+    df["run2"] = (df["R"].fillna(0) >= 2).astype(float)
+    df["BatterId"] = df["PlayerId"].astype("int64")
+    daily = df.groupby(["BatterId", "Date"], sort=False)[
+        TH_STATS].sum().reset_index()
+    for name, hl in (("panel_bat_thresh", DECAY_HL),
+                     ("panel_bat_thresh_car", CAREER_HL)):
+        panel = decayed_panel(daily, ["BatterId"], TH_STATS, hl=hl)
+        panel.to_parquet(STORES / f"{name}.parquet", index=False)
+    lg = {c: float(df[c].sum() / df["g"].sum())
+          for c in TH_STATS if c != "g"}
+    (STORES / "thresh_league.json").write_text(json.dumps(lg, indent=1))
+    print(f"panel_bat_thresh(+car): {len(daily):,} batter-days, league "
+          + " ".join(f"{k}={v:.3f}" for k, v in lg.items()), flush=True)
+
+
+def thresh_features(rows, panel_d, panel_c, league):
+    """TH_FEATS frame (row-aligned) for a frame with BatterId + Date:
+    EB-shrunk (THRESH_K games to the league per-game share) as-of
+    threshold shares, decayed + career arms. Zero history collapses to
+    the league prior exactly — heads training and serving MUST both
+    route through here so the two sides cannot drift."""
+    out = pd.DataFrame(index=rows.index)
+    # parquet round-trips can downcast to [s]; merge_asof needs both
+    # sides on the same resolution
+    rows = rows.assign(Date=pd.to_datetime(rows["Date"])
+                       .astype("datetime64[ns]"))
+    panel_d = panel_d.assign(Date=panel_d["Date"]
+                             .astype("datetime64[ns]"))
+    panel_c = panel_c.assign(Date=panel_c["Date"]
+                             .astype("datetime64[ns]"))
+    md = merge_asof_panel(rows, panel_d, ["BatterId"], TH_STATS, "d_")
+    mc = merge_asof_panel(rows, panel_c, ["BatterId"], TH_STATS, "c_",
+                          hl=CAREER_HL)
+    for pref_out, m, pref in (("th_", md, "d_"), ("thc_", mc, "c_")):
+        g = m[pref + "g"].fillna(0.0)
+        for c in ("hrr2", "hrr3", "hrr4", "rbi2", "run2"):
+            out[pref_out + c] = ((m[pref + c].fillna(0.0)
+                                  + THRESH_K * league[c])
+                                 / (g + THRESH_K))
+    out["th_log_g"] = np.log1p(md["d_g"].fillna(0.0))
+    return out
+
+
 def build_bat_track_panel():
     """Current-season bat tracking as a daily decayed panel, from the
     raw pitch archive's per-swing bat speed / swing length (2024+;
@@ -3330,6 +3402,7 @@ def main():
         build_il_table()
         build_bat_tracking_table()
         build_bat_track_panel()
+        build_thresh_panel()
         build_pull_table()
         build_hrpt_tables()
         build_bat_sched_panel()

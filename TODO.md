@@ -119,9 +119,15 @@ Original item list (statuses above):
   0.5479→0.5421. Served Outs>18.5 map a=−0.728. pytest fast+slow green; serve smoke ladder
   monotone. Note: Tools/5 cross-fit stays family-grain, so its pout rows understate the served
   stack until line-aware cross-fit is added (display caveat only).
-- [ ] **W4.13** Batter-grain head context: threshold-share histories (`c/s/d_{hrr2,hrr3,hrr4, rbi2,run2}_g_sh`, EB K=40; old `2205-2225`) into the hrr/rbi/r family heads — captures
-  batter-specific within-game clustering the sim's generic correlation misses. Early-stop
-  referees whether it's real.
+- [x] **W4.13** DONE 2026-07-20. `build_thresh_panel` (554,652 batter-days: per-game
+  H+R+RBI≥2/3/4, 2+RBI, 2+Runs clear rates; 90d + career horizons; league priors in
+  `thresh_league.json`) + shared `F.thresh_features` (EB K=40; zero history → league prior
+  exactly) consumed by heads training (`_load_rows`) AND serving (`Predictor._thresh_map` →
+  `_apply_heads(thr=)`) through the SAME builder — no train/serve drift possible. Held-out
+  verdict (early-stop refereed): real structure found — sb +0.0007→+0.0012, bk +0.00001→
+  +0.0006, bb +0.00004→+0.0005, h −0.00002→+0.0002, r/hrr/b1/pha all up; rbi ~0; hr/b2/b3
+  identity; pout stays identity (line maps own it). Gotcha fixed: parquet Date round-trips
+  as [s] — `thresh_features` normalizes both sides to [ns]. Serve smoke PASS, pytest 30/30.
 
 ### W4-D. Bigger swings (evidence-gated)
 
