@@ -15,9 +15,10 @@ backtester's):
   4. run the vectorized sim and count every market off the tensor
 
 save_excel_slate() writes the workbook the Tools expect (sheets: Batter
-Props, Pitching Props, Games, Bets) to Predictions/, and persists the
-per-sim tensors beside it so any new market can be priced later without
-re-simming.
+Props, Pitching Props, Games, Bets) to Predictions/. Per-sim tensor
+persistence and the SGP pricer (Model/sgp.py) were removed 2026-07-19
+by user decision (no parlay betting) — both recoverable from git
+history if SGP pricing is ever wanted.
 """
 
 import datetime as dt
@@ -1450,22 +1451,6 @@ def save_excel_slate(specs, out, path=None):
         cell.alignment = center
 
     wb.save(path)
-
-    npz = {}
-    for gi, r in enumerate(out):
-        npz[f"tensor_{gi}"] = r["tensor"]
-        npz[f"score_{gi}"] = r["score"]
-        npz[f"f5_{gi}"] = r["runs_f5"]
-        npz[f"i1_{gi}"] = r["runs_i1"]
-        npz[f"players_{gi}"] = np.array(r["meta"]["players"])
-        # product tag: morning (projected lineups) vs confirmed — the
-        # two ledgers are evaluated separately
-        sp = r["spec"]
-        confirmed = (sp.get("away_lineup_src", "mlb") == "mlb"
-                     and sp.get("home_lineup_src", "mlb") == "mlb")
-        npz[f"product_{gi}"] = np.array(
-            "confirmed" if confirmed else "projected")
-    np.savez_compressed(Path(path).with_suffix(".sims.npz"), **npz)
     return str(path)
 
 
