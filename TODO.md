@@ -46,9 +46,18 @@ tie aggregate lean-positive, walkforward better all 5 folds vs pre-wave. W4.19 v
 retired 07-19, lineup provenance = away/home_lineup_src in slate JSON + serve printout; the
 re-serve-on-confirmation habit is manual process — C2 automates the quantification later.)
 
-- [ ] **W4.21 (research)** Within-slate ranking overlay (LambdaRank-style display reranker,
-  served probabilities untouched) — only if W4-B/W4.14/18 leave top-10 precision short; nothing
-  in the stack optimizes ranking directly.
+- [ ] **W4.21 (research — DEFERRED one measurement cycle, decision 2026-07-20)** Within-slate
+  ranking overlay (LambdaRank-style display reranker, served probabilities untouched).
+  Deferred because: (a) the measured top-10 shortfall comes from the 4k-sim goal board, which
+  jitters ±1–1.5 pts from MC re-ranking noise, and the 100k-sim batched serve (W4.15) just
+  removed exactly that noise from production — its effect is unmeasured; (b) ranking by
+  calibrated p is already top-k optimal given the model's information, and every discrimination
+  lever this wave moved AUC ≤ +0.002, so the rankable residual looks thin; (c) a display rank
+  that disagrees with stated p breaks the workbook's sort=probability invariant; (d) 298
+  slates is thin for LambdaRank. **Re-evaluate at the next calibration refresh (~late Aug):**
+  grade SERVED workbooks' top-10 precision on confirmed-lineup slates (W4.19 split) + rerun
+  the goal board; take up W4.21 only if Hit / K / Single / H+R+RBI 2+ / 2+ TB — the columns
+  where "most of top 10" is honestly reachable — still sit short of their ceilings.
 - [ ] **W4.22 (user decision — DECLINED for now, may reconsider later)** Odds-blended workbook
   column (dual output: pure model for gate/CLV, blend for display). Do not implement without
   explicit user choice.
