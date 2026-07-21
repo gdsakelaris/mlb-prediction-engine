@@ -956,10 +956,14 @@ def build_park_geometry(pa):
     pull/porch fits exist. Unmatched venues (renames, international
     sites) come through as NaN and the trees route around them."""
     bp = read_csv("mlb_ballparks.csv",
-                  usecols=["Ballpark", "LF", "CF", "RF", "Elevation_ft"])
+                  usecols=["Ballpark", "LF", "CF", "RF", "Elevation_ft",
+                           "Roof"])
     bp = bp.rename(columns={"Ballpark": "Venue"}).drop_duplicates("Venue")
     for c in ("LF", "CF", "RF", "Elevation_ft"):
         bp[c] = _num(bp[c])
+    bp["roof_retract"] = (bp["Roof"].astype(str).str.lower()
+                          == "retractable").astype(float)
+    bp = bp.drop(columns=["Roof"])
     # historical names of CURRENT parks (sponsor renames — same physical
     # geometry). Departed parks (Oakland Coliseum, Turner Field, Globe
     # Life PARK, alternate sites) stay NaN deliberately.
@@ -2488,6 +2492,13 @@ def assemble_features(rows, stores):
                         stores["eb_k"], milb=pmm)
     out = _shrunk_rates(out, "ph_", "ph_pa", PIT_RATES, pri_p,
                         stores["eb_k"], milb=pmm)
+    # explicit platoon-split skill: the hand-conditioned shrunk rate
+    # minus the overall one (trees can't subtract; both arms shrink to
+    # the SAME prior, so thin hand samples collapse to zero split
+    # instead of a spurious one)
+    for c in ("K", "BB", "HR", "1B"):
+        out[f"b_pl_{c}"] = out[f"bh_{c}_rate"] - out[f"b_{c}_rate"]
+        out[f"p_pl_{c}"] = out[f"ph_{c}_rate"] - out[f"p_{c}_rate"]
     # per-TTO pitcher rates: this row's times-through-order slice
     rows_t = rows[["PitcherId", "Date", "tto"]].copy()
     rows_t["tto_key"] = (_num(rows_t["tto"]).fillna(1).clip(1, 3)
@@ -2996,6 +3007,20 @@ def assemble_features(rows, stores):
     j = rows[["Venue"]].merge(pg, on="Venue", how="left")
     elev_kft = j["Elevation_ft"].values / 1000.0
     out["park_elev"] = elev_kft
+    # roof state at retractable parks: the venue's park factors blend
+    # open- and closed-roof samples, so which regime TODAY is in is
+    # signal the factors can't carry. 0 at fixed-roof/open-air parks;
+    # NaN when the condition is unreported (serve scrape miss) or the
+    # venue is unmatched
+    retract = (j["roof_retract"].values if "roof_retract" in j.columns
+               else np.full(n, np.nan))
+    cond = rows["Condition"].astype(str)
+    closed = cond.str.contains("Dome|Roof Closed", case=False,
+                               na=False).values
+    unknown = cond.str.strip().isin(["", "nan", "Unknown"]).values
+    ro_state = np.where(unknown, np.nan, np.where(closed, 0.0, 1.0))
+    out["roof_open"] = np.where(retract == 1.0, ro_state,
+                                np.where(retract == 0.0, 0.0, np.nan))
     pull_fence = np.where(rows["stand"].astype(str) == "R",
                           j["LF"].values, j["RF"].values)
     out["pull_fence"] = pull_fence

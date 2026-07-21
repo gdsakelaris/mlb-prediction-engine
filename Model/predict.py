@@ -47,7 +47,13 @@ DATA = ROOT / "Data"
 ART = ROOT / "Model" / "artifacts"
 PRED_DIR = ROOT / "Predictions"
 
-N_SIMS = 20000
+N_SIMS = 20000           # per-game engine path (fallback + explicit)
+# W4.15: the batched device path serves the whole slate as game x sim
+# batches, so the default sim count rises 20k -> 100k (stabilizes
+# top-of-sort ordering); SIM_CHUNK bounds device memory per run_batch
+# call. SERVE_BATCH=0 reproduces the per-game path exactly.
+N_SIMS_SERVE = 100_000
+SIM_CHUNK = 25_000
 MAX_PEN = 8
 TIRED_NP = 20            # a pen arm that threw >= this many pitches
                          # YESTERDAY drops behind every fresh arm in
@@ -1167,7 +1173,7 @@ class Predictor:
                 ump_r = float(m.uf_R.iloc[0])
         return park_hr, ump_r
 
-    def predict_slate(self, specs, n_sims=N_SIMS, progress=None):
+    def predict_slate(self, specs, n_sims=None, progress=None):
         tick = progress or (lambda m: None)
         hctx = None
         tick("building slate context...")
@@ -1179,25 +1185,74 @@ class Predictor:
         except Exception as e:              # noqa: BLE001
             print(f"slate context unavailable ({e}); serving without "
                   f"Elo/heads context", flush=True)
-        out = []
-        for gi, spec in enumerate(specs):
-            tick(f"game {gi + 1}/{len(specs)}: preparing...")
-            prep, meta = self.prepare_game(spec, n_sims=n_sims)
-            tick(f"game {gi + 1}/{len(specs)}: simulating...")
-            res = sim.run(prep, n_sims=n_sims,
-                          seed=int(pd.Timestamp(spec["date"]).toordinal())
-                          * 100 + gi,
-                          season=meta["season"],
-                          is_dh_game=bool(spec.get("is_dh")))
-            res["meta"] = meta
+        use_batch = os.environ.get("SERVE_BATCH", "1") != "0"
+        if n_sims is None:
+            n_sims = N_SIMS_SERVE if use_batch else N_SIMS
+        out = None
+        if use_batch and specs:
+            try:
+                out = self._slate_batch(specs, n_sims, tick)
+            except Exception as e:          # noqa: BLE001
+                print(f"batched sim path unavailable ({e}); per-game "
+                      f"fallback at {N_SIMS:,} sims", flush=True)
+                n_sims = min(n_sims, N_SIMS)
+        if out is None:
+            out = []
+            for gi, spec in enumerate(specs):
+                tick(f"game {gi + 1}/{len(specs)}: preparing...")
+                prep, meta = self.prepare_game(spec, n_sims=n_sims)
+                tick(f"game {gi + 1}/{len(specs)}: simulating...")
+                res = sim.run(prep, n_sims=n_sims,
+                              seed=int(pd.Timestamp(spec["date"])
+                                       .toordinal()) * 100 + gi,
+                              season=meta["season"],
+                              is_dh_game=bool(spec.get("is_dh")))
+                res["meta"] = meta
+                out.append(res)
+        for gi, (spec, res) in enumerate(zip(specs, out)):
             res["spec"] = spec
             res["calib"] = self.calib
             if hctx is not None:
                 res["heads"] = self.heads
                 res["hctx"] = hctx[gi]
                 res["hdef"] = self._defense
-                res["thr"] = self._thresh_map(meta, spec["date"])
+                res["thr"] = self._thresh_map(res["meta"], spec["date"])
+        return out
+
+    def _slate_batch(self, specs, n_sims, tick):
+        """W4.15: serve on the batched device path. prepare_games
+        amortizes prep across the slate; run_batch runs game x sim
+        device batches, chunked on the sim axis so 50-100k sims fit
+        device memory; chunks are equal-sized (total may round up a
+        hair) and merged by concatenation, so per-game dicts match
+        sim.run's shapes exactly."""
+        import sim_batch
+        k = max(1, -(-n_sims // SIM_CHUNK))
+        s = -(-n_sims // k)
+        tick(f"preparing {len(specs)} games (batched)...")
+        pm = sim_batch.prepare_games(self, specs, n_sims=s)
+        seed0 = int(pd.Timestamp(specs[0]["date"]).toordinal()) * 100
+        seasons = [m["season"] for _, m in pm]
+        is_dh = [bool(sp.get("is_dh")) for sp in specs]
+        parts = []
+        for ci in range(k):
+            tick(f"simulating {len(specs)} games: chunk {ci + 1}/{k} "
+                 f"({s:,} sims)...")
+            parts.append(sim_batch.run_batch(
+                [p for p, _ in pm], n_sims=s, seed=seed0 + ci,
+                seasons=seasons, is_dh=is_dh))
+        out = []
+        for gi, (_, meta) in enumerate(pm):
+            chunks = [pt[gi] for pt in parts]
+            res = dict(chunks[0])
+            for key in ("tensor", "score", "runs_f5", "runs_i1"):
+                res[key] = np.concatenate([c[key] for c in chunks],
+                                          axis=0)
+            res["leftover"] = int(sum(c["leftover"] for c in chunks))
+            res["meta"] = meta
             out.append(res)
+            for pt in parts:      # free chunk buffers as games merge
+                pt[gi] = None
         return out
 
     def _thresh_map(self, meta, date):
@@ -1825,19 +1880,20 @@ def save_excel_slate(specs, out, path=None):
 # --------------------------------------------------------------- CLI
 
 def main():
-    """Headless serve: Data/todays_games.json -> workbook + sims npz.
+    """Headless serve: Data/todays_games.json -> workbook.
 
     The scheduler's serve entry point — the exact equivalent of the
     GUI's Predict button (same spec assembly the GUI does: games sorted
     by start_et, lineups tuple-ified), so a scheduled serve and a GUI
-    serve are indistinguishable downstream. Each game's npz product tag
+    serve are indistinguishable downstream. Each game's product tag
     (projected vs confirmed) comes from the per-side lineup provenance
-    the slate scraper recorded; serving early in the day simply yields
-    projected-product games, and a later re-serve yields confirmed
-    ones.
+    the slate scraper recorded (away/home_lineup_src in the slate
+    JSON); serving early in the day simply yields projected-product
+    games, and a later re-serve yields confirmed ones.
 
     Usage:
-        python Model/predict.py --serve             # full slate, 20k sims
+        python Model/predict.py --serve             # full slate,
+                                # 100k sims batched (20k per-game path)
         python Model/predict.py --serve --sims 4000 # faster smoke test
         python Model/predict.py --serve --json Data/slates/a.json \
             Data/slates/b.json   # batch: one workbook per slate file
@@ -1846,7 +1902,9 @@ def main():
     ap = argparse.ArgumentParser(description=main.__doc__)
     ap.add_argument("--serve", action="store_true",
                     help="serve the slate headlessly (GUI-equivalent)")
-    ap.add_argument("--sims", type=int, default=N_SIMS)
+    ap.add_argument("--sims", type=int, default=None,
+                    help="sims per game (default: 100k batched, "
+                         "20k on the per-game fallback path)")
     ap.add_argument("--json", nargs="+",
                     default=[str(DATA / "todays_games.json")],
                     help="one or more slate JSONs; each gets its own "
@@ -1878,7 +1936,10 @@ def main():
         n_conf = sum(1 for s in specs
                      if s.get("away_lineup_src", "mlb") == "mlb"
                      and s.get("home_lineup_src", "mlb") == "mlb")
-        print(f"served {len(specs)} games at {args.sims} sims "
+        n_shown = args.sims or (
+            N_SIMS_SERVE if os.environ.get("SERVE_BATCH", "1") != "0"
+            else N_SIMS)
+        print(f"served {len(specs)} games at {n_shown:,} sims "
               f"({n_conf} confirmed-lineup, {len(specs) - n_conf} "
               f"projected) -> {path}")
         served += 1

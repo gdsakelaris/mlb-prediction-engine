@@ -4,9 +4,11 @@ Trimmed 2026-07-20 (second trim, after W4-A/W4.16/W4-B/W4.12/W4.13 shipped — e
 verdicts live in Logs/*_2026-07-20.log, the goal-metric memory, and git history of this file).
 
 **Ship discipline:** paired replay A/B (`evaluate --ab`) + `pytest` green before a change
-serves; `Model/walkforward.py` (rolling-origin folds 2022–2026) after material changes to the
-trained models. Env gates `PEN_WAVE3` / `PEN_CHOICE` in predict.py reproduce pre-pen-wave
-behavior ("0") for paired A/Bs. **Goal metric** (top-10/slate precision + >50% monotone
+serves — that is the whole per-ship gate. `Model/walkforward.py` (rolling-origin folds
+2022–2026) runs at wave boundaries / ~monthly (with the calibration refresh) and for
+STRUCTURAL changes (new model class, loss, sampling scheme, hyperparameter retune), not per
+shipped feature (user policy 2026-07-20). Env gates `PEN_WAVE3` / `PEN_CHOICE` in predict.py
+reproduce pre-pen-wave behavior ("0") for paired A/Bs. **Goal metric** (top-10/slate precision + >50% monotone
 reliability + trust depth) is measured in Tools/5's Goal Board/Reliability sheets and the
 `--ab` goal section. **Calibration refresh cadence:** rerun the extended replay →
 `--fit-calibrators --reuse-rows` → `heads --train` at every wave boundary + ~monthly in-season
@@ -15,13 +17,18 @@ reliability + trust depth) is measured in Tools/5's Goal Board/Reliability sheet
 ## Watch (check in the next paired A/B or calibration refresh)
 
 - [ ] **`per` (starter ER) lean under PEN_CHOICE** — −0.00046, raw p=.016, BH-tie twice;
-  plausibly inherited-runner ER attribution. Investigate only if it persists.
-- [x] **Hit / 2+ Hits top-10 dip after W4-B** — RESOLVED by W4.18 (goal board: Hit +1.7,
-  2+ Hits +0.7 vs pre-bag; the dip was single-seed variance).
-- [ ] **pk / pbb per-line calibration** — holdout-positive but within noise at 46 slates;
-  re-assess at the next calibration refresh (`evaluate.LINE_CAL_FAMS` is the one-line switch).
-- [ ] **Batter 0.80–0.90 stated bands run ~1–2 pts hot** (n≈1,800 pooled) — recheck on the
-  next refreshed ledger.
+  plausibly inherited-runner ER attribution. Needs a dedicated PEN_CHOICE=0 arm; `per`
+  reliability on the W4.20 refreshed ledger shows no calibration-level distortion (bands
+  alternate sign, all ≲1.3σ). Investigate only if it persists.
+- [ ] **Batter-hits top-10 cluster after W4.20** — Hit −1.5 / HR −0.7 / Single −0.6 /
+  3+ TB −0.6 pts on the goal board (same metric swung +1.7 in W4.18; AUC flat-to-positive on
+  the same markets, so read as replay MC re-ranking noise at 4k sims). Recheck next A/B.
+- [x] **pk / pbb per-line calibration** — RESOLVED at the W4.20 refresh (298-slate ledger,
+  70/30 chrono holdout): pk per-line WORSE (−0.00012) — stays out; pbb +0.00019 borderline
+  (3 lines) — stays out, flip only on a second consecutive positive; pout re-confirmed
+  strongly (+0.006). `evaluate.LINE_CAL_FAMS` unchanged = ("pout",).
+- [ ] **Batter 0.80–0.90 stated bands** — still +1.1 pts hot on the W4.20 ledger (n=1,847,
+  ≈1.2σ); persistent lean but not decisive. Recheck at next refresh.
 
 ## Wave 4 — remaining queue
 
@@ -31,14 +38,14 @@ families non-negative, Hit top-10 +1.7 pts recovering the W4-B watch dip, walkfo
 in all 5 folds. W4.14 multi-library ensemble folded into the B7 annual slot — bagging captured
 the cheap variance win; a second library is the expensive remainder.)
 
-- [ ] **W4.15** Serve sims 20k→50–100k by routing GUI/headless serve through the sim_batch GPU
-  path — stabilizes top-of-sort ordering at similar wall time.
-- [ ] **W4.19** Confirmed-lineup re-serve habit + measurement: grade projected-vs-confirmed
-  serves separately (npz product tags exist); re-serve when lineups confirm on days you can.
-  Process, not code (C2 automates the quantification later).
-- [ ] **W4.20** Roof-state flag (the B1 survivor — open/closed Condition into park/weather
-  features) + verify per-batter platoon-split SKILL panels exist (matchup platoon is in;
-  per-batter EB split skill may not be).
+(W4.15 SHIPPED 2026-07-20: serve routes through sim_batch on GPU at 100k sims, chunked 25k/
+device batch; 43/43 families within 2x MC noise vs per-game path, top-10 overlap .96, 100k
+batched = HALF the wall of 20k per-game; SERVE_BATCH=0 reproduces the old path. W4.20 SHIPPED
+2026-07-20: roof_open flag + b_pl_/p_pl_ platoon-split deltas, 276→285 features; A/B no-harm
+tie aggregate lean-positive, walkforward better all 5 folds vs pre-wave. W4.19 verified: npz
+retired 07-19, lineup provenance = away/home_lineup_src in slate JSON + serve printout; the
+re-serve-on-confirmation habit is manual process — C2 automates the quantification later.)
+
 - [ ] **W4.21 (research)** Within-slate ranking overlay (LambdaRank-style display reranker,
   served probabilities untouched) — only if W4-B/W4.14/18 leave top-10 precision short; nothing
   in the stack optimizes ranking directly.
@@ -50,7 +57,7 @@ the cheap variance win; a second library is the expensive remainder.)
 
 - [ ] **B2. Forecast-error weather sampling** — sample temp/wind per sim from the historical
   forecast-error distribution. Blocked: `forecast_error.json` has n=46, `sufficient: false`
-  (checked 2026-07-20). Fold in the roof-open/closed Condition flag when this runs.
+  (checked 2026-07-20). The roof-state flag shipped separately in W4.20 (`roof_open`).
 - [ ] **C2. Lineup-uncertainty quantification** — probability-weighted lineup distribution before
   confirmation. Blocked on slate-archive accrual, **revisit ~late Aug 2026**. The retired Tools/6
   archive wrapper was the data-collection half — bring it back if this runs.
