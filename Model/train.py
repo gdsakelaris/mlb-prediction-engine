@@ -70,7 +70,7 @@ def _xgb_overrides():
 
 
 def make_clf(max_iter=300, eval_metric="mlogloss", tuned=False,
-             params=None):
+             params=None, seed=7):
     """XGBoost estimator factory (CUDA histogram trees). `params` wins
     outright (Optuna trials); else `tuned=True` applies the persisted
     xgb_params.json overrides (the PA tree only — hazard/A2 keep the
@@ -86,20 +86,51 @@ def make_clf(max_iter=300, eval_metric="mlogloss", tuned=False,
     return XGBClassifier(
         **kw, tree_method="hist", device="cuda",
         early_stopping_rounds=15, eval_metric=eval_metric,
-        n_jobs=-1, random_state=7, verbosity=0)
+        n_jobs=-1, random_state=seed, verbosity=0)
 
 
-def _fit_es(clf, Xtr, ytr):
-    """Fit with 5% held out as the early-stopping eval_set."""
-    rng = np.random.default_rng(7)
+def _fit_es(clf, Xtr, ytr, w=None, seed=7):
+    """Fit with 5% held out as the early-stopping eval_set. `w` =
+    optional training sample weights (the eval slice stays unweighted
+    so early stopping keeps judging current-fit quality evenly)."""
+    rng = np.random.default_rng(seed)
     idx = rng.permutation(len(ytr))
     cut = int(len(idx) * 0.95)
     take = ((lambda a, i: a.iloc[i]) if hasattr(Xtr, "iloc")
             else (lambda a, i: a[i]))
+    kw = {}
+    if w is not None:
+        kw["sample_weight"] = np.asarray(w)[idx[:cut]]
     clf.fit(take(Xtr, idx[:cut]), ytr[idx[:cut]],
             eval_set=[(take(Xtr, idx[cut:]), ytr[idx[cut:]])],
-            verbose=False)
+            verbose=False, **kw)
     return clf
+
+
+def _decay_weights(pa, mask, hl_years):
+    """Exponential recency weights for training rows: a PA hl_years
+    old counts half of one played yesterday. None -> unweighted."""
+    if hl_years is None:
+        return None
+    d = pd.to_datetime(pa["Date"])
+    age = (d[mask].max() - d[mask]).dt.days / 365.25
+    return np.power(0.5, age.values / float(hl_years))
+
+
+def _fit_bag(make, Xtr, ytr, w, seeds):
+    """One fit per seed, averaged via F.BaggedClf (single seed ->
+    the bare estimator, artifact shape unchanged)."""
+    members = [
+        _fit_es(make(s), Xtr, ytr, w=w, seed=s) for s in seeds]
+    return members[0] if len(members) == 1 else F.BaggedClf(members)
+
+
+# A1 PA-tree training config (design-eval gated, sweep 2026-07-20:
+# recency decay LOST at every half-life — hl5 +0.00009, hl3 +0.00034,
+# hl2 +0.00054 design logloss, old PAs carry signal the era features
+# don't; 3-seed bagging WON −0.00022)
+A1_DECAY_HL_YEARS = None       # recency half-life in years, None = off
+A1_BAG_SEEDS = (7, 17, 27)     # seed-bagged PA tree (W4.18)
 
 
 VectorScaler = F.VectorScaler
@@ -208,11 +239,15 @@ def _t3_matrix(Xf, bb_idx):
     return np.column_stack([Xf, d])
 
 
-def fit_a1_tree(pa, X, cal_year, a2d):
+def fit_a1_tree(pa, X, cal_year, a2d, hl_years=None, seeds=None):
     """Hierarchical contact tree: T1 {K,BB,HBP,in-play} and T3
     outcome|bb-type {out,1B,2B,3B,HR}, composed with A2 (=T2) into the
     flat 8-class vector + the class-conditional bb mix. Evaluated as
-    the COMPOSITE against the flat baselines."""
+    the COMPOSITE against the flat baselines. hl_years/seeds default
+    to the module config (A1_DECAY_HL_YEARS / A1_BAG_SEEDS)."""
+    hl_years = A1_DECAY_HL_YEARS if hl_years is None else hl_years
+    hl_years = None if hl_years in (0, "none") else hl_years
+    seeds = tuple(seeds or A1_BAG_SEEDS)
     y8 = pa["label"].map({c: i for i, c in enumerate(CLASSES)}).values
     tr = (pa["Season"] < cal_year).values
     ca = (pa["Season"] == cal_year).values
@@ -224,9 +259,13 @@ def fit_a1_tree(pa, X, cal_year, a2d):
     _banner(f"A1 TREE / T1 — PA gate ({len(F.T1_CLASSES)} classes, "
             f"{len(feats)} features)")
     _kv("train rows", f"{tr.sum():,}")
+    if hl_years or len(seeds) > 1:
+        _kv("config", f"decay hl={hl_years or 'off'}y, "
+            f"seeds={list(seeds)}")
+    w1 = _decay_weights(pa, tr, hl_years)
     t0 = time.time()
-    t1 = make_clf(tuned=True)
-    _fit_es(t1, Xf[tr], y1[tr])
+    t1 = _fit_bag(lambda s: make_clf(tuned=True, seed=s),
+                  Xf[tr], y1[tr], w1, seeds)
     s1 = VectorScaler().fit(t1.predict_proba(Xf[ca]), y1[ca])
     _kv("fit time", f"{time.time() - t0:.0f}s")
 
@@ -243,9 +282,10 @@ def fit_a1_tree(pa, X, cal_year, a2d):
     for j in range(1, 4):
         d3[bb_idx.values == j, j - 1] = 1.0
     X3 = np.column_stack([Xf, d3])
+    w3 = _decay_weights(pa, tr3, hl_years)
     t0 = time.time()
-    t3 = make_clf(tuned=True)
-    _fit_es(t3, X3[tr3], y3[tr3])
+    t3 = _fit_bag(lambda s: make_clf(tuned=True, seed=s),
+                  X3[tr3], y3[tr3], w3, seeds)
     s3 = VectorScaler().fit(t3.predict_proba(X3[ca3]), y3[ca3])
     _kv("fit time", f"{time.time() - t0:.0f}s")
 

@@ -16,26 +16,21 @@ reliability + trust depth) is measured in Tools/5's Goal Board/Reliability sheet
 
 - [ ] **`per` (starter ER) lean under PEN_CHOICE** — −0.00046, raw p=.016, BH-tie twice;
   plausibly inherited-runner ER attribution. Investigate only if it persists.
-- [ ] **Hit / 2+ Hits top-10 dip after W4-B** — −1.3 / −0.7 pts (~1.5 SE); confirm noise or
-  real give-back in the next A/B goal board.
+- [x] **Hit / 2+ Hits top-10 dip after W4-B** — RESOLVED by W4.18 (goal board: Hit +1.7,
+  2+ Hits +0.7 vs pre-bag; the dip was single-seed variance).
 - [ ] **pk / pbb per-line calibration** — holdout-positive but within noise at 46 slates;
   re-assess at the next calibration refresh (`evaluate.LINE_CAL_FAMS` is the one-line switch).
 - [ ] **Batter 0.80–0.90 stated bands run ~1–2 pts hot** (n≈1,800 pooled) — recheck on the
   next refreshed ledger.
 
-## In flight
-
-- [ ] **W4.17/W4.18 — time-decay training weights + seed-bagged A1** — hooks implemented
-  (`train.A1_DECAY_HL_YEARS` / `train.A1_BAG_SEEDS`, `F.BaggedClf`, defaults = off); design-eval
-  sweep (base vs hl 5/3/2y, then 3-seed bag on the winner) running 2026-07-20,
-  `Logs/w417_18_sweep_2026-07-20.log`. Win ⇒ full ship cycle; plateau ⇒ record and leave the
-  hooks for the annual retune slot.
-
 ## Wave 4 — remaining queue
 
-- [ ] **W4.14** Multi-library ensemble (LightGBM/CatBoost T1/T3 beside XGB, averaged) — the
-  bake-off half of B7 pulled forward. Skip if W4.18 seed-bagging ships (diminishing returns);
-  otherwise the biggest remaining discrimination lever.
+(W4.17 decay REJECTED by design sweep — all half-lives worse, verdict in the train.py config
+comment; W4.18 3-seed bagging SHIPPED 2026-07-20 — A/B aggregate CI-positive +0.00009, 20/20
+families non-negative, Hit top-10 +1.7 pts recovering the W4-B watch dip, walkforward better
+in all 5 folds. W4.14 multi-library ensemble folded into the B7 annual slot — bagging captured
+the cheap variance win; a second library is the expensive remainder.)
+
 - [ ] **W4.15** Serve sims 20k→50–100k by routing GUI/headless serve through the sim_batch GPU
   path — stabilizes top-of-sort ordering at similar wall time.
 - [ ] **W4.19** Confirmed-lineup re-serve habit + measurement: grade projected-vs-confirmed

@@ -2329,6 +2329,22 @@ def _derive_ondeck(rows):
     return pd.Series(df["OnDeckId"].values, index=rows.index)
 
 
+class BaggedClf:
+    """Average of independently-seeded fits of one estimator spec —
+    variance reduction for the PA tree. predict_proba = member mean;
+    lives here (like VectorScaler/PlattCal) for a stable pickle path."""
+
+    def __init__(self, members):
+        self.members = list(members)
+        self.classes_ = getattr(self.members[0], "classes_", None)
+
+    def predict_proba(self, X):
+        p = self.members[0].predict_proba(X)
+        for m in self.members[1:]:
+            p = p + m.predict_proba(X)
+        return p / len(self.members)
+
+
 def load_stores():
     """Everything assemble_features needs, loaded once."""
     s = {}
