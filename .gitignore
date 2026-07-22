@@ -15,3 +15,5 @@ Logs/
 Predictions/
 Tools/PROP_RANKINGS.xlsx
 Model/artifacts/
+
+.vscode
