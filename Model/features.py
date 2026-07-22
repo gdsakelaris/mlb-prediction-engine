@@ -66,6 +66,7 @@ import argparse
 import json
 import os
 import shutil
+import warnings
 from collections import deque
 from datetime import date
 from pathlib import Path
@@ -2349,6 +2350,35 @@ class BaggedClf:
         return p / len(self.members)
 
 
+class BlendClf:
+    """Heterogeneous ensemble: log-prob (geometric) mean within each
+    member group, then equal-weight log-prob mean across groups, so a
+    3-member XGB bag and a 3-member LGBM bag each carry half the vote
+    regardless of member count. Lives here (like BaggedClf) for a
+    stable pickle path."""
+
+    def __init__(self, groups):
+        self.groups = [list(g) for g in groups if g]
+        self.classes_ = getattr(self.groups[0][0], "classes_", None)
+
+    @property
+    def members(self):
+        return [m for g in self.groups for m in g]
+
+    def predict_proba(self, X):
+        acc = None
+        for g in self.groups:
+            lg = None
+            for m in g:
+                lp = np.log(np.clip(m.predict_proba(X), 1e-12, None))
+                lg = lp if lg is None else lg + lp
+            lg = lg / len(g)
+            acc = lg if acc is None else acc + lg
+        acc = acc / len(self.groups)
+        p = np.exp(acc - acc.max(axis=1, keepdims=True))
+        return p / p.sum(axis=1, keepdims=True)
+
+
 def load_stores():
     """Everything assemble_features needs, loaded once."""
     s = {}
@@ -3151,7 +3181,10 @@ def assemble_features(rows, stores):
                 [omap.get((s_, f_), np.nan)
                  for s_, f_ in zip(seas, fid)], dtype=float))
         arrs = np.vstack(arrs)
-        with np.errstate(all="ignore"):
+        # all-NaN position groups (no OAA coverage) mean NaN on purpose
+        # — XGB is missing-native; silence numpy's narration of it
+        with np.errstate(all="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
             if_oaa = np.nanmean(arrs[:4], axis=0)
             of_oaa = np.nanmean(arrs[4:], axis=0)
         out["def_oaa_if"] = if_oaa

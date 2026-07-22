@@ -1769,6 +1769,36 @@ def build_bets(out, date):
     return rows
 
 
+CLEAR_LEADER_LOGIT = 0.25   # #1->#2 log-odds margin for the top-pick flag
+
+
+def _flag_clear_leaders(ws, cols, pct_cols):
+    """Medium-border the top cell of each probability column whose
+    #1->#2 log-odds margin clears CLEAR_LEADER_LOGIT — the 'top pick
+    is not a near-tie' signal for the top-slot goal. Borders only:
+    grading owns fills and the workbook contract keeps all text
+    regular black, so the flag survives Tools/4 regrades untouched."""
+    from openpyxl.styles import Border, Side
+    med = Side(style="medium", color="FF000000")
+    lead = Border(left=med, right=med, top=med, bottom=med)
+    for j, c in enumerate(cols, start=1):
+        if c not in pct_cols:
+            continue
+        vals = []
+        for i in range(2, ws.max_row + 1):
+            v = ws.cell(row=i, column=j).value
+            if isinstance(v, (int, float)):
+                vals.append((float(v), i))
+        if len(vals) < 2:
+            continue
+        vals.sort(reverse=True)
+        (p1, i1), (p2, _) = vals[0], vals[1]
+        p1, p2 = (min(max(p, 1e-6), 1 - 1e-6) for p in (p1, p2))
+        margin = (np.log(p1 / (1 - p1)) - np.log(p2 / (1 - p2)))
+        if margin >= CLEAR_LEADER_LOGIT:
+            ws.cell(row=i1, column=j).border = lead
+
+
 def save_excel_slate(specs, out, path=None):
     """Aggregate sim results into the workbook (Batter Props, Pitching
     Props, Games, Bets). `out` is predict_slate()'s list."""
@@ -1847,12 +1877,14 @@ def save_excel_slate(specs, out, path=None):
                if c not in ("Game", "Team", "G#", "Slot", "Name", "ID",
                             "Career G") and not c.startswith("x")}
     write_sheet(ws, bat_cols, bat_rows, bat_pct)
+    _flag_clear_leaders(ws, bat_cols, bat_pct)
 
     ws = wb.create_sheet("Pitching Props")
     pit_rows = [r for f in frames for r in f["pit"]]
     pit_cols = list(pit_rows[0].keys()) if pit_rows else []
     pit_pct = {c for c in pit_cols if ">" in c}
     write_sheet(ws, pit_cols, pit_rows, pit_pct)
+    _flag_clear_leaders(ws, pit_cols, pit_pct)
 
     ws = wb.create_sheet("Games")
     game_rows = [f["game"] for f in frames]

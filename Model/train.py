@@ -89,6 +89,23 @@ def make_clf(max_iter=300, eval_metric="mlogloss", tuned=False,
         n_jobs=-1, random_state=seed, verbosity=0)
 
 
+def make_lgb_clf(tuned=False, seed=7):
+    """LightGBM member factory for the heterogeneous A1 blend. Tracks
+    the tuned XGB spec where the knobs map one-to-one; CPU histogram
+    trees (the pip wheel carries no CUDA)."""
+    import lightgbm as lgb
+    ov = _xgb_overrides() if tuned else {}
+    return lgb.LGBMClassifier(
+        n_estimators=int(ov.get("n_estimators", 600)),
+        learning_rate=float(ov.get("learning_rate", 0.05)),
+        num_leaves=int(ov.get("max_leaves", 63)),
+        min_child_samples=200,
+        reg_lambda=float(ov.get("reg_lambda", 1.0)),
+        subsample=float(ov.get("subsample", 1.0)), subsample_freq=1,
+        colsample_bytree=float(ov.get("colsample_bytree", 1.0)),
+        n_jobs=-1, random_state=seed, verbosity=-1)
+
+
 def _fit_es(clf, Xtr, ytr, w=None, seed=7):
     """Fit with 5% held out as the early-stopping eval_set. `w` =
     optional training sample weights (the eval slice stays unweighted
@@ -101,9 +118,15 @@ def _fit_es(clf, Xtr, ytr, w=None, seed=7):
     kw = {}
     if w is not None:
         kw["sample_weight"] = np.asarray(w)[idx[:cut]]
-    clf.fit(take(Xtr, idx[:cut]), ytr[idx[:cut]],
-            eval_set=[(take(Xtr, idx[cut:]), ytr[idx[cut:]])],
-            verbose=False, **kw)
+    es = [(take(Xtr, idx[cut:]), ytr[idx[cut:]])]
+    if clf.__class__.__module__.startswith("lightgbm"):
+        import lightgbm as lgb
+        clf.fit(take(Xtr, idx[:cut]), ytr[idx[:cut]], eval_set=es,
+                callbacks=[lgb.early_stopping(15, verbose=False),
+                           lgb.log_evaluation(0)], **kw)
+    else:
+        clf.fit(take(Xtr, idx[:cut]), ytr[idx[:cut]],
+                eval_set=es, verbose=False, **kw)
     return clf
 
 
@@ -117,11 +140,18 @@ def _decay_weights(pa, mask, hl_years):
     return np.power(0.5, age.values / float(hl_years))
 
 
-def _fit_bag(make, Xtr, ytr, w, seeds):
+def _fit_bag(make, Xtr, ytr, w, seeds, lgb_seeds=()):
     """One fit per seed, averaged via F.BaggedClf (single seed ->
-    the bare estimator, artifact shape unchanged)."""
+    the bare estimator, artifact shape unchanged). With lgb_seeds set,
+    a LightGBM bag joins via F.BlendClf — library-balanced log-prob
+    blend, each library half the vote."""
     members = [
         _fit_es(make(s), Xtr, ytr, w=w, seed=s) for s in seeds]
+    if lgb_seeds:
+        lmembers = [
+            _fit_es(make_lgb_clf(tuned=True, seed=s), Xtr, ytr,
+                    w=w, seed=s) for s in lgb_seeds]
+        return F.BlendClf([members, lmembers])
     return members[0] if len(members) == 1 else F.BaggedClf(members)
 
 
@@ -131,6 +161,10 @@ def _fit_bag(make, Xtr, ytr, w, seeds):
 # don't; 3-seed bagging WON −0.00022)
 A1_DECAY_HL_YEARS = None       # recency half-life in years, None = off
 A1_BAG_SEEDS = (7, 17, 27)     # seed-bagged PA tree (W4.18)
+A1_LGB_SEEDS = ()              # LightGBM blend REJECTED (W5.1 A/B
+# 2026-07-21: aggregate tie +0.00004, composite dead even 1.45695 vs
+# 1.45696, goal-board top-1 NET NEGATIVE ~-0.2pts/market — LGBM
+# dilutes the top slot; plumbing kept, seeds here re-arm it)
 
 
 VectorScaler = F.VectorScaler
@@ -239,15 +273,18 @@ def _t3_matrix(Xf, bb_idx):
     return np.column_stack([Xf, d])
 
 
-def fit_a1_tree(pa, X, cal_year, a2d, hl_years=None, seeds=None):
+def fit_a1_tree(pa, X, cal_year, a2d, hl_years=None, seeds=None,
+                lgb_seeds=None):
     """Hierarchical contact tree: T1 {K,BB,HBP,in-play} and T3
     outcome|bb-type {out,1B,2B,3B,HR}, composed with A2 (=T2) into the
     flat 8-class vector + the class-conditional bb mix. Evaluated as
-    the COMPOSITE against the flat baselines. hl_years/seeds default
-    to the module config (A1_DECAY_HL_YEARS / A1_BAG_SEEDS)."""
+    the COMPOSITE against the flat baselines. hl_years/seeds/lgb_seeds
+    default to the module config (A1_DECAY_HL_YEARS / A1_BAG_SEEDS /
+    A1_LGB_SEEDS)."""
     hl_years = A1_DECAY_HL_YEARS if hl_years is None else hl_years
     hl_years = None if hl_years in (0, "none") else hl_years
     seeds = tuple(seeds or A1_BAG_SEEDS)
+    lgb_seeds = tuple(A1_LGB_SEEDS if lgb_seeds is None else lgb_seeds)
     y8 = pa["label"].map({c: i for i, c in enumerate(CLASSES)}).values
     tr = (pa["Season"] < cal_year).values
     ca = (pa["Season"] == cal_year).values
@@ -259,13 +296,13 @@ def fit_a1_tree(pa, X, cal_year, a2d, hl_years=None, seeds=None):
     _banner(f"A1 TREE / T1 — PA gate ({len(F.T1_CLASSES)} classes, "
             f"{len(feats)} features)")
     _kv("train rows", f"{tr.sum():,}")
-    if hl_years or len(seeds) > 1:
+    if hl_years or len(seeds) > 1 or lgb_seeds:
         _kv("config", f"decay hl={hl_years or 'off'}y, "
-            f"seeds={list(seeds)}")
+            f"seeds={list(seeds)}, lgb_seeds={list(lgb_seeds)}")
     w1 = _decay_weights(pa, tr, hl_years)
     t0 = time.time()
     t1 = _fit_bag(lambda s: make_clf(tuned=True, seed=s),
-                  Xf[tr], y1[tr], w1, seeds)
+                  Xf[tr], y1[tr], w1, seeds, lgb_seeds)
     s1 = VectorScaler().fit(t1.predict_proba(Xf[ca]), y1[ca])
     _kv("fit time", f"{time.time() - t0:.0f}s")
 
@@ -285,7 +322,7 @@ def fit_a1_tree(pa, X, cal_year, a2d, hl_years=None, seeds=None):
     w3 = _decay_weights(pa, tr3, hl_years)
     t0 = time.time()
     t3 = _fit_bag(lambda s: make_clf(tuned=True, seed=s),
-                  X3[tr3], y3[tr3], w3, seeds)
+                  X3[tr3], y3[tr3], w3, seeds, lgb_seeds)
     s3 = VectorScaler().fit(t3.predict_proba(X3[ca3]), y3[ca3])
     _kv("fit time", f"{time.time() - t0:.0f}s")
 

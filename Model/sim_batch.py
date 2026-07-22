@@ -188,7 +188,13 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
     """Simulate G games x n_sims each; returns a list of per-game dicts
     shaped exactly like sim.run's output."""
     if backend == "gpu":
-        import cupy as xp
+        import warnings
+        with warnings.catch_warnings():
+            # pip cupy bundles its CUDA libs; the CUDA_PATH probe miss
+            # is cosmetic and the sims prove the GPU path works
+            warnings.filterwarnings(
+                "ignore", message="CUDA path could not be detected.*")
+            import cupy as xp
     else:
         xp = np
     G = len(preps)

@@ -587,14 +587,18 @@ def ab_compare(path_a, path_b, start=None, end=None, boot=500,
     gb_ = goal_metrics(m[["Date", "market"]].assign(p=pb, y=y))
     gsec = ga.merge(gb_, on="market", suffixes=("_a", "_b"))
     gsec["d_auc"] = (gsec.auc_b - gsec.auc_a).round(4)
+    gsec["d_t1"] = (gsec.t1_hit_b - gsec.t1_hit_a).round(4)
+    gsec["d_t3"] = (gsec.t3_hit_b - gsec.t3_hit_a).round(4)
     gsec["d_t10"] = (gsec.t10_hit_b - gsec.t10_hit_a).round(4)
     gsec = gsec[["market", "n_a", "auc_a", "auc_b", "d_auc",
+                 "t1_hit_a", "t1_hit_b", "d_t1",
+                 "t3_hit_a", "t3_hit_b", "d_t3",
                  "t10_hit_a", "t10_hit_b", "d_t10",
                  "trust_depth_a", "trust_depth_b"]].rename(
         columns={"n_a": "n"})
-    print("\ngoal board (ranking-only, raw p; top-10/slate hit rate, "
-          "AUC, trust depth; positive delta = B better):")
-    print(gsec.sort_values("d_t10", ascending=False)
+    print("\ngoal board (ranking-only, raw p; top-1/3/10 per-slate hit "
+          "rates, AUC, trust depth; positive delta = B better):")
+    print(gsec.sort_values("d_t1", ascending=False)
           .to_string(index=False))
     return rep
 
@@ -630,6 +634,8 @@ def goal_metrics(df, top_n=GOAL_TOP_N, boot=GOAL_BOOT, seed=7):
                if 0.0 < rate < 1.0 else np.nan)
         srt = g.sort_values("p", ascending=False)
         top = srt.groupby("Date", sort=False).head(top_n)
+        top1 = srt.groupby("Date", sort=False).head(1)
+        top3 = srt.groupby("Date", sort=False).head(3)
         hi = g[g.p > 0.5]
         depth = 0
         if boot:
@@ -664,6 +670,8 @@ def goal_metrics(df, top_n=GOAL_TOP_N, boot=GOAL_BOOT, seed=7):
         out.append(dict(
             market=str(mkt), n=len(g), base=round(rate, 4),
             auc=round(auc, 4) if np.isfinite(auc) else np.nan,
+            t1_hit=round(float(top1.y.mean()), 4),
+            t3_hit=round(float(top3.y.mean()), 4),
             t10_stated=round(float(top.p.mean()), 4),
             t10_hit=round(float(top.y.mean()), 4),
             t10_gap=round(float(top.y.mean() - top.p.mean()), 4),
