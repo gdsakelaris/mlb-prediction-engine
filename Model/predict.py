@@ -72,6 +72,16 @@ PEN_EXIT_M = 12          # B4 per-pitcher exit tables: league pseudo-
 PEN_WAVE3 = os.environ.get("PEN_WAVE3", "1") != "0"
 PEN_CHOICE = os.environ.get("PEN_CHOICE", "1") != "0"
 
+# Displayed/ranked workbook probabilities blend logit-space with the
+# two-sided de-vigged market fair price wherever one is captured for
+# that exact (player/team, market, line); pure model everywhere else.
+# The Bets sheet EV, the CLV gate, and replay ledgers stay pure model
+# by construction — blending toward the market's own fair would blind
+# edge detection and poison calibration fits. MKT_BLEND=0 serves pure
+# model for paired comparisons.
+MKT_BLEND = os.environ.get("MKT_BLEND", "1") != "0"
+MKT_BLEND_W = 0.5
+
 K_LINES = [3.5, 4.5, 5.5, 6.5, 7.5, 8.5]
 OUT_LINES = [14.5, 15.5, 16.5, 17.5, 18.5]
 PHA_LINES = [3.5, 4.5, 5.5, 6.5]
@@ -1209,9 +1219,18 @@ class Predictor:
                               is_dh_game=bool(spec.get("is_dh")))
                 res["meta"] = meta
                 out.append(res)
+        mf = None
+        if MKT_BLEND and getattr(self, "mkt_blend", True) and specs:
+            try:
+                mf = _market_fair_maps(specs[0]["date"])
+            except Exception as e:          # noqa: BLE001
+                print(f"market blend unavailable ({e}); serving pure "
+                      f"model", flush=True)
         for gi, (spec, res) in enumerate(zip(specs, out)):
             res["spec"] = spec
             res["calib"] = self.calib
+            if mf is not None:
+                res["mktfair"] = mf
             if hctx is not None:
                 res["heads"] = self.heads
                 res["hctx"] = hctx[gi]
@@ -1348,6 +1367,194 @@ def _line_of(market):
         return float(str(market).split(">")[-1])
     except (TypeError, ValueError):
         return np.nan
+
+
+# engine prop key -> workbook column, joined with O.PROP_MARKET to give
+# (odds-API market, line) -> column for the display blend
+_MKT_KEY_COL = {
+    "hr": "HR", "hit": "Hit", "hits2": "2+ Hits", "single": "Single",
+    "double": "Double", "tb2": "2+ TB", "tb3": "3+ TB", "tb4": "4+ TB",
+    "run": "Run", "run2": "2+ Runs", "rbi": "RBI", "rbi2": "2+ RBI",
+    "hrr2": "H+R+RBI 2+", "hrr3": "H+R+RBI 3+", "hrr4": "H+R+RBI 4+",
+    "bb": "BB", "sb": "SB", "bk": "K", "bk2": "2+ K", "bk3": "3+ K"}
+_MKT_BAT_COL = {(m["api"], m["line"]): _MKT_KEY_COL[k]
+                for k, m in O.PROP_MARKET.items() if k in _MKT_KEY_COL}
+_MKT_PIT_STEM = {"pitcher_strikeouts": "K", "pitcher_outs": "Outs",
+                 "pitcher_hits_allowed": "Hits", "pitcher_walks": "BB",
+                 "pitcher_earned_runs": "ER"}
+
+
+# one-sided price haircut for the display blend: fair ~= 0.9336 x the
+# median implied Over across books (measured on 25,394 two-sided
+# groups 2026-07-08..22; stable 0.930-0.945 across every market —
+# re-measure at calibration refreshes). Books post whole boards
+# Over-only some days (batter hits/RBI); the ranking signal in those
+# prices is real, only the vig level is not. Bets EV and the CLV gate
+# still require true two-sided sharp_fair.
+R_ONESIDED = 0.9336
+
+
+def _soft_fair(recs):
+    """Fair prob for the display blend: two-sided sharp_fair when
+    available, else the haircut one-sided consensus, else None."""
+    f = O.sharp_fair(recs)
+    if f is not None:
+        return f
+    over = [O.american_to_prob(r.get("OverPrice")) for r in recs]
+    over = [x for x in over if x is not None]
+    if over:
+        return float(np.clip(np.median(over) * R_ONESIDED,
+                             1e-6, 1 - 1e-6))
+    under = [O.american_to_prob(r.get("UnderPrice")) for r in recs]
+    under = [x for x in under if x is not None]
+    if under:
+        return float(np.clip(1.0 - np.median(under) * R_ONESIDED,
+                             1e-6, 1 - 1e-6))
+    return None
+
+
+def _blend_p(p, fair, w=None):
+    """Logit-space blend of the served probability with the market
+    fair, weight w on the market (0.5 default; re-tune at calibration
+    refreshes once the odds archive supports per-family weights)."""
+    w = MKT_BLEND_W if w is None else w
+    p = min(max(float(p), 1e-6), 1 - 1e-6)
+    f = min(max(float(fair), 1e-6), 1 - 1e-6)
+    z = ((1 - w) * np.log(p / (1 - p)) + w * np.log(f / (1 - f)))
+    return float(np.clip(1.0 / (1.0 + np.exp(-z)), 1e-6, 1 - 1e-6))
+
+
+def _market_fair_maps(date):
+    """One slate date's market fair prices for the display blend,
+    keyed for the workbook: 'bat'/'pit' by (pid, col), 'game' by
+    (team, col) — h2h under the HOME club as '_home_wp', team totals
+    under their own club as 'TT > x'. Fair = sharp_fair when two-sided,
+    else the R_ONESIDED haircut consensus. Each value is {GamePk: fair}
+    (-1 = pk absent) so doubleheader prices resolve to the right game;
+    an uncaptured market stays pure model. None when the store has
+    nothing for the date."""
+    try:
+        o = pd.read_csv(O.DEFAULT_STORE)
+    except OSError:
+        return None
+    o = o[o["Date"] == str(date)]
+    if o.empty:
+        return None
+    maps = {"bat": {}, "pit": {}, "game": {}}
+    props = o[o["PlayerId"].notna()]
+    for (pid, mkt, line), grp in props.groupby(
+            ["PlayerId", "Market", "Line"]):
+        col = _MKT_BAT_COL.get((mkt, line))
+        dst = maps["bat"]
+        if col is None:
+            stem = _MKT_PIT_STEM.get(mkt)
+            if stem is None:
+                continue
+            col, dst = f"{stem} > {line}", maps["pit"]
+        f = _soft_fair(grp.to_dict("records"))
+        if f is None:
+            continue
+        gpk = grp["GamePk"].dropna()
+        key = int(gpk.iloc[0]) if len(gpk) else -1
+        dst.setdefault((int(pid), col), {})[key] = f
+    for (team, mkt, line), grp in o[o["PlayerId"].isna()].groupby(
+            ["Team", "Market", "Line"], dropna=False):
+        if mkt == "h2h":
+            col = "_home_wp"
+        elif mkt == "totals":
+            col = f"Runs > {line}"
+        elif mkt == "team_totals":
+            col = f"TT > {line}"
+        else:
+            continue
+        f = _soft_fair(grp.to_dict("records"))
+        if f is None:
+            continue
+        gpk = grp["GamePk"].dropna()
+        key = int(gpk.iloc[0]) if len(gpk) else -1
+        maps["game"].setdefault((str(team), col), {})[key] = f
+    return maps if any(maps.values()) else None
+
+
+def _mkt_lookup(dst, key0, col, gpk):
+    d = dst.get((key0, col))
+    if not d:
+        return None
+    if gpk in d:
+        return d[gpk]
+    return next(iter(d.values())) if len(d) == 1 else None
+
+
+def _blend_market(mf, spec, bat_rows, pit_rows, grow, away, home):
+    """Blend market fairs into the three display sheets' rows, then
+    re-run every ladder guard (blend coverage varies by rung, so a
+    blended rung may cross an unblended neighbor). Returns cells
+    blended."""
+    gpk = int(spec.get("game_pk") or -1)
+    n = 0
+    fam_cols = {}
+    for c, fam in COL_FAM.items():
+        fam_cols.setdefault(fam, []).append(c)
+    for br in bat_rows:
+        pid = int(br["ID"])
+        for col in COL_FAM:
+            f = _mkt_lookup(mf["bat"], pid, col, gpk)
+            if f is not None:
+                br[col] = _blend_p(br[col], f)
+                n += 1
+        for cols in fam_cols.values():
+            lo = None
+            for c in cols:
+                if lo is not None and br[c] > lo:
+                    br[c] = lo
+                lo = br[c]
+    for pr_ in pit_rows:
+        pid = int(pr_["ID"])
+        for col in list(pr_):
+            if " > " in str(col):
+                f = _mkt_lookup(mf["pit"], pid, col, gpk)
+                if f is not None:
+                    pr_[col] = _blend_p(pr_[col], f)
+                    n += 1
+        for pref in PIT_FAM:
+            lo = None
+            for c in pr_:
+                if str(c).startswith(pref):
+                    if lo is not None and pr_[c] > lo:
+                        pr_[c] = lo
+                    lo = pr_[c]
+    f = _mkt_lookup(mf["game"], home, "_home_wp", gpk)
+    if f is not None:
+        hw = _blend_p(grow["_home_wp"], f)
+        grow["_home_wp"] = hw
+        grow["Winner"] = home if hw >= 0.5 else away
+        grow["Win Prob"] = max(hw, 1 - hw)
+        n += 1
+    for x in TOTAL_LINES:
+        f = _mkt_lookup(mf["game"], home, f"Runs > {x}", gpk)
+        if f is not None:
+            grow[f"Runs > {x}"] = _blend_p(grow[f"Runs > {x}"], f)
+            n += 1
+    for team, side in ((away, "Away"), (home, "Home")):
+        for x in TEAM_TOTAL_LINES:
+            f = _mkt_lookup(mf["game"], team, f"TT > {x}", gpk)
+            if f is not None:
+                grow[f"{side} Runs > {x}"] = _blend_p(
+                    grow[f"{side} Runs > {x}"], f)
+                n += 1
+    lo = None
+    for x in TOTAL_LINES:
+        if lo is not None and grow[f"Runs > {x}"] > lo:
+            grow[f"Runs > {x}"] = lo
+        lo = grow[f"Runs > {x}"]
+    for side in ("Away", "Home"):
+        lo = None
+        for x in TEAM_TOTAL_LINES:
+            c = f"{side} Runs > {x}"
+            if lo is not None and grow[c] > lo:
+                grow[c] = lo
+            lo = grow[c]
+    return n
 
 
 def _apply_heads(heads, ctx, deft, season, bat_rows, pit_rows, grow,
@@ -1567,7 +1774,11 @@ def game_frame(res):
         _apply_heads(res["heads"], res["hctx"], res.get("hdef") or {},
                      int(meta["season"]), bat_rows, pit_rows, grow,
                      away, home, thr=res.get("thr"))
-    return dict(bat=bat_rows, pit=pit_rows, game=grow)
+    bn = 0
+    if res.get("mktfair"):
+        bn = _blend_market(res["mktfair"], spec, bat_rows, pit_rows,
+                           grow, away, home)
+    return dict(bat=bat_rows, pit=pit_rows, game=grow, blend_n=bn)
 
 
 GAME_COLS = (["Game", "Date", "Venue", "Winner", "Win Prob",
@@ -1808,6 +2019,10 @@ def save_excel_slate(specs, out, path=None):
     from openpyxl.utils import get_column_letter
 
     frames = [game_frame(r) for r in out]
+    bn = sum(f.get("blend_n", 0) for f in frames)
+    print(f"  market blend: {bn:,} cells"
+          + ("" if bn else " (no two-sided prices for this date)"),
+          flush=True)
     date = str(specs[0]["date"]) if specs else dt.date.today().isoformat()
     PRED_DIR.mkdir(exist_ok=True)
     if path is None:

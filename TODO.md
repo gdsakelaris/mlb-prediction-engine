@@ -1,7 +1,9 @@
 # Open Items
 
-Trimmed 2026-07-20 (second trim, after W4-A/W4.16/W4-B/W4.12/W4.13 shipped — evidence and
-verdicts live in Logs/*_2026-07-20.log, the goal-metric memory, and git history of this file).
+Updated 2026-07-22 (post-W5.1: ensemble avenue closed, top-1 promoted to first-class goal,
+served goal tracker live). Trimmed 2026-07-20 (second trim, after W4-A/W4.16/W4-B/W4.12/W4.13
+shipped — evidence and verdicts live in Logs/*_2026-07-20.log, the goal-metric memory, and git
+history of this file).
 
 **Ship discipline:** paired replay A/B (`evaluate --ab`) + `pytest` green before a change
 serves — that is the whole per-ship gate. `Model/walkforward.py` (rolling-origin folds
@@ -9,10 +11,13 @@ serves — that is the whole per-ship gate. `Model/walkforward.py` (rolling-orig
 STRUCTURAL changes (new model class, loss, sampling scheme, hyperparameter retune), not per
 shipped feature (user policy 2026-07-20). Env gates `PEN_WAVE3` / `PEN_CHOICE` in predict.py
 reproduce pre-pen-wave behavior ("0") for paired A/Bs. **Goal metric** (top-10/slate precision + >50% monotone
-reliability + trust depth) is measured in Tools/5's Goal Board/Reliability sheets and the
-`--ab` goal section. **Calibration refresh cadence:** rerun the extended replay →
-`--fit-calibrators --reuse-rows` → `heads --train` at every wave boundary + ~monthly in-season
-(~45 min GPU; procedure in the goal-metric memory).
+reliability + trust depth, and since 2026-07-21 **top-1** as a first-class goal — gate ship
+decisions on top-5/10, watch/report top-1 since it's 1 obs/market/slate) is measured in
+Tools/5's Goal Board/Reliability sheets, the `--ab` goal section (t1/t3/t10), and the SERVED
+tracker "Tools/6) Goal Tracker.py" → artifacts/served_goal_tracker.csv (run after each Tools/4
+grade; scopes all + confirmed-lineup). **Calibration refresh cadence:** rerun the extended
+replay → `--fit-calibrators --reuse-rows` → `heads --train` at every wave boundary + ~monthly
+in-season (~45 min GPU; procedure in the goal-metric memory).
 
 ## Watch (check in the next paired A/B or calibration refresh)
 
@@ -29,6 +34,12 @@ reliability + trust depth) is measured in Tools/5's Goal Board/Reliability sheet
   strongly (+0.006). `evaluate.LINE_CAL_FAMS` unchanged = ("pout",).
 - [ ] **Batter 0.80–0.90 stated bands** — still +1.1 pts hot on the W4.20 ledger (n=1,847,
   ≈1.2σ); persistent lean but not decisive. Recheck at next refresh.
+- [ ] **Batter top-1 weakness (served)** — first Tools/6 board (10 slates 07-07..07-20):
+  pitcher top picks elite (K>4.5 / Outs>14.5 / K / K>3.5 all 10/10 at t1, med margin12
+  0.15–0.34) but batter top slots weak (best 0.7, 2+ Hits 0.1; margins 0.02–0.09) — top-pick
+  trust = pitcher markets, confirming the clear-leader asymmetry (serve smoke: 10 pitcher /
+  0 batter clear-leader flags). Keep the tracker current after each grade; this series is the
+  primary input to the late-Aug W4.21 decision.
 
 ## Wave 4 — remaining queue
 
@@ -46,6 +57,19 @@ tie aggregate lean-positive, walkforward better all 5 folds vs pre-wave. W4.19 v
 retired 07-19, lineup provenance = away/home_lineup_src in slate JSON + serve printout; the
 re-serve-on-confirmation habit is manual process — C2 automates the quantification later.)
 
+(W5.1 heterogeneous ensemble REJECTED 2026-07-21, Logs/w5ens_cycle_2026-07-21.log: 3-seed
+LGBM bag blended into the XGB bag via F.BlendClf — paired A/B on 1.71M rows/298 slates was an
+aggregate TIE +0.00004, 0/20 families significant after BH, A1 composite dead even, and
+goal-board top-1 NET NEGATIVE ≈ −0.2 pts/market (LGBM, weaker solo, dilutes the top slot);
+no-harm ties ship only with ranking wins, so rolled back from artifacts/pre_w5ens_2026-07-21/.
+Plumbing kept — train.py A1_LGB_SEEDS re-arms it. CatBoost probe same day
+(Logs/cb_probe_2026-07-21.log): fails the pre-registered solo-parity gate by 3x (+0.00145
+composite). **ENSEMBLE AVENUE CLOSED** — two data points; NN-as-member closed with it; re-open
+only with a member at solo parity. KEPT from the cycle: --ab goal board t1/t3 columns,
+predict.py clear-leader border flag (CLEAR_LEADER_LOGIT=0.25), Tools/6 served tracker +
+10-slate backfill. Ledgers: rows_prew5.parquet = shipped-stack baseline for the next A/B;
+rows_w5ens_reject.parquet = rejected blend rows.)
+
 - [ ] **W4.21 (research — DEFERRED one measurement cycle, decision 2026-07-20)** Within-slate
   ranking overlay (LambdaRank-style display reranker, served probabilities untouched).
   Deferred because: (a) the measured top-10 shortfall comes from the 4k-sim goal board, which
@@ -58,9 +82,29 @@ re-serve-on-confirmation habit is manual process — C2 automates the quantifica
   grade SERVED workbooks' top-10 precision on confirmed-lineup slates (W4.19 split) + rerun
   the goal board; take up W4.21 only if Hit / K / Single / H+R+RBI 2+ / 2+ TB — the columns
   where "most of top 10" is honestly reachable — still sit short of their ceilings.
-- [ ] **W4.22 (user decision — DECLINED for now, may reconsider later)** Odds-blended workbook
-  column (dual output: pure model for gate/CLV, blend for display). Do not implement without
-  explicit user choice.
+  (2026-07-21 update: the served-precision half of that evidence now accrues automatically in
+  artifacts/served_goal_tracker.csv — Tools/6, confirmed scope; first board = batter top-1
+  weakness watch above. Top-1 promotion raises the stakes of this decision but the deferral
+  logic stands.)
+- [x] **W4.22 SHIPPED 2026-07-22 (user approved same day, "blend everything possible")** —
+  displayed workbook probabilities now blend 50/50 in logit space with the market fair price
+  wherever one is captured for that exact (player/team, market, line): all three grid sheets
+  (batter cols, pitcher ladders, Win Prob/totals/team totals). Pure model preserved by
+  construction in the Bets sheet EV, the CLV gate, and every replay ledger (`P.mkt_blend=False`
+  in evaluate.py replay/gate paths; `MKT_BLEND=0` serves pure model for paired comparisons;
+  `MKT_BLEND_W=0.5` in predict.py). Fair = `sharp_fair` two-sided, else `R_ONESIDED=0.9336`
+  haircut on the one-sided consensus (measured on 25,394 two-sided groups, stable 0.930–0.945
+  across all 15 markets — books post hits/RBI boards Over-only some days; re-measure at
+  refreshes). Ladder guards re-run post-blend. Evidence basis: market benchmark 2026-07-22
+  (11 served slates, same-universe: market out-ranks model on batter top-K ~3–7 pts at
+  t3/t5/t10 at BOTH open and close, Hit t1 .82 vs .46; memory market-benchmark-2026-07-22;
+  rerun pattern scratchpad market_bench.py). Ship gate: pytest 30/30 + paired smoke serve on
+  the 07-22 slate (blend-off vs blend-on, same seed: Bets bit-identical, pure cols identical,
+  4,410 cells blended, 100% moved toward market, exact 50/50 logit blend, all ladders
+  monotone). Replay A/B is blind to display-layer changes by design — the live judge is
+  Tools/6: compare served top-K on post-07-22 slates vs the pre-blend series at the late-Aug
+  review. Weight/haircut re-tune (per-family w once the odds archive supports it) rides the
+  calibration-refresh cadence.
 
 ## Blocked (future unblock dates)
 
@@ -68,14 +112,19 @@ re-serve-on-confirmation habit is manual process — C2 automates the quantifica
   forecast-error distribution. Blocked: `forecast_error.json` has n=46, `sufficient: false`
   (checked 2026-07-20). The roof-state flag shipped separately in W4.20 (`roof_open`).
 - [ ] **C2. Lineup-uncertainty quantification** — probability-weighted lineup distribution before
-  confirmation. Blocked on slate-archive accrual, **revisit ~late Aug 2026**. The retired Tools/6
-  archive wrapper was the data-collection half — bring it back if this runs.
+  confirmation. Blocked on slate-archive accrual, **revisit ~late Aug 2026**. The retired serve
+  archiver (built/retired 2026-07-20; copy in that session's scratchpad retired_tools/) was the
+  data-collection half — bring it back if this runs. (Its old "Tools/6" slot is now the Goal
+  Tracker — unrelated tool.)
 
 ## Annual retune slot only (do not do mid-season)
 
-- [ ] **B7. Per-component Optuna + library bake-off** — separate studies for T1/T3/A2/hazard/SB
-  plus a one-time XGB vs LightGBM/CatBoost/regularized-linear comparison. Wave 1 found a flat
-  plateau (+0.0006); low expected value. W4.14/W4.17/W4.18 outcomes feed this slot.
+- [ ] **B7. Per-component Optuna + library bake-off** — separate studies for T1/T3/A2/hazard/SB.
+  Wave 1 found a flat plateau (+0.0006); low expected value. The library bake-off half is now
+  largely RESOLVED by W5.1 (2026-07-21): LGBM blend rejected by full A/B (top-1 net negative),
+  CatBoost fails solo parity 3x the pre-registered gate — ensemble avenue closed; what remains
+  for this slot is per-component hyperparam studies only, plus re-opening the member question
+  ONLY if some library reaches solo parity (probe pattern: scratchpad cb_probe.py).
 - [ ] **B8. Multi-fold hyperparam scoring** — when B7 runs, score on aggregate out-of-fold log
   loss across chronological folds (…→2021 … …→2024) instead of the single 2024 design year.
 

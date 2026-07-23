@@ -7,8 +7,9 @@ REM                                     price; a later manual rerun near
 REM                                     first pitch tightens the close)
 REM Guarantees every game day has at least one archived slate and one
 REM early-ish odds capture even if the manual game-day workflow is missed.
-REM Manual serving/grading is unchanged. Logs to Logs\noon_YYYY-MM-DD.log;
-REM exit 1 if any step failed.
+REM Manual serving is unchanged; grading + the served tracker were folded
+REM into the 6 AM job 2026-07-23 (Scrapers\run_daily_update.cmd).
+REM Logs to Logs\noon_YYYY-MM-DD.log; exit 1 if any step failed.
 
 set "ROOT=%~dp0.."
 REM preferred interpreter (the install with the full ML stack). If that exact

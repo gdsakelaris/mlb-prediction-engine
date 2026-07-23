@@ -120,6 +120,7 @@ def replay_rows(start, end, n_sims=4000, max_games=None, progress=True):
     # (market_gate) keeps its own single _cal application.
     P.calib = {}
     P.heads = None
+    P.mkt_blend = False   # display-only market blend never enters rows
     games = P.stores.raw["games"]
     span = games[(games.Date >= pd.Timestamp(start))
                  & (games.Date <= pd.Timestamp(end))]
@@ -233,6 +234,7 @@ def replay_rows_batch(start, end, n_sims=4000, chunk=64, progress=True,
     P = PR.Predictor()
     P.calib = {}     # RAW rows by contract — see replay_rows
     P.heads = None
+    P.mkt_blend = False
     games = P.stores.raw["games"]
     span = games[(games.Date >= pd.Timestamp(start))
                  & (games.Date <= pd.Timestamp(end))]
@@ -767,6 +769,7 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
     captured odds changed since the last run (gate_rows_cache.parquet);
     unchanged slates load their graded rows from the cache."""
     P = PR.Predictor()
+    P.mkt_blend = False   # gate grades the PURE model vs the market
     _warn_calib_overlap(P.calib, start, end, "CLV gate")
     odds = pd.read_csv(O.DEFAULT_STORE, encoding="utf-8-sig",
                        low_memory=False)
