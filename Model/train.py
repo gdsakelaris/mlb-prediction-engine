@@ -635,9 +635,11 @@ def main():
         F.write_artifact(ART / f"{name}.joblib",
                          lambda p, o=obj: joblib.dump(o, p))
     if not (ART / "latent.json").exists():
-        (ART / "latent.json").write_text(json.dumps(
-            dict(fitted=False, mu_env=0.0, sigma_env=0.0,
-                 sigma_pitcher=0.0, sigma_hr=0.0), indent=1))
+        F.write_artifact(ART / "latent.json",
+                         lambda p: p.write_text(json.dumps(
+                             dict(fitted=False, mu_env=0.0, sigma_env=0.0,
+                                  sigma_pitcher=0.0, sigma_hr=0.0),
+                             indent=1)))
         print("latent.json: defaults written (run --fit-latent after "
               "sim.py exists)", flush=True)
     manifest = dict(

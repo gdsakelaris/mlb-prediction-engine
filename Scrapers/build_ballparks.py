@@ -29,6 +29,8 @@ from pathlib import Path
 
 import requests
 
+from seasons import atomic_write
+
 DATA_DIR = Path(__file__).resolve().parents[1] / "Data"
 
 # Ballpark, Team, Dimensions (as published), latitude, longitude, roof.
@@ -158,7 +160,7 @@ def main():
         })
         print(f"{name}: LF {lf} / CF {cf} / RF {rf}, {elev} ft, {roof}")
 
-    with open(args.output, "w", newline="", encoding="utf-8-sig") as f:
+    with atomic_write(args.output, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=["Ballpark", "Team", "LF", "CF",
                                                "RF", "Elevation_ft", "Lat",
                                                "Lon", "Roof"])

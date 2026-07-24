@@ -43,7 +43,7 @@ from pathlib import Path
 
 import requests
 
-from seasons import YEARS
+from seasons import YEARS, atomic_write
 
 API = "https://statsapi.mlb.com/api/v1"
 
@@ -311,7 +311,7 @@ def main():
                       file=sys.stderr)
                 sys.exit(1)
             if changed:
-                with open(cache_file, "w", encoding="utf-8") as f:
+                with atomic_write(cache_file, "w", encoding="utf-8") as f:
                     json.dump(data, f)
                 print(f"{season}: cache upgraded "
                       f"({len(data['games'])} games incl. postseason)")
@@ -322,7 +322,7 @@ def main():
                 print(f"{season}: FAILED ({e})", file=sys.stderr)
                 sys.exit(1)
             if season != newest:  # completed seasons never change
-                with open(cache_file, "w", encoding="utf-8") as f:
+                with atomic_write(cache_file, "w", encoding="utf-8") as f:
                     json.dump(data, f)
             print(f"{season}: {len(data['games'])} games, "
                   f"{len(data['batting'])} batting lines, "
@@ -340,7 +340,7 @@ def main():
     for name, cols, rows in outputs:
         path = os.path.join(args.outdir, name)
         # utf-8-sig so Excel renders accented names correctly
-        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        with atomic_write(path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=cols)
             writer.writeheader()
             writer.writerows(rows)

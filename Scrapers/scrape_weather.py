@@ -35,6 +35,8 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+from seasons import atomic_write
+
 DATA_DIR = Path(__file__).resolve().parents[1] / "Data"
 DEFAULT_OUT = DATA_DIR / "mlb_weather.csv"
 GAMES_CSV = DATA_DIR / "mlb_games.csv"
@@ -205,7 +207,8 @@ def main():
     fresh = (fresh.drop_duplicates("GamePk", keep="last")
              .sort_values(["Date", "GamePk"]))
     out_path.parent.mkdir(exist_ok=True)
-    fresh.to_csv(out_path, index=False, encoding="utf-8-sig")
+    with atomic_write(out_path, "w", newline="", encoding="utf-8-sig") as f:
+        fresh.to_csv(f, index=False)
     print(f"wrote {len(fresh):,} rows -> {out_path}", flush=True)
 
 

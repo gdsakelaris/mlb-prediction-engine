@@ -34,7 +34,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 
-from seasons import CURRENT_SEASON, YEARS
+from seasons import CURRENT_SEASON, YEARS, atomic_write
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "Data"
 OUT_EVENTS = DATA_DIR / "mlb_il_events.csv"
@@ -177,11 +177,13 @@ def main():
               .drop_duplicates(EVENT_COLS)
               .sort_values(["PlayerId", "Date"]))
     OUT_EVENTS.parent.mkdir(exist_ok=True)
-    events.to_csv(OUT_EVENTS, index=False, encoding="utf-8-sig")
+    with atomic_write(OUT_EVENTS, "w", newline="", encoding="utf-8-sig") as f:
+        events.to_csv(f, index=False)
     print(f"wrote {len(events):,} events -> {OUT_EVENTS}", flush=True)
 
     stints = build_stints(events)
-    stints.to_csv(OUT_STINTS, index=False, encoding="utf-8-sig")
+    with atomic_write(OUT_STINTS, "w", newline="", encoding="utf-8-sig") as f:
+        stints.to_csv(f, index=False)
     done = stints["ActDate"].notna().sum()
     print(f"wrote {len(stints):,} stints ({done:,} completed) -> "
           f"{OUT_STINTS}", flush=True)

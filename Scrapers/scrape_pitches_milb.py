@@ -30,6 +30,7 @@ Usage:
 
 import argparse
 import io
+import os
 import time
 from datetime import date, timedelta
 from pathlib import Path
@@ -38,7 +39,7 @@ import pandas as pd
 import requests
 
 import scrape_pitches as SP
-from seasons import YEARS
+from seasons import YEARS, atomic_write
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "Data"
 RAW_DIR = DATA_DIR / "raw_pitches_milb"
@@ -152,12 +153,19 @@ def write_raw(year, frames):
     for c in df.select_dtypes(include="object").columns:
         df[c] = df[c].astype(str).where(df[c].notna())
     path = RAW_DIR / f"pitches_{year}.parquet"
+    tmp = path.with_name(path.name + ".tmp")
     try:
-        df.to_parquet(path, index=False, compression="zstd")
+        df.to_parquet(tmp, index=False, compression="zstd")
     except Exception as e:                              # noqa: BLE001
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
         path = RAW_DIR / f"pitches_{year}.csv.gz"
+        tmp = path.with_name(path.name + ".tmp")
         print(f"    parquet failed ({e}); falling back to csv.gz", flush=True)
-        df.to_csv(path, index=False, compression="gzip")
+        df.to_csv(tmp, index=False, compression="gzip")
+    os.replace(tmp, path)
     print(f"    raw archive: {len(df):,} pitches -> {path.name}", flush=True)
 
 
@@ -230,7 +238,8 @@ def main():
                                    keep="last")
                .sort_values(["PlayerId", "Date"]))
         path.parent.mkdir(exist_ok=True)
-        new.to_csv(path, index=False, encoding="utf-8-sig")
+        with atomic_write(path, "w", newline="", encoding="utf-8-sig") as f:
+            new.to_csv(f, index=False)
         print(f"wrote {len(new):,} rows -> {path}", flush=True)
 
     finish(kept_p, pit_frames, p_path)

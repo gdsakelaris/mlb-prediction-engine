@@ -22,6 +22,8 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
+from seasons import atomic_write
+
 DATA_DIR = Path(__file__).resolve().parents[1] / "Data"
 
 TEAMS = {
@@ -146,7 +148,7 @@ def main():
 
     fieldnames = ["PlayerId", "Name", "Team", "Position", "B", "T", "Ht", "Wt", "DOB"]
     # utf-8-sig so Excel renders accented names (José, Berríos) correctly.
-    with open(args.output, "w", newline="", encoding="utf-8-sig") as f:
+    with atomic_write(args.output, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(all_rows)

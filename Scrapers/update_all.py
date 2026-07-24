@@ -115,6 +115,27 @@ def run(label, args):
     return ok, took
 
 
+def rotate_backups(n=3):
+    """Keep n generations of the backup set: backups.1 (newest snapshot)
+    ... backups.{n-1}, rotated at the start of each run. The LIVE
+    backups/ dir is COPIED, never renamed away — backup_known_good
+    deliberately preserves the last-good backup when a live file is
+    already invalid, and renaming the dir would destroy that guarantee.
+    One bad-but-schema-valid morning can no longer poison the only
+    restore point."""
+    if not BACKUP_DIR.exists():
+        return
+    gens = [BACKUP_DIR.with_name(f"{BACKUP_DIR.name}.{i}")
+            for i in range(1, n)]
+    if gens and gens[-1].exists():
+        shutil.rmtree(gens[-1])
+    for older, newer in zip(reversed(gens[1:]), reversed(gens[:-1])):
+        if newer.exists():
+            newer.rename(older)
+    if gens:
+        shutil.copytree(BACKUP_DIR, gens[0])
+
+
 def backup_known_good(files):
     """Copy each currently-valid file to Data/backups/ before its scraper
     rewrites it. A file that is ALREADY invalid is not backed up — that would
@@ -161,15 +182,22 @@ def main():
     args = ap.parse_args()
 
     results = []
+    rotate_backups()
     for label, cmd in discover_jobs():
         files = JOB_FILES.get(label, [])
         if files:
             backup_known_good(files)
         ok, took = run(label, cmd)
-        if ok and files:
-            ok = validate_and_restore(files)
-            if not ok:
+        # validate even when the scraper exited nonzero: a crash or kill
+        # MID-WRITE used to leave a truncated file in place because the
+        # restore only fired on exit 0. (The scrapers now write
+        # atomically too — this is the second layer of the same defense,
+        # and restoring over an untouched-but-valid file is a no-op.)
+        if files:
+            valid = validate_and_restore(files)
+            if not valid:
                 print(f">>> {label}: data FAILED validation", flush=True)
+            ok = ok and valid
         results.append((label, ok, took))
 
     all_ok = all(ok for _, ok, _ in results)

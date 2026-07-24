@@ -1,0 +1,26 @@
+#!/bin/sh
+# Versioned pre-commit gate (installed via: git config core.hooksPath githooks)
+#
+# Fast suite on every commit — the ship discipline's "pytest green" is
+# now enforced by the repo, not by memory. When an ENGINE file is staged
+# (sim.py / sim_batch.py / predict.py) the slow lane (golden + artifact
+# parity) runs too: engine drift can only be caught there. Escape hatch
+# for emergencies: git commit --no-verify.
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+PY="$LOCALAPPDATA/Programs/Python/Python313/python.exe"
+[ -x "$PY" ] || PY=python
+
+"$PY" -m pytest Tests -q || {
+    echo "pre-commit: fast suite RED - fix it (or git commit --no-verify)"
+    exit 1
+}
+
+if git diff --cached --name-only | grep -qE '^Model/(sim|sim_batch|predict)\.py$'; then
+    echo "pre-commit: engine file staged - running slow lane"
+    "$PY" -m pytest Tests -q -m slow || {
+        echo "pre-commit: SLOW lane RED - the engine change breaks golden/parity"
+        exit 1
+    }
+fi
+exit 0

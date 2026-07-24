@@ -931,8 +931,9 @@ class App(tk.Tk):
         if old.get("names"):     # keep scraped display names for re-loading
             spec["names"] = old["names"]
         # scraped fields with no form widget — carry them through the edit
-        # (DH flags, lineup provenance, next scheduled off-days)
-        for k in ("is_dh", "dh_game2", "away_lineup_src", "home_lineup_src",
+        # (DH flags, game identity, lineup provenance, next scheduled off-days)
+        for k in ("is_dh", "dh_game2", "game_pk",
+                  "away_lineup_src", "home_lineup_src",
                   "away_next_offday", "home_next_offday"):
             if old.get(k) is not None:
                 spec[k] = old[k]

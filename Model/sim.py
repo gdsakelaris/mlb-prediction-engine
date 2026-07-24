@@ -184,6 +184,7 @@ def bat_axis(rows):
     return r - 18 * (r >= 36)
 
 
+# MIRROR[engine_loop]: twin in Model/sim_batch.py run_batch — change BOTH or parity drifts
 def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
     rng = np.random.default_rng(seed)
     rules = rules_for(season, is_dh_game)
@@ -264,6 +265,7 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
     if rank_cum is not None:
         rank_cum = np.asarray(rank_cum, dtype=np.float64)
 
+    # MIRROR[loop_pen_choice]: twin in Model/sim_batch.py pick_pen — change BOTH or parity drifts
     def _pick_pen(idx, side, hi_mask, due_stand=None):
         """Arm from the leverage-matched order; -1 = none. With a
         pen_rank_cum store (B6) the entry RANK among still-available
@@ -740,6 +742,7 @@ def _apply_pattern(a, bt, cls, dests, oadd, pruns, prbi, pearn, bases,
     resp[a] = new_resp
 
 
+# MIRROR[loop_endhalf]: twin in Model/sim_batch.py end_half — change BOTH or parity drifts
 def _end_half(mask, inning, half, outs, bases, resp, score, runs_f5,
               runs_i1, bat_ptr, done, stint_outs, cur_pit, starter_in,
               pen_next, prep, rng, tensor, REG, rules, active, bench,

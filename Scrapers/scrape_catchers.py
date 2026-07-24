@@ -43,7 +43,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-from seasons import CURRENT_SEASON, YEARS
+from seasons import CURRENT_SEASON, YEARS, atomic_write
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "Data"
 OUT_PLAYERS = DATA_DIR / "mlb_catchers.csv"
@@ -260,11 +260,13 @@ def main():
     players = (players.drop_duplicates(["Year", "PlayerId"], keep="last")
                .sort_values(["Year", "PlayerId"]))
     OUT_PLAYERS.parent.mkdir(exist_ok=True)
-    players.to_csv(OUT_PLAYERS, index=False, encoding="utf-8-sig")
+    with atomic_write(OUT_PLAYERS, "w", newline="", encoding="utf-8-sig") as f:
+        players.to_csv(f, index=False)
     print(f"wrote {len(players):,} rows -> {OUT_PLAYERS}", flush=True)
 
     team = team_rollup(players).sort_values(["Year", "Team"])
-    team.to_csv(OUT_TEAM, index=False, encoding="utf-8-sig")
+    with atomic_write(OUT_TEAM, "w", newline="", encoding="utf-8-sig") as f:
+        team.to_csv(f, index=False)
     print(f"wrote {len(team):,} rows -> {OUT_TEAM}", flush=True)
 
 

@@ -31,7 +31,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 
-from seasons import CURRENT_SEASON, YEARS
+from seasons import CURRENT_SEASON, YEARS, atomic_write
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "Data"
 DEFAULT_OUT = DATA_DIR / "mlb_sprint_speed.csv"
@@ -128,7 +128,8 @@ def main():
     all_rows = all_rows.drop_duplicates(["Year", "PlayerId"], keep="last")
     all_rows = all_rows.sort_values(["Year", "PlayerId"])
     out_path.parent.mkdir(exist_ok=True)
-    all_rows.to_csv(out_path, index=False, encoding="utf-8-sig")
+    with atomic_write(out_path, "w", newline="", encoding="utf-8-sig") as f:
+        all_rows.to_csv(f, index=False)
     print(f"wrote {len(all_rows):,} rows -> {out_path}", flush=True)
 
 

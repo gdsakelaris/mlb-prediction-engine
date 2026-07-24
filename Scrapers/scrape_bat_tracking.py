@@ -32,7 +32,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 
-from seasons import CURRENT_SEASON, YEARS
+from seasons import CURRENT_SEASON, YEARS, atomic_write
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "Data"
 DEFAULT_OUT = DATA_DIR / "mlb_bat_tracking.csv"
@@ -135,7 +135,8 @@ def main():
     allrows = allrows.drop_duplicates(["Year", "PlayerId"], keep="last")
     allrows = allrows.sort_values(["Year", "PlayerId"])
     out_path.parent.mkdir(exist_ok=True)
-    allrows.to_csv(out_path, index=False, encoding="utf-8-sig")
+    with atomic_write(out_path, "w", newline="", encoding="utf-8-sig") as f:
+        allrows.to_csv(f, index=False)
     print(f"wrote {len(allrows):,} rows -> {out_path}", flush=True)
 
 

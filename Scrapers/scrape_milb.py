@@ -39,7 +39,7 @@ from pathlib import Path
 
 import requests
 
-from seasons import CURRENT_SEASON, stored_rows_by_season
+from seasons import CURRENT_SEASON, atomic_write, stored_rows_by_season
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "Data"
 
@@ -202,7 +202,7 @@ def scrape_group(session, group, backfill):
         print(f"{group} {year}: {len(season_rows)} rows")
 
     # utf-8-sig so Excel renders accented names (José, Díaz) correctly.
-    with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
+    with atomic_write(out_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=list(columns))
         writer.writeheader()
         writer.writerows(all_rows)

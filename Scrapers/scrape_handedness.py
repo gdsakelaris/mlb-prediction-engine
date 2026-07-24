@@ -17,6 +17,8 @@ from pathlib import Path
 
 import requests
 
+from seasons import atomic_write
+
 DATA_DIR = Path(__file__).resolve().parents[1] / "Data"
 API = "https://statsapi.mlb.com/api/v1/people"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -64,7 +66,7 @@ def main():
         time.sleep(0.3)
 
     out = DATA_DIR / "mlb_handedness.csv"
-    with open(out, "w", newline="", encoding="utf-8-sig") as f:
+    with atomic_write(out, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=["PlayerId", "Name", "Bats", "Throws"])
         w.writeheader()
         w.writerows(rows)

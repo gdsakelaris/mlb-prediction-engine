@@ -14,6 +14,9 @@ kills the whole job.
 """
 
 import csv
+import os
+import time
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 
@@ -40,6 +43,39 @@ def years(today=None):
 
 YEARS = years()
 CURRENT_SEASON = current_season()
+
+
+@contextmanager
+def atomic_write(path, mode="w", **open_kwargs):
+    """Crash-safe file rewrite: write to <name>.tmp, then os.replace over
+    the target on clean exit — a crash, kill, or power loss mid-write can
+    never leave a truncated warehouse CSV (the pattern the odds store and
+    pitch archive already used; this makes it the shared default for
+    every scraper's in-place rewrite). On an exception the tmp file is
+    removed and the original is untouched. The final replace retries
+    through transient PermissionError because Data/ lives under OneDrive,
+    whose sync client briefly locks files it is uploading."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    f = open(tmp, mode, **open_kwargs)
+    try:
+        yield f
+    except BaseException:
+        f.close()
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    f.close()
+    for attempt in range(5):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.3 * (attempt + 1))
 
 
 def stored_rows_by_season(csv_path, season_col):

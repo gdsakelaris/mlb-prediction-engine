@@ -183,6 +183,7 @@ def _sample_dense(xp, cum_rows, u):
     return (u[:, None] > cum_rows).sum(axis=1).astype(xp.int32)
 
 
+# MIRROR[engine_loop]: twin in Model/sim.py run — change BOTH or parity drifts
 def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
               backend="gpu"):
     """Simulate G games x n_sims each; returns a list of per-game dicts
@@ -236,12 +237,14 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
         def sadd(arr, idx, val):
             np.add.at(arr, idx, val)
     else:
-        import cupyx
-
+        # xp.add.at is cupy's supported scatter-add (cupyx.scatter_add
+        # deprecated 2026; swap proven bit-identical on-device — all
+        # scatter targets are integer accumulators, so addition order
+        # cannot change results) and unifies the two backends' code
         def sadd(arr, idx, val):
             if not np.isscalar(val) and val.dtype != arr.dtype:
                 val = val.astype(arr.dtype)
-            cupyx.scatter_add(arr, idx, val)
+            xp.add.at(arr, idx, val)
 
     lat = bp.lat
     z_env = (lat["mu_env"][gidx] + lat["sigma_env"][gidx]
@@ -264,6 +267,7 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
     pen_used = (xp.zeros((N, 2, bp.pen_hi.shape[2]), dtype=bool)
                 if lev else None)
 
+    # MIRROR[loop_pen_choice]: twin in Model/sim.py _pick_pen — change BOTH or parity drifts
     def pick_pen(idx, side, hi_mask, due_stand=None):
         s32 = side.astype(xp.int32)
         order = xp.where(hi_mask[:, None], bp.pen_hi[gidx[idx], s32],
@@ -308,6 +312,7 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
     def bat_axis(rows):
         return rows - 18 * (rows >= 36).astype(rows.dtype)
 
+    # MIRROR[loop_endhalf]: twin in Model/sim.py _end_half — change BOTH or parity drifts
     def end_half(mask):
         idx = xp.flatnonzero(mask)
         if idx.size == 0:
@@ -805,6 +810,7 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
 
 # ------------------------------------------------ batched preparation
 
+# MIRROR[prep_resolve]: twin in Model/predict.py prepare_game — change BOTH or parity drifts
 def _resolve_game(P, spec, n_sims):
     """The light per-game half of prepare_game: lineups, starters, pen,
     row layout, participation covariates, meta. Mirrors prepare_game
@@ -904,6 +910,7 @@ def _resolve_game(P, spec, n_sims):
                 elo=(elo_a, elo_h), tcx=tcx, fm_side=fm_side)
 
 
+# MIRROR[prep_matchup]: twin in Model/predict.py _class_vecs — change BOTH or parity drifts
 def _matchup_frame(P, resolved):
     """G x 1080 matchup rows in prepare_game's exact nesting order
     (pitcher-major, batter, tto)."""
@@ -1018,6 +1025,7 @@ def _start_hist(P):
     return cache
 
 
+# MIRROR[prep_hazard]: twin in Model/predict.py _hazard_grid — change BOTH or parity drifts
 def _hazard_grids(P, resolved):
     """Batched serve-side hazard grids: same fields as
     Predictor._hazard_grid, one model call for all starters."""
@@ -1094,6 +1102,7 @@ def _hazard_grids(P, resolved):
     return [p[i] for i in range(len(resolved))]
 
 
+# MIRROR[prep_sb]: twin in Model/predict.py _sb_matrices — change BOTH or parity drifts
 def _sb_matrices(P, resolved):
     """Batched steal matrices: one predict per model for all games'
     (runner, pitcher) pairs, then scatter into [n_players, n_players]

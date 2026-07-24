@@ -27,6 +27,8 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+from seasons import atomic_write
+
 DATA_DIR = Path(__file__).resolve().parents[1] / "Data"
 DEFAULT_OUT = DATA_DIR / "mlb_linescores.csv"
 GAMES_CSV = DATA_DIR / "mlb_games.csv"
@@ -126,7 +128,8 @@ def main():
     allrows["GamePk"] = allrows["GamePk"].astype("int64")
     allrows["Inning"] = allrows["Inning"].astype("int64")
     out_path.parent.mkdir(exist_ok=True)
-    allrows.to_csv(out_path, index=False, encoding="utf-8-sig")
+    with atomic_write(out_path, "w", newline="", encoding="utf-8-sig") as f:
+        allrows.to_csv(f, index=False)
     print(f"wrote {len(allrows):,} rows ({allrows['GamePk'].nunique():,} "
           f"games) -> {out_path} ({fail:,} fetch failures this run)",
           flush=True)

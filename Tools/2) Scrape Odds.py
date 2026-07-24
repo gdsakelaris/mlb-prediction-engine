@@ -29,10 +29,12 @@ book actually posts them. Run it twice a day and it just works: player-prop mark
 game markets are one flat bulk call, and a rerun near first pitch SKIPS games
 already underway (their pregame line is final), so the second run only pays for
 games not yet started. write_store keeps one row per (Date, PlayerId, Market,
-Line, Book) holding BOTH ends of the capture history — the earliest capture in
-the Open* columns and the latest in OverPrice/UnderPrice — so a morning run
-pins the opening price, a rerun near first pitch tightens the closing one, and
-the move between them (steam, line value) stays measurable forever.
+Line, Book, GamePk) holding BOTH ends of the capture history — the earliest
+capture in the Open* columns and the latest in OverPrice/UnderPrice — so a
+morning run pins the opening price, a rerun near first pitch tightens the
+closing one, and the move between them (steam, line value) stays measurable
+forever. GamePk (stamped from the keyless StatsAPI schedule) keeps a
+doubleheader's two games apart in the store.
 
 IMPORTANT on the free tier: it covers moneyline/totals for current & upcoming
 games, but player props ("additional markets") and historical snapshots are
@@ -344,13 +346,23 @@ def fetch(url, params):
 
 def write_store(rows, out):
     """Append rows, then collapse to one row per (Date, PlayerId, Market,
-    Line, Book) keeping BOTH ends of the capture history: OverPrice/
-    UnderPrice/CapturedAt hold the LATEST capture (the closing side) and
-    OpenOverPrice/OpenUnderPrice/OpenCapturedAt the EARLIEST — so a
-    morning run pins the open, a rerun near first pitch tightens the
+    Line, Book, GamePk) keeping BOTH ends of the capture history:
+    OverPrice/UnderPrice/CapturedAt hold the LATEST capture (the closing
+    side) and OpenOverPrice/OpenUnderPrice/OpenCapturedAt the EARLIEST —
+    so a morning run pins the open, a rerun near first pitch tightens the
     close, and the price move between them stays measurable forever.
     Rows written before the Open columns existed backfill their open from
     the one capture they hold.
+
+    GamePk joined the key 2026-07-23 so a doubleheader's two games stop
+    overwriting each other (before that, game 2's recapture destroyed
+    game 1's close). A legacy blank-pk row merges into its pk'd sibling
+    only when exactly one sibling exists for the same (Date, ident,
+    Market, Line, Book) AND the blank's last capture strictly predates
+    the sibling's first — the unambiguous pre-pk-era case, preserving
+    open->close continuity across the format change. Any other blank
+    (could belong to either DH game, or captured alongside/after the
+    sibling) stays a separate legacy row rather than be guessed at.
 
     The store is the one file in Data/ that cannot be re-scraped after the
     fact (pregame lines are gone once games start), so it gets extra care:
@@ -377,7 +389,8 @@ def write_store(rows, out):
         line_v = row.get("Line")
         line_k = "" if line_v in (None, "") else str(line_v)
         key = (str(row.get("Date")), ident,
-               row.get("Market"), line_k, row.get("Book"))
+               row.get("Market"), line_k, row.get("Book"),
+               str(row.get("GamePk") or "").strip())
         close_ts = str(row.get("CapturedAt") or "")
         open_ = (str(row.get("OpenCapturedAt") or close_ts),
                  row.get("OpenOverPrice") or row.get("OverPrice"),
@@ -390,6 +403,32 @@ def write_store(rows, out):
             prev[0] = open_
         if close_ts >= prev[1][0]:
             prev[1] = (close_ts, row)
+
+    # GamePk-key transition: fold a legacy blank-pk entry into its pk'd
+    # sibling ONLY when exactly one sibling exists AND the blank's entire
+    # history strictly predates the sibling's first capture — i.e. the
+    # blank is unambiguously the pre-pk era of the same market (its open
+    # backfills the sibling's). A blank captured alongside or after the
+    # sibling (same-run schedule outage, a DH whose other game resolved
+    # blank) can never be attributed safely and stays its own legacy row —
+    # mis-merging would silently replace one DH game's close with the
+    # other's, in the one file that can never be re-scraped.
+    with_pk = {}
+    for key in best:
+        if key[5]:
+            with_pk.setdefault(key[:5], []).append(key)
+    for key in [k for k in best if not k[5]]:
+        sibs = with_pk.get(key[:5], [])
+        if len(sibs) != 1:
+            continue
+        sib = best[sibs[0]]
+        blank = best[key]
+        if not blank[1][0] < sib[0][0]:
+            continue
+        best.pop(key)
+        if blank[0][0] < sib[0][0]:
+            sib[0] = blank[0]
+
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists():
         backup_dir = out.parent / "backups"
@@ -419,6 +458,44 @@ def _commence(e):
         return dt.datetime.fromisoformat(str(t).replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def match_game_pk(pk_map, away_abbr, home_abbr, commence):
+    """The event's MLB gamePk as a string: the (away, home) schedule entry
+    whose first pitch is nearest the event's commence_time. A doubleheader
+    resolves only when one candidate is STRICTLY nearest with a parseable
+    time (a tie or unparseable schedule dates could be either game); a
+    lone candidate must sit within 6h of a known commence, so a stale
+    odds event for a postponed game can't inherit the surviving game's
+    pk. '' whenever identity can't be pinned — blank is exactly the
+    pre-2026-07-23 behavior, never a guess."""
+    cand = pk_map.get((away_abbr, home_abbr), [])
+    if not cand:
+        return ""
+    far = dt.timedelta(days=9)
+
+    def gap(c):
+        if commence is None:
+            return far
+        try:
+            gd = dt.datetime.fromisoformat(str(c[1]).replace("Z", "+00:00"))
+        except ValueError:
+            return far
+        return abs(gd - commence)
+
+    if len(cand) == 1:
+        g = gap(cand[0])
+        if g is not far and g > dt.timedelta(hours=6):
+            return ""
+        return str(cand[0][0])
+    if commence is None:
+        return ""
+    gaps = sorted((gap(c), str(c[0])) for c in cand)
+    if gaps[0][0] >= far:
+        return ""
+    if gaps[0][0] + dt.timedelta(minutes=5) >= gaps[1][0]:
+        return ""                     # effectively tied: never guess
+    return gaps[0][1]
 
 
 def _slate_date(e):
@@ -488,6 +565,18 @@ def main():
         print(f"could not list events: {e}", file=sys.stderr)
         sys.exit(1)
     events = [e for e in events if _slate_date(e) == day]
+
+    # game identity: one keyless StatsAPI schedule call maps each event to
+    # its MLB gamePk so a doubleheader's two games stop colliding in the
+    # store (write_store keys on GamePk since 2026-07-23). A schedule
+    # failure degrades to blank pks — the capture itself must never be
+    # lost to the identity stamp.
+    try:
+        pk_map = _gtg.schedule_game_pks(day)
+    except Exception as ex:                          # noqa: BLE001
+        print(f"  gamePk schedule fetch failed ({ex}); GamePk left blank",
+              file=sys.stderr)
+        pk_map = {}
     # bookmakers overrides regions at the API when both are sent, so exactly
     # one is used; billing counts each group of 10 books as one region.
     if args.books:
@@ -508,6 +597,23 @@ def main():
                    if _commence(e) is None or _commence(e) > now]
     n_skip = len(events) - len(pending)
     pend_ids = {e.get("id") for e in pending}
+
+    # per-matchup identity guard: if a matchup's events today don't all
+    # resolve to DISTINCT pks (postponed sibling, placeholder commence,
+    # half-failed schedule), blank them ALL for this run — a wrong pk is
+    # worse than none, and a same-run pk/blank mix on one matchup is
+    # exactly what write_store's fold must never be handed on a DH day.
+    ev_pk, by_matchup = {}, {}
+    for e in pending:
+        aa = full_name_to_abbrev(e.get("away_team", ""))
+        ha = full_name_to_abbrev(e.get("home_team", ""))
+        ev_pk[e.get("id")] = match_game_pk(pk_map, aa, ha, _commence(e))
+        by_matchup.setdefault((aa, ha), []).append(e.get("id"))
+    for ids in by_matchup.values():
+        pks = [ev_pk[i] for i in ids]
+        if len(ids) > 1 and ("" in pks or len(set(pks)) != len(ids)):
+            for i in ids:
+                ev_pk[i] = ""
 
     est = (len(prop_markets + event_game) * len(pending) * n_reg
            + len(bulk_game) * n_reg)
@@ -542,7 +648,9 @@ def main():
                 continue
             ha = full_name_to_abbrev(ev.get("home_team", ""))
             aa = full_name_to_abbrev(ev.get("away_team", ""))
-            gm = parse_event_games(ev, ha, aa, day, "", captured_at)
+            gm = parse_event_games(ev, ha, aa, day,
+                                   ev_pk.get(ev.get("id"), ""),
+                                   captured_at)
             all_rows += gm
             n_game += len(gm)
         print(f"  game markets: {n_game} rows across the slate (left: {remain})")
@@ -555,6 +663,7 @@ def main():
     for e in (pending if ev_req else []):
         home_abbr = full_name_to_abbrev(e.get("home_team", ""))
         away_abbr = full_name_to_abbrev(e.get("away_team", ""))
+        gpk = ev_pk.get(e.get("id"), "")
         resolver = make_resolver(idx, home_abbr, away_abbr)
         try:
             data, remain = fetch(
@@ -586,10 +695,10 @@ def main():
                 print(f"  {away_abbr}@{home_abbr}: odds fetch failed "
                       f"({ex})", file=sys.stderr)
                 continue
-        pr = (parse_event_props(data, resolver, day, "", captured_at,
+        pr = (parse_event_props(data, resolver, day, gpk, captured_at,
                                 prop_apis=prop_markets)
               if prop_markets else [])
-        gm = (parse_event_games(data, home_abbr, away_abbr, day, "",
+        gm = (parse_event_games(data, home_abbr, away_abbr, day, gpk,
                                 captured_at, keys=EVENT_GAME_APIS)
               if event_game else [])
         all_rows += pr + gm

@@ -433,6 +433,40 @@ def next_offday(play, team, d0, days):
     return None
 
 
+def schedule_game_pks(date):
+    """(away_abbrev, home_abbrev) -> [(gamePk, gameDate_utc), ...] in
+    first-pitch order for `date`, from one keyless StatsAPI schedule call.
+    Stamps each slate game's MLB gamePk — the game identity the odds store,
+    Bets sheet and grader need to keep doubleheader games apart. Postponed/
+    cancelled games are skipped so a DH pair's indexing can't be shifted by
+    a game that no source still lists."""
+    r = requests.get("https://statsapi.mlb.com/api/v1/schedule",
+                     params={"sportId": 1, "date": date},
+                     headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    tr = requests.get("https://statsapi.mlb.com/api/v1/teams",
+                      params={"sportId": 1, "season": int(date[:4])},
+                      headers=HEADERS, timeout=30)
+    tr.raise_for_status()
+    ab = {t["id"]: ABBREV_ALIASES.get(t.get("abbreviation"),
+                                      t.get("abbreviation"))
+          for t in tr.json().get("teams", [])}
+    out = {}
+    for day in r.json().get("dates", []):
+        for g in day.get("games", []):
+            state = (g.get("status") or {}).get("detailedState", "")
+            if state.startswith(("Postponed", "Cancelled")):
+                continue
+            away = ab.get(g["teams"]["away"]["team"]["id"])
+            home = ab.get(g["teams"]["home"]["team"]["id"])
+            if away and home and g.get("gamePk"):
+                out.setdefault((away, home), []).append(
+                    (int(g["gamePk"]), g.get("gameDate") or ""))
+    for v in out.values():
+        v.sort(key=lambda x: x[1])
+    return out
+
+
 # ------------------------------------------------------------- fantasypros
 
 def scrape_fantasypros():
@@ -770,6 +804,37 @@ def main():
         g["is_dh"] = 1.0 if pair_n[key] > 1 else 0.0
         g["dh_game2"] = 1.0 if seen_dh[key] >= 1 else 0.0
         seen_dh[key] += 1
+
+    # game identity: stamp each game's MLB gamePk (odds-store / Bets-sheet /
+    # grader identity for doubleheaders). Both sides are first-pitch ordered
+    # (games sorted right above, schedule list by gameDate), so a DH pair's
+    # i-th occurrence takes the i-th pk. A schedule failure leaves game_pk
+    # null — the slate must never be lost to the identity stamp.
+    if games:
+        print("fetching schedule gamePks (game identity) ...")
+        try:
+            pks = schedule_game_pks(games[0]["date"])
+        except Exception as e:                      # noqa: BLE001
+            print(f"  gamePk schedule fetch failed ({e}); game_pk left null",
+                  file=sys.stderr)
+            pks = {}
+        seen_pk = Counter()
+        for g in games:
+            key = (g["away_team"], g["home_team"])
+            cand = pks.get(key, [])
+            occ = seen_pk[key]
+            seen_pk[key] += 1
+            # ordinal pairing is only trustworthy when the slate and the
+            # (postponed-filtered) schedule agree on how many games the
+            # matchup has today — a dropped sibling would shift every
+            # later index onto the wrong game. Mismatch -> no pk (safe;
+            # the odds capture blanks such matchups independently).
+            g["game_pk"] = (cand[occ][0]
+                            if len(cand) == pair_n[key] and occ < len(cand)
+                            else None)
+        n_pk = sum(1 for g in games if g["game_pk"] is not None)
+        print(f"  gamePk stamped for {n_pk}/{len(games)} games")
+
     payload = {"scraped_at": dt.datetime.now().isoformat(timespec="seconds"),
                "date": games[0]["date"] if games else None,
                "games": games}

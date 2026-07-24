@@ -24,6 +24,7 @@ history if SGP pricing is ever wanted.
 import datetime as dt
 import json
 import os
+import shutil
 from pathlib import Path
 
 import joblib
@@ -270,9 +271,32 @@ class Predictor:
                       int(r.lead), int(r.same), int(r.isc)] = r.rate
             self.part_haz = dense
         # cross-line-coherent output calibrators (one shared monotone
-        # map per market FAMILY; fit by evaluate.py --fit-calibrators)
+        # map per market FAMILY; fit by evaluate.py --fit-calibrators).
+        # A missing/incomplete artifact used to degrade to SILENT
+        # identity — raw probabilities served with zero signal; the
+        # self.degraded list now feeds a stderr warning, a red
+        # '!! STATUS' workbook sheet, and headless exit code 3.
+        self.degraded = []
         cal_path = ART / "output_calibrators.joblib"
-        self.calib = joblib.load(cal_path) if cal_path.exists() else {}
+        if cal_path.exists():
+            self.calib = joblib.load(cal_path)
+            expected = (set(COL_FAM.values()) | set(PIT_FAM.values())
+                        | {"ml", "tot", "tt"})
+            missing = sorted(expected - set(self.calib))
+            if missing:
+                self.degraded.append(
+                    f"calibrator families missing ({', '.join(missing)})"
+                    " — those markets serve RAW probabilities; refit: "
+                    "python Model/evaluate.py --fit-calibrators "
+                    "--reuse-rows")
+        else:
+            self.calib = {}
+            self.degraded.append(
+                "output_calibrators.joblib MISSING — serving RAW "
+                "probabilities; fix: python Model/evaluate.py "
+                "--fit-calibrators --reuse-rows")
+        for d in self.degraded:
+            print(f"WARNING: {d}", file=sys.stderr, flush=True)
         # residual heads (heads.py --train): per-family shallow-GBM
         # logit corrections applied on top of the Platt output. Only
         # heads that kept trees load; to serve Platt-only, move
@@ -287,6 +311,9 @@ class Predictor:
                         bst=lgb.Booster(model_str=h["booster_str"]),
                         features=h["features"],
                         best_iter=int(h["best_iter"]))
+        else:
+            print("note: residual heads not loaded (Platt-only serve)",
+                  file=sys.stderr, flush=True)
         # batter threshold-share panels for the heads' clustering
         # features (absent -> older heads artifacts serve unchanged)
         self._thresh_panels = None
@@ -549,6 +576,7 @@ class Predictor:
         out.sort(key=lambda t: -t[1])
         return out[:MAX_PEN]
 
+    # MIRROR[prep_matchup]: twin in Model/sim_batch.py _matchup_frame — change BOTH or parity drifts
     def _class_vecs(self, X):
         """A1/A2 probabilities for assembled matchup rows. Returns
         (p8 [n,8], a2arr): a2arr is [n,4] P(bb | in-play) under the
@@ -731,6 +759,7 @@ class Predictor:
 
     # -------------------------------------------------- game assembly
 
+    # MIRROR[prep_resolve]: twin in Model/sim_batch.py _resolve_game — change BOTH or parity drifts
     def prepare_game(self, spec, n_sims=N_SIMS):
         date = pd.Timestamp(spec["date"])
         season = int(spec.get("season") or date.year)
@@ -998,6 +1027,7 @@ class Predictor:
         cache[key] = float(th)
         return cache[key]
 
+    # MIRROR[prep_hazard]: twin in Model/sim_batch.py _hazard_grids — change BOTH or parity drifts
     def _hazard_grid(self, ppid, date, season, team=None, post=0.0):
         leash = self.fstores.get("panel_leash")
         lz = None
@@ -1069,6 +1099,7 @@ class Predictor:
             self.hz["model"].predict_proba(Xh)[:, 1])
         return p.reshape(41, 11)
 
+    # MIRROR[prep_sb]: twin in Model/sim_batch.py _sb_matrices — change BOTH or parity drifts
     def _sb_matrices(self, players, pit_rows, bat_rows_all, date, season,
                      away, home, post=0.0):
         n_players = len(players)
@@ -1229,6 +1260,7 @@ class Predictor:
         for gi, (spec, res) in enumerate(zip(specs, out)):
             res["spec"] = spec
             res["calib"] = self.calib
+            res["degraded"] = list(self.degraded)
             if mf is not None:
                 res["mktfair"] = mf
             if hctx is not None:
@@ -1440,10 +1472,15 @@ def _market_fair_maps(date):
     o = o[o["Date"] == str(date)]
     if o.empty:
         return None
+    # per-game grain: a doubleheader's two games carry their own pks (the
+    # store keys on GamePk since 2026-07-23), so fairs group per game;
+    # legacy blank-pk rows group under -1, the lookup's fallback key
+    o = o.assign(_gpk=pd.to_numeric(o["GamePk"], errors="coerce")
+                 .fillna(-1).astype(int))
     maps = {"bat": {}, "pit": {}, "game": {}}
     props = o[o["PlayerId"].notna()]
-    for (pid, mkt, line), grp in props.groupby(
-            ["PlayerId", "Market", "Line"]):
+    for (pid, mkt, line, gpk), grp in props.groupby(
+            ["PlayerId", "Market", "Line", "_gpk"]):
         col = _MKT_BAT_COL.get((mkt, line))
         dst = maps["bat"]
         if col is None:
@@ -1454,11 +1491,9 @@ def _market_fair_maps(date):
         f = _soft_fair(grp.to_dict("records"))
         if f is None:
             continue
-        gpk = grp["GamePk"].dropna()
-        key = int(gpk.iloc[0]) if len(gpk) else -1
-        dst.setdefault((int(pid), col), {})[key] = f
-    for (team, mkt, line), grp in o[o["PlayerId"].isna()].groupby(
-            ["Team", "Market", "Line"], dropna=False):
+        dst.setdefault((int(pid), col), {})[int(gpk)] = f
+    for (team, mkt, line, gpk), grp in o[o["PlayerId"].isna()].groupby(
+            ["Team", "Market", "Line", "_gpk"], dropna=False):
         if mkt == "h2h":
             col = "_home_wp"
         elif mkt == "totals":
@@ -1470,9 +1505,7 @@ def _market_fair_maps(date):
         f = _soft_fair(grp.to_dict("records"))
         if f is None:
             continue
-        gpk = grp["GamePk"].dropna()
-        key = int(gpk.iloc[0]) if len(gpk) else -1
-        maps["game"].setdefault((str(team), col), {})[key] = f
+        maps["game"].setdefault((str(team), col), {})[int(gpk)] = f
     return maps if any(maps.values()) else None
 
 
@@ -1557,6 +1590,51 @@ def _blend_market(mf, spec, bat_rows, pit_rows, grow, away, home):
     return n
 
 
+def _head_feat_row(ctx, deft, season, away, home, hf, line, p, thr, pid):
+    """One residual-head feature row — the single source of truth for
+    head-feature construction, shared by the sheet-wide _apply_heads and
+    the per-bet _head_adjust_one so the Bets number is computed by
+    exactly the served math. Must mirror heads._features."""
+    own, opp = ("home", "away") if hf else ("away", "home")
+    own_t, opp_t = (home, away) if hf else (away, home)
+    f = {}
+    for c in HEAD_CTX:
+        f[f"own_{c}"] = ctx.get(f"{own}_{c}", np.nan)
+        f[f"opp_{c}"] = ctx.get(f"{opp}_{c}", np.nan)
+    f["elo_diff"] = ctx.get("elo_diff", np.nan)
+    f["own_def_oaa"], f["own_frame"] = deft.get(
+        (season, own_t), (np.nan, np.nan))
+    f["opp_def_oaa"], f["opp_frame"] = deft.get(
+        (season, opp_t), (np.nan, np.nan))
+    f["home"] = float(hf)
+    f["line"] = line
+    f["p_dist"] = abs(p - 0.5)
+    f["park_hr"] = ctx.get("park_hr", 1.0)
+    f["ump_r"] = ctx.get("ump_r", 1.0)
+    if thr is not None:
+        tpid = -1 if pid is None else int(pid)
+        f.update(thr.get(tpid) or thr[-1])
+    return f
+
+
+def _head_adjust_one(heads, fam, ctx, deft, season, away, home, hf, line,
+                     p, thr=None, pid=-1):
+    """Head-correct ONE calibrated probability — the per-bet twin of the
+    _apply_heads batch loop (same feature row, same logit shift, same
+    clip). Returns p unchanged when the family has no trained head."""
+    h = (heads or {}).get(fam)
+    if h is None or p is None:
+        return p
+    f = _head_feat_row(ctx, deft, season, away, home, hf, line,
+                       float(p), thr, pid)
+    X = pd.DataFrame([f])[h["features"]]
+    r = h["bst"].predict(X, num_iteration=h["best_iter"],
+                         raw_score=True)[0]
+    pc = min(max(float(p), 1e-6), 1 - 1e-6)
+    z = np.log(pc / (1 - pc)) + float(r)
+    return float(np.clip(1.0 / (1.0 + np.exp(-z)), 1e-6, 1 - 1e-6))
+
+
 def _apply_heads(heads, ctx, deft, season, bat_rows, pit_rows, grow,
                  away, home, thr=None):
     """Residual-head corrections, applied AFTER the family calibrators:
@@ -1595,27 +1673,9 @@ def _apply_heads(heads, ctx, deft, season, bat_rows, pit_rows, grow,
         h = heads[fam]
         feats = []
         for _cont, col, hf, p in items:
-            own, opp = ("home", "away") if hf else ("away", "home")
-            own_t, opp_t = (home, away) if hf else (away, home)
-            f = {}
-            for c in HEAD_CTX:
-                f[f"own_{c}"] = ctx.get(f"{own}_{c}", np.nan)
-                f[f"opp_{c}"] = ctx.get(f"{opp}_{c}", np.nan)
-            f["elo_diff"] = ctx.get("elo_diff", np.nan)
-            f["own_def_oaa"], f["own_frame"] = deft.get(
-                (season, own_t), (np.nan, np.nan))
-            f["opp_def_oaa"], f["opp_frame"] = deft.get(
-                (season, opp_t), (np.nan, np.nan))
-            f["home"] = float(hf)
-            f["line"] = _line_of(col)
-            f["p_dist"] = abs(p - 0.5)
-            f["park_hr"] = ctx.get("park_hr", 1.0)
-            f["ump_r"] = ctx.get("ump_r", 1.0)
-            if thr is not None:
-                tpid = _cont.get("ID", -1)
-                tpid = -1 if tpid is None else int(tpid)
-                f.update(thr.get(tpid) or thr[-1])
-            feats.append(f)
+            feats.append(_head_feat_row(ctx, deft, season, away, home,
+                                        hf, _line_of(col), p, thr,
+                                        _cont.get("ID", -1)))
         X = pd.DataFrame(feats)[h["features"]]
         raw = h["bst"].predict(X, num_iteration=h["best_iter"],
                                raw_score=True)
@@ -1856,16 +1916,72 @@ def build_bets(out, date):
     odds = odds[odds.Date.astype(str) == str(date)]
     if odds.empty:
         return []
+    # per-game grain (store keys on GamePk since 2026-07-23); legacy
+    # blank-pk rows group under -1 and match like before
+    odds = odds.assign(_gpk=pd.to_numeric(odds["GamePk"], errors="coerce")
+                       .fillna(-1).astype(int))
 
     s = sim.SIDX
-    by_pid, by_game = {}, {}
+    # role-split maps: rows 0-17 are batter slots, 18-19 the starters. A
+    # two-way player appears in BOTH; routing pitcher markets through
+    # by_pit (and batter markets through by_bat) prices each market off
+    # the right tensor slot instead of whichever was appended first.
+    by_bat, by_pit, by_game = {}, {}, {}
     for res in out:
         meta = res["meta"]
         label = f'{meta["away"]}@{meta["home"]}'
-        by_game[meta["home"]] = (res, label)
+        by_game.setdefault(meta["home"], []).append((res, label))
         for row_i, pid in enumerate(meta["players"]):
-            if pid >= 0 and row_i < 20:
-                by_pid.setdefault(int(pid), []).append((res, row_i, label))
+            if pid < 0 or row_i >= 20:
+                continue
+            dst = by_pit if row_i >= 18 else by_bat
+            dst.setdefault(int(pid), []).append((res, row_i, label))
+
+    def spec_pk(res):
+        return int(res["spec"].get("game_pk") or -1)
+
+    slate_has_pks = any(spec_pk(r) != -1 for r in out)
+
+    def pick(hits, gpk):
+        """The sim result an odds group belongs to. On a pk-stamped slate
+        a pk'd group must exact-match a served sim's gamePk — with no
+        match it is skipped (None), never priced off another game's sim:
+        on a DH slate where only one game was served, pricing game 2's
+        odds with game 1's model would fabricate an edge and stamp it
+        with game 1's identity. Legacy blank-pk groups (-1), and pk'd
+        stores meeting a wholly un-stamped slate (old slate JSON /
+        schedule outage), keep the pre-GamePk behavior: the first hit."""
+        if gpk == -1 or not slate_has_pks:
+            return hits[0]
+        for h in hits:
+            if spec_pk(h[0]) == gpk:
+                return h
+        return None
+
+    def _lk(v):
+        return "" if pd.isna(v) else str(v)
+
+    def head_adj(res, fam, line, p, hf, pid):
+        """Route the calibrated p through the family residual head when
+        the serve carries one — the Bets number must be the SERVED
+        number (the display sheets and grading both include heads; the
+        Bets sheet bypassing them meant it priced EV off a probability
+        the engine never actually served)."""
+        if not res.get("heads") or res.get("hctx") is None or p is None:
+            return p
+        meta = res["meta"]
+        return _head_adjust_one(res["heads"], fam, res["hctx"],
+                                res.get("hdef") or {}, meta["season"],
+                                meta["away"], meta["home"], hf, line, p,
+                                thr=res.get("thr"), pid=pid)
+
+    def id_bits(res):
+        """(G#, GamePk-or-None) for the Bets row — the game identity the
+        grader needs to pick the right final on doubleheader days."""
+        spec = res["spec"]
+        gnum = 2 if spec.get("dh_game2") else 1
+        pk = spec_pk(res)
+        return gnum, (pk if pk != -1 else None)
 
     rows = []
 
@@ -1885,7 +2001,8 @@ def build_bets(out, date):
         return None
 
     def emit(game, player, team, prop, side, line, p_model, fair_side,
-             group, price_col, note_bits):
+             group, price_col, note_bits, gnum=1, gpk=None,
+             mkt=None, pid_out=None):
         # a de-vigged two-sided market is required: without it a stray
         # longshot price has no sanity anchor and EV explodes
         if fair_side is None or p_model is None:
@@ -1901,67 +2018,117 @@ def build_bets(out, date):
         if books == 1:
             bits.append("1 book")
         rows.append({
-            "Game": game, "Player": player, "Team": team, "Prop": prop,
-            "Side": side, "Line": line, "Model %": p_model,
+            "Game": game, "G#": gnum, "Player": player, "Team": team,
+            "Prop": prop, "Side": side, "Line": line, "Model %": p_model,
             "Mkt %": fair_side, "Edge": p_model - fair_side,
             "Best Odds": amer, "Book": book, "EV%": ev, "Books": books,
-            "Note": "; ".join(bits) if bits else None})
+            "GamePk": gpk, "Note": "; ".join(bits) if bits else None,
+            # ledger-only keys (not in bet_cols, never written to the
+            # sheet): the raw market string and pid the staking layer
+            # needs for settlement
+            "_market": mkt, "PlayerId": pid_out})
 
-    # player props
+    # player props. A -1 (legacy blank-pk) group is dropped when the same
+    # prop also has pk'd rows — it is the stale half of a transition-day
+    # mix, and emitting it would duplicate the bet at old prices.
     pl = odds[pd.to_numeric(odds.PlayerId, errors="coerce").notna()]
-    for (pid, market, line), g in pl.groupby(
-            [pd.to_numeric(pl.PlayerId, errors="coerce").astype("int64"),
-             "Market", "Line"]):
+    pl = pl.assign(_pid=pd.to_numeric(pl.PlayerId,
+                                      errors="coerce").astype("int64"))
+    pk_props = {(int(p), m, _lk(l)) for p, m, l in
+                zip(pl.loc[pl._gpk != -1, "_pid"],
+                    pl.loc[pl._gpk != -1, "Market"],
+                    pl.loc[pl._gpk != -1, "Line"])}
+    prop_buf = {}
+    for (pid, market, line, gpk), g in pl.groupby(
+            ["_pid", "Market", "Line", "_gpk"]):
+        if gpk == -1 and (int(pid), market, _lk(line)) in pk_props:
+            continue
         try:
             line = float(line)
         except (TypeError, ValueError):
             continue
-        hits = by_pid.get(int(pid))
+        hits = (by_pit if market.startswith("pitcher")
+                else by_bat).get(int(pid))
         if not hits:
             continue
-        res, row_i, label = hits[0]
+        picked = pick(hits, gpk)
+        if picked is None:
+            continue
+        res, row_i, label = picked
         counts = stat_counts(res, row_i, market)
         if counts is None:
             continue
         p_over = _cal(res.get("calib"), MKT_FAM.get(market),
                       _tail_prob(counts, line),
                       market=_line_market(market, line))
-        fair = O.sharp_fair(g.to_dict("records"))
         meta = res["meta"]
-        name = meta["names"][row_i]
         team = (meta["away"] if (row_i < 9 or row_i == 18)
                 else meta["home"])
+        p_over = head_adj(res, MKT_FAM.get(market), line, p_over,
+                          int(team == meta["home"]), int(pid))
+        fair = O.sharp_fair(g.to_dict("records"))
+        name = meta["names"][row_i]
         career = (meta["career_g"][row_i] if row_i < 18
                   else meta["career_gp"][row_i])
         note = ["rookie <50 G"] if career < ROOKIE_G else []
-        prop = _prop_name(market, line)
-        emit(label, name, team, prop, "Over", line, p_over,
-             fair, g, "OverPrice", note)
-        emit(label, name, team, prop, "Under", line,
-             1 - p_over, (1 - fair) if fair is not None else None, g,
-             "UnderPrice", note)
+        gnum, gpk_out = id_bits(res)
+        prop_buf.setdefault((int(pid), market, gpk), []).append(
+            (line, p_over, fair, g, label, name, team, note,
+             gnum, gpk_out))
 
-    # game markets: h2h (Over = home side) and totals
+    # cross-line coherence: the served sheets clamp each ladder
+    # non-increasing in the line (see _apply_heads); the Bets numbers
+    # must obey the same invariant after per-line head adjustment
+    for (pid, market, gpk), cand in prop_buf.items():
+        cand.sort(key=lambda c: c[0])
+        lo = None
+        for (line, p_over, fair, g, label, name, team, note,
+             gnum, gpk_out) in cand:
+            if lo is not None and p_over > lo:
+                p_over = lo
+            lo = p_over
+            prop = _prop_name(market, line)
+            emit(label, name, team, prop, "Over", line, p_over,
+                 fair, g, "OverPrice", note, gnum, gpk_out,
+                 market, int(pid))
+            emit(label, name, team, prop, "Under", line,
+                 1 - p_over, (1 - fair) if fair is not None else None,
+                 g, "UnderPrice", note, gnum, gpk_out,
+                 market, int(pid))
+
+    # game markets: h2h (Over = home side) and totals; same stale-legacy
+    # suppression as the props loop
     gm = odds[odds.Market.isin(["h2h", "totals"])
               & pd.to_numeric(odds.PlayerId, errors="coerce").isna()]
-    for (team, market, line), g in gm.groupby(["Team", "Market", "Line"],
-                                              dropna=False):
-        hit = by_game.get(team)
-        if hit is None:
+    pk_games = {(str(t), m, _lk(l)) for t, m, l in
+                zip(gm.loc[gm._gpk != -1, "Team"],
+                    gm.loc[gm._gpk != -1, "Market"],
+                    gm.loc[gm._gpk != -1, "Line"])}
+    tot_buf = {}
+    for (team, market, line, gpk), g in gm.groupby(
+            ["Team", "Market", "Line", "_gpk"], dropna=False):
+        if gpk == -1 and (str(team), market, _lk(line)) in pk_games:
             continue
-        res, label = hit
+        hits = by_game.get(team)
+        if not hits:
+            continue
+        picked = pick(hits, gpk)
+        if picked is None:
+            continue
+        res, label = picked
         meta = res["meta"]
         fair = O.sharp_fair(g.to_dict("records"))
+        gnum, gpk_out = id_bits(res)
         if market == "h2h":
             hw = _cal(res.get("calib"), "ml",
                       float((res["score"][:, 1]
                              > res["score"][:, 0]).mean()))
             note = ["winner: no proven edge vs. always-home"]
             emit(label, "", meta["home"], "moneyline", meta["home"], "",
-                 hw, fair, g, "OverPrice", note)
+                 hw, fair, g, "OverPrice", note, gnum, gpk_out, "h2h")
             emit(label, "", meta["away"], "moneyline", meta["away"], "",
                  1 - hw, (1 - fair) if fair is not None else None, g,
-                 "UnderPrice", note)
+                 "UnderPrice", note, gnum, gpk_out, "h2h")
         else:
             try:
                 line = float(line)
@@ -1970,11 +2137,23 @@ def build_bets(out, date):
             total = res["score"].sum(axis=1)
             p_over = _cal(res.get("calib"), "tot",
                           float((total > line).mean()))
+            p_over = head_adj(res, "tot", line, p_over, 1, -1)
+            tot_buf.setdefault((label, gpk), []).append(
+                (line, p_over, fair, g, gnum, gpk_out))
+
+    # totals ladder clamp, mirroring the Games sheet's Runs > x column
+    for (label, gpk), cand in tot_buf.items():
+        cand.sort(key=lambda c: c[0])
+        lo = None
+        for (line, p_over, fair, g, gnum, gpk_out) in cand:
+            if lo is not None and p_over > lo:
+                p_over = lo
+            lo = p_over
             emit(label, "", "", "total runs", "Over", line, p_over,
-                 fair, g, "OverPrice", [])
+                 fair, g, "OverPrice", [], gnum, gpk_out, "totals")
             emit(label, "", "", "total runs", "Under", line, 1 - p_over,
                  (1 - fair) if fair is not None else None, g,
-                 "UnderPrice", [])
+                 "UnderPrice", [], gnum, gpk_out, "totals")
 
     rows.sort(key=lambda r: -(r["EV%"] or 0))
     return rows
@@ -2010,7 +2189,28 @@ def _flag_clear_leaders(ws, cols, pct_cols):
             ws.cell(row=i1, column=j).border = lead
 
 
-def save_excel_slate(specs, out, path=None):
+def _status_sheet(wb, degraded, date):
+    """Unmissable degraded-serve banner: a red '!! STATUS' sheet at
+    index 0 (and made active, so Excel opens ON it) listing what was
+    missing and the fix command. Clean serves create no sheet. Every
+    Tools consumer opens sheets BY NAME, so the extra sheet is
+    contract-safe."""
+    if not degraded:
+        return
+    from openpyxl.styles import Alignment, Font, PatternFill
+    ws = wb.create_sheet("!! STATUS", 0)
+    ws.merge_cells("A1:F3")
+    cell = ws.cell(row=1, column=1)
+    cell.value = (f"DEGRADED SERVE {date}\n"
+                  + "\n".join(f"- {d}" for d in degraded))
+    cell.fill = PatternFill("solid", fgColor="FFC00000")
+    cell.font = Font(color="FFFFFFFF", bold=True)
+    cell.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.column_dimensions["A"].width = 100
+    wb.active = wb.sheetnames.index("!! STATUS")
+
+
+def save_excel_slate(specs, out, path=None, ledger=True):
     """Aggregate sim results into the workbook (Batter Props, Pitching
     Props, Games, Bets). `out` is predict_slate()'s list."""
     from openpyxl import Workbook
@@ -2033,6 +2233,17 @@ def save_excel_slate(specs, out, path=None):
             k += 1
 
     bet_rows = build_bets(out, date)
+    # paper-trading ledger (STAKING_DESIGN §9): record every Bets row at
+    # its captured price. LEDGER=0 disables; smoke serves are excluded
+    # by the caller (main passes ledger=False for --sims runs). The
+    # ledger must never block a serve.
+    if bet_rows and ledger and os.environ.get("LEDGER", "1") != "0":
+        try:
+            import staking
+            staking.append(staking.enrich(bet_rows, date, MKT_FAM))
+        except Exception as e:              # noqa: BLE001
+            print(f"staking ledger unavailable ({e}); serve continues",
+                  file=sys.stderr, flush=True)
 
     wb = Workbook()
     white_bold = Font(color="FFFFFFFF", bold=True)
@@ -2107,9 +2318,9 @@ def save_excel_slate(specs, out, path=None):
     write_sheet(ws, GAME_COLS, game_rows, game_pct)
 
     ws = wb.create_sheet("Bets")
-    bet_cols = ["Game", "Player", "Team", "Prop", "Side", "Line",
+    bet_cols = ["Game", "G#", "Player", "Team", "Prop", "Side", "Line",
                 "Model %", "Mkt %", "Edge", "Best Odds", "Book", "EV%",
-                "Books", "Note"]
+                "Books", "GamePk", "Note"]
     write_sheet(ws, bet_cols, bet_rows,
                 {"Model %", "Mkt %", "Edge", "EV%"},
                 header_color=BETS_HEADER, all_row_fill=row_tint)
@@ -2120,11 +2331,59 @@ def save_excel_slate(specs, out, path=None):
         cell.border = box
         cell.alignment = center
 
+    deg = (out[0].get("degraded") or []) if out else []
+    _status_sheet(wb, deg, date)
+    if deg:
+        print(f"WARNING: DEGRADED SERVE -> {'; '.join(deg)}",
+              file=sys.stderr, flush=True)
+
     wb.save(path)
+    # pristine as-served copy: grading recolors the workbook in place,
+    # so the exact file the user was served survives here for the
+    # late-Aug served-precision judgments (and any honest replay)
+    served = PRED_DIR / "as_served"
+    served.mkdir(exist_ok=True)
+    shutil.copy2(path, served / Path(path).name)
     return str(path)
 
 
 # --------------------------------------------------------------- CLI
+
+def _serve_health_warning():
+    """Headless twin of the GUI's startup data-health check (Tools/3):
+    warn on a failed/stale morning job (Logs/last_run_status.json) and
+    on game logs >6 days old in-season. Print-only — serving stays a
+    manual decision and a health probe must never block it, so every
+    failure mode inside the check itself is swallowed too."""
+    try:
+        problems = []
+        sf = DATA.parent / "Logs" / "last_run_status.json"
+        if sf.exists():
+            st = json.loads(sf.read_text(encoding="utf-8"))
+            if not st.get("ok", True):
+                jobs = ", ".join(st.get("failed_jobs", [])) or "unknown"
+                problems.append(f"last data update FAILED ({jobs}) — "
+                                f"see newest Logs/update_*.log")
+            fin = str(st.get("finished", ""))[:10]
+            if fin and fin != dt.date.today().isoformat():
+                problems.append(f"last data update finished {fin}, not "
+                                f"today — serving on stale data")
+        else:
+            problems.append("Logs/last_run_status.json missing — the "
+                            "morning job has never recorded a run")
+        g = pd.read_csv(DATA / "mlb_games.csv", usecols=["Date"])
+        newest = pd.to_datetime(g.Date, errors="coerce").max()
+        today = pd.Timestamp(dt.date.today())
+        if (pd.notna(newest) and 5 <= today.month <= 9
+                and (today - newest).days > 6):
+            problems.append(f"newest game log is {newest.date()} "
+                            f"({(today - newest).days} days old) — run "
+                            f"Scrapers/update_all.py")
+        for p in problems:
+            print(f"!!! DATA HEALTH: {p}", file=sys.stderr, flush=True)
+    except Exception:                               # noqa: BLE001
+        pass
+
 
 def main():
     """Headless serve: Data/todays_games.json -> workbook.
@@ -2160,6 +2419,7 @@ def main():
     if not args.serve:
         ap.error("nothing to do: pass --serve")
 
+    _serve_health_warning()
     P = None  # models load once, first slate that has games
     served = 0
     for jpath in args.json:
@@ -2179,7 +2439,9 @@ def main():
             P = Predictor(progress=lambda m: print(m, flush=True))
         out = P.predict_slate(specs, n_sims=args.sims,
                               progress=lambda m: print(m, flush=True))
-        path = save_excel_slate(specs, out)
+        # ledger only on full-sim serves: --sims smoke tests must never
+        # write permanent paper-trade rows
+        path = save_excel_slate(specs, out, ledger=args.sims is None)
         n_conf = sum(1 for s in specs
                      if s.get("away_lineup_src", "mlb") == "mlb"
                      and s.get("home_lineup_src", "mlb") == "mlb")
@@ -2192,6 +2454,13 @@ def main():
         served += 1
     if len(args.json) > 1:
         print(f"batch complete: {served}/{len(args.json)} slates served")
+    if P is not None and P.degraded:
+        # exit 3 = served-but-DEGRADED (raw probabilities in play) —
+        # distinct from a crash's exit 1 so a wrapper can tell "no
+        # workbook" from "workbook you should not bet"
+        print(f"WARNING: served degraded -> {'; '.join(P.degraded)}",
+              file=sys.stderr, flush=True)
+        sys.exit(3)
 
 
 if __name__ == "__main__":

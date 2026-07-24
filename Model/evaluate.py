@@ -416,6 +416,31 @@ def _warn_calib_overlap(calib, start, end, context):
               "range for an honest read. ***\n")
 
 
+def _auto_gate_start():
+    """Resolve --start auto for the CLV gate: the day AFTER the served
+    output-calibrators' fit window ends, so the Sunday gate can never
+    grade in-sample rows (the audit-confirmed overlap: the scheduled
+    gate's fixed start sat inside the calibrator fit range). Fails
+    loudly when the calibrators or their _meta are absent — an auto
+    window that silently fell back to in-sample would defeat the point.
+    Advances automatically at every calibration refresh, which also
+    bounds the window to one refresh cycle."""
+    cal_path = ART / "output_calibrators.joblib"
+    if not cal_path.exists():
+        sys.exit("--start auto: no output_calibrators.joblib — fit "
+                 "calibrators first or pass an explicit --start")
+    meta = joblib.load(cal_path).get("_meta") or {}
+    fe = meta.get("fit_end")
+    if not fe:
+        sys.exit("--start auto: output_calibrators.joblib has no _meta "
+                 "fit_end — refit calibrators or pass an explicit "
+                 "--start")
+    start = (pd.Timestamp(str(fe)) + pd.Timedelta(days=1)).date()
+    print(f"gate start auto-resolved to {start} "
+          f"(calibrator fit_end {fe})")
+    return str(start)
+
+
 def skill_ledger(start=None, end=None):
     """The honest where-does-the-model-have-skill document, computed
     straight from artifacts/calib_rows.parquet — NEVER re-sims. Per
@@ -707,38 +732,14 @@ def reliability_bands(df, lo=0.5, width=0.05):
 # ------------------------------------------------------- the CLV gate
 
 def _odds_y(gb, gp, games_df, pk, pid, market, line):
-    """Realized outcome for one captured price, or None (void/unplayed)."""
-    if market in ("h2h", "totals"):
-        g = games_df[games_df.GamePk == pk]
-        if g.empty:
-            return None
-        aw = pd.to_numeric(g.AwayScore.iloc[0], errors="coerce")
-        hm = pd.to_numeric(g.HomeScore.iloc[0], errors="coerce")
-        if pd.isna(aw) or pd.isna(hm):
-            return None
-        return int(hm > aw) if market == "h2h" else \
-            int(aw + hm > line)
-    if market.startswith("pitcher"):
-        r = gp[(gp.GamePk == pk) & (gp.PlayerId == pid)]
-        if r.empty:
-            return None
-        r = r.iloc[0]
-        stat = {"pitcher_strikeouts": r.SO, "pitcher_outs": r.OUTS,
-                "pitcher_hits_allowed": r.H, "pitcher_walks": r.BB,
-                "pitcher_earned_runs": r.ER}.get(market)
-        return None if stat is None or pd.isna(stat) else int(stat > line)
-    r = gb[(gb.GamePk == pk) & (gb.PlayerId == pid)]
-    if r.empty or not (r.PA.iloc[0] > 0):
-        return None
-    r = r.iloc[0]
-    stat = {"batter_hits": r.H, "batter_home_runs": r.HR,
-            "batter_total_bases": r.TB, "batter_runs_scored": r.R,
-            "batter_rbis": r.RBI, "batter_walks": r.BB,
-            "batter_stolen_bases": r.SB,
-            "batter_singles": r.H - r["2B"] - r["3B"] - r.HR,
-            "batter_doubles": r["2B"],
-            "batter_hits_runs_rbis": r.H + r.R + r.RBI}.get(market)
-    return None if stat is None or pd.isna(stat) else int(stat > line)
+    """Realized outcome for one captured price: 1/0, or None for
+    void/unplayed AND pushes (stat == integer line — a push is a void
+    for log-loss grading; grading it as a loss biased every
+    integer-line totals row until 2026-07-23). Thin delegate: the one
+    settlement truth lives in staking.outcome_y so the gate and the
+    paper-trading ledger can never grade differently."""
+    import staking as SK
+    return SK.outcome_y(gb, gp, games_df, pk, pid, market, line)
 
 
 def _gate_fingerprint(n_sims):
@@ -747,7 +748,12 @@ def _gate_fingerprint(n_sims):
     manifest.json) so standalone refits — e.g. a bare fit_sb that
     bypasses the manifest — still invalidate the cache."""
     import os
-    parts = [f"s{n_sims}"]
+    # "sem1": grading-semantics version — bumped when the gate's store
+    # grouping, y settlement, or row schema changes, so cached rows
+    # graded under old semantics re-sim ONCE. sem1 (2026-07-23) covers
+    # the whole batch: per-GamePk groups, pushes void in _odds_y,
+    # by_bat/by_pit role split, and the Shin diagnostic columns.
+    parts = [f"s{n_sims}", "sem1"]
     for f_ in ("manifest.json", "output_calibrators.joblib",
                "residual_heads.joblib", "latent.json",
                "a1_model.joblib", "a2_model.joblib",
@@ -759,7 +765,7 @@ def _gate_fingerprint(n_sims):
 
 
 GATE_CACHE_COLS = ["key", "family", "Date", "y", "p_model", "p_close",
-                   "p_open", "one_cap", "gap_min"]
+                   "p_open", "p_shin", "one_cap", "gap_min"]
 
 
 def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
@@ -805,37 +811,85 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
             print(f"  {date}: {len(hit)} rows from cache", flush=True)
             continue
         day_list = []
-        # replay the slate once; map players/games to sim results
-        by_pid, by_home, by_team = {}, {}, {}
+        # replay the slate once; map players/games to sim results. Each
+        # ident keeps a LIST of (pk, ...) hits so a doubleheader's two
+        # replayed games both stay addressable. Batter slots (rows 0-17)
+        # and starter slots (18-19) are kept in separate maps so a
+        # two-way player's pitcher markets grade his pitching tensor
+        # slot, never his batting slot.
+        by_bat, by_pit, by_home, by_team = {}, {}, {}, {}
         for _, g in day_games.iterrows():
             spec = B.build_spec(P, g, lineups, starters, umps, wx)
             if len(spec["away_lineup"]) < 9 or None in (
                     spec["away_starter"], spec["home_starter"]):
                 continue
             res = P.predict_slate([spec], n_sims=n_sims)[0]
-            by_home[g.HomeTeam] = (res, int(g.GamePk))
-            by_team[str(g.AwayTeam)] = (res, int(g.GamePk), 0)
-            by_team[str(g.HomeTeam)] = (res, int(g.GamePk), 1)
+            pk_g = int(g.GamePk)
+            by_home.setdefault(g.HomeTeam, []).append((pk_g, res))
+            by_team.setdefault(str(g.AwayTeam), []).append((pk_g, res, 0))
+            by_team.setdefault(str(g.HomeTeam), []).append((pk_g, res, 1))
             for row_i, pid in enumerate(res["meta"]["players"]):
-                if pid >= 0 and row_i < 20:
-                    by_pid.setdefault(int(pid), (res, row_i,
-                                                 int(g.GamePk)))
+                if pid < 0 or row_i >= 20:
+                    continue
+                dst = by_pit if row_i >= 18 else by_bat
+                dst.setdefault(int(pid), []).append((pk_g, res, row_i))
         print(f"  {date}: {len(by_home)} games replayed", flush=True)
+
+        def _resolve(hits, gpk):
+            """The replayed game an odds group grades against: exact
+            GamePk match for pk'd store rows (None when that game
+            wasn't replayed — never grade against the other DH game),
+            first hit for legacy blank rows (pre-GamePk behavior)."""
+            if not hits:
+                return None
+            if gpk == -1:
+                return hits[0]
+            for h in hits:
+                if h[0] == gpk:
+                    return h
+            return None
 
         s = sim.SIDX
         # game markets group by TEAM (their PlayerId is blank — grouping
         # them by PlayerId would fold every game on the slate into one
-        # group); player props group by PlayerId as before
+        # group); player props group by PlayerId as before. _gpk keeps a
+        # doubleheader's two games in separate groups (store keys on
+        # GamePk since 2026-07-23) so sharp_fair never blends two games'
+        # prices; a legacy -1 group is dropped when the same market also
+        # has pk'd rows (stale transition-day duplicate).
+        day_odds = day_odds.assign(
+            _gpk=pd.to_numeric(day_odds["GamePk"],
+                               errors="coerce").fillna(-1).astype(int))
         gm_mask = day_odds.Market.isin(("h2h", "totals", "team_totals"))
+        _pk_rows = day_odds[day_odds._gpk != -1]
+        _pk_gm = _pk_rows.Market.isin(("h2h", "totals", "team_totals"))
+        prop_pk_seen = {(str(p), m, str(l)) for p, m, l in zip(
+            _pk_rows.loc[~_pk_gm, "PlayerId"],
+            _pk_rows.loc[~_pk_gm, "Market"],
+            _pk_rows.loc[~_pk_gm, "Line"])}
+        game_pk_seen = {(str(t), m, str(l)) for t, m, l in zip(
+            _pk_rows.loc[_pk_gm, "Team"],
+            _pk_rows.loc[_pk_gm, "Market"],
+            _pk_rows.loc[_pk_gm, "Line"])}
         grouped = list(day_odds[~gm_mask].groupby(
-            ["PlayerId", "Market", "Line"], dropna=False)) + \
+            ["PlayerId", "Market", "Line", "_gpk"], dropna=False)) + \
             list(day_odds[gm_mask].groupby(
-                ["Team", "Market", "Line"], dropna=False))
-        for (pid_s, market, line_s), grp in grouped:
+                ["Team", "Market", "Line", "_gpk"], dropna=False))
+        for (pid_s, market, line_s, gpk), grp in grouped:
+            if gpk == -1:
+                seen = (game_pk_seen
+                        if market in ("h2h", "totals", "team_totals")
+                        else prop_pk_seen)
+                if (str(pid_s), market, str(line_s)) in seen:
+                    continue
             fam = PR.MKT_FAM.get(market)
             if fam is None:
                 continue
             fair = O.sharp_fair(grp.to_dict("records"))
+            # Shin devig, DIAGNOSTIC ONLY: carried through the cache and
+            # reported per family so the late-Aug review can compare
+            # methods on evidence; no verdict or consumer reads it
+            fair_shin = O.shin_fair(grp.to_dict("records"))
             op = [dict(OverPrice=r.get("OpenOverPrice"),
                        UnderPrice=r.get("OpenUnderPrice"),
                        Book=r.get("Book"))
@@ -858,10 +912,10 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
             if market == "team_totals":
                 if not np.isfinite(line):
                     continue
-                hit = by_team.get(str(grp.Team.iloc[0]))
+                hit = _resolve(by_team.get(str(grp.Team.iloc[0])), gpk)
                 if hit is None:
                     continue
-                res, pk, side = hit
+                pk, res, side = hit
                 p_model = PR._cal(res.get("calib"), "tt", float(
                     (res["score"][:, side] > line).mean()))
                 grow = games[games.GamePk == pk]
@@ -873,10 +927,10 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
                 y = None if pd.isna(sc_) else int(sc_ > line)
             elif market in ("h2h", "totals"):
                 team = grp.Team.iloc[0]
-                hit = by_home.get(team)
+                hit = _resolve(by_home.get(team), gpk)
                 if hit is None:
                     continue
-                res, pk = hit
+                pk, res = hit
                 if market == "h2h":
                     p_model = PR._cal(res.get("calib"), "ml", float(
                         (res["score"][:, 1] > res["score"][:, 0]).mean()))
@@ -889,10 +943,12 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
                     pid = int(float(pid_s))
                 except (TypeError, ValueError):
                     continue
-                hit = by_pid.get(pid)
+                role = (by_pit if market.startswith("pitcher")
+                        else by_bat)
+                hit = _resolve(role.get(pid), gpk)
                 if hit is None:
                     continue
-                res, row_i, pk = hit
+                pk, res, row_i = hit
                 t = res["tensor"]
                 if market == "batter_total_bases":
                     counts = (t[:, row_i, s["B1"]]
@@ -915,8 +971,8 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
                 continue
             day_list.append(dict(family=fam, Date=date, y=y,
                                  p_model=p_model, p_close=fair,
-                                 p_open=fair_open, one_cap=one_cap,
-                                 gap_min=gap_min))
+                                 p_open=fair_open, p_shin=fair_shin,
+                                 one_cap=one_cap, gap_min=gap_min))
         rows.extend(day_list)
         if day_list:
             new_frames.append(
@@ -925,8 +981,11 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
     # persist: rows for the current fingerprint only (a stack change
     # invalidates everything), atomically
     keep = cache[cache.key.isin(seen_keys)] if len(cache) else cache
-    merged = pd.concat([keep] + new_frames, ignore_index=True) \
-        if new_frames else keep
+    # empty frames are excluded before concat (their all-NA columns
+    # would poison result dtypes; pandas deprecation FutureWarning)
+    _frames = [f for f in [keep] + new_frames if len(f)]
+    merged = (pd.concat(_frames, ignore_index=True)
+              if _frames else keep)
     if len(merged):
         F.write_artifact(cache_path,
                          lambda p: merged[GATE_CACHE_COLS].to_parquet(
@@ -962,10 +1021,22 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
                   - logloss(moved.y, np.clip(moved.p_model, 0, 1))
                   ) if len(moved) >= 30 else np.nan
         recap = sub.gap_min[sub.gap_min > 0]
+        # Shin diagnostic on the shin-priced subset, with ll_model
+        # recomputed on the SAME subset so delta_shin is comparable
+        shin = sub[sub.p_shin.notna()]
+        if len(shin) >= 30:
+            ll_shin = logloss(shin.y, shin.p_shin)
+            delta_shin = ll_shin - logloss(shin.y, shin.p_model)
+        else:
+            ll_shin = delta_shin = np.nan
         fam_stats.append(dict(
             family=fam, n=len(sub),
             ll_model=round(d_model, 5), ll_close=round(d_close, 5),
             delta=round(delta, 5),
+            ll_shin=round(float(ll_shin), 5)
+            if ll_shin == ll_shin else np.nan,
+            delta_shin=round(float(delta_shin), 5)
+            if delta_shin == delta_shin else np.nan,
             ci_lo=round(float(np.quantile(boots, 0.05)), 5)
             if len(boots) else np.nan,
             p_raw=pval, n_moved=len(moved),
@@ -985,6 +1056,15 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
         np.where((rep.p_bh < alpha) & (rep.ci_lo > 0), "PASS",
                  "NO-EDGE"))
     print(rep.to_string(index=False))
+    # persist the verdict table — the staking ledger's eligibility source
+    # of truth (STAKING_DESIGN §2/§7 read PASS families from here, never
+    # from console scroll-back)
+    rep_out = rep.assign(start=str(start), end=str(end),
+                         run_at=pd.Timestamp.now().isoformat(
+                             timespec="seconds"))
+    F.write_artifact(ART / "market_gate_report.csv",
+                     lambda p: rep_out.to_csv(p, index=False),
+                     backup=False)
 
     # edge buckets: does a bigger model-vs-close gap realize more often?
     df["edge"] = df.p_model - df.p_close
@@ -1018,7 +1098,10 @@ if __name__ == "__main__":
                     help="paired A/B between two replay-row parquets "
                          "(A=baseline, B=candidate; optional "
                          "--start/--end filter)")
-    ap.add_argument("--start", default=None)
+    ap.add_argument("--start", default=None,
+                    help="YYYY-MM-DD, or 'auto' (--gate only): the day "
+                         "after the served calibrators' fit_end, so the "
+                         "scheduled gate never grades in-sample")
     ap.add_argument("--end", default=None)
     ap.add_argument("--sims", type=int, default=4000)
     ap.add_argument("--max-games", type=int, default=None)
@@ -1030,6 +1113,10 @@ if __name__ == "__main__":
                     help="batched replay path (sim_batch prepare_games "
                          "+ run_batch on CUDA)")
     args = ap.parse_args()
+    if args.start == "auto":
+        if not args.gate:
+            ap.error("--start auto is only valid with --gate")
+        args.start = _auto_gate_start()
     needs_range = not (args.ledger or args.ab
                        or (args.fitcal and args.reuse_rows))
     if needs_range and not (args.start and args.end):

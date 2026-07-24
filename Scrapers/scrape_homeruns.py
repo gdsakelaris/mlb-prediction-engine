@@ -43,7 +43,8 @@ from pathlib import Path
 
 import requests
 
-from seasons import CURRENT_SEASON, YEARS, stored_rows_by_season
+from seasons import (CURRENT_SEASON, YEARS, atomic_write,
+                     stored_rows_by_season)
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "Data"
 
@@ -157,7 +158,7 @@ def main():
         row["Running Total"] = i
 
     # utf-8-sig so Excel renders accented names (Domínguez, García) correctly.
-    with open(args.output, "w", newline="", encoding="utf-8-sig") as f:
+    with atomic_write(args.output, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=list(COLUMNS))
         writer.writeheader()
         writer.writerows(all_rows)

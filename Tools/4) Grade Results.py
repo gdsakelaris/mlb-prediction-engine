@@ -31,7 +31,9 @@ order) — a game-1 prediction is never credited with a game-2 stat.
 Games-sheet rows are matched per game: the tag's i-th row grades against
 the day's i-th final for that matchup (schedule order); if only one of
 the two games is final the tag's rows are skipped until both are in.
-Bets rows carry no G#, so on a multi-final day they stay unsettled
+Bets rows carry GamePk + G# since 2026-07-23, so they settle against
+exactly their own game's final (a DH row whose game isn't final yet
+waits); legacy rows without either stay unsettled on multi-final days
 rather than misgraded.
 
 If some games are missing (they weren't final at the last scrape), their
@@ -52,6 +54,7 @@ in the totals but keeps its old paint.
 """
 import argparse
 import re
+import shutil
 import sys
 from collections import Counter
 from pathlib import Path
@@ -62,6 +65,17 @@ from openpyxl.styles import Font, PatternFill
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "Data"
 PRED_DIR = Path(__file__).resolve().parent.parent / "Predictions"
+# paper-trading ledger settlement rides each grade (Model/staking.py is
+# a light import: pandas + odds only, no model artifacts)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "Model"))
+
+
+def _settle_ledger(date):
+    try:
+        import staking
+        staking.settle(str(date))
+    except Exception as e:                              # noqa: BLE001
+        print(f"  ledger settle skipped ({e})", flush=True)
 
 # the one grading color: solid green = the stat occurred
 GREEN = "00B050"
@@ -263,12 +277,17 @@ def _bat_actual(s, prop):
 
 
 def _settle_bet(row, batters, starters, games, bat_pid, pit_pid, bg, sg):
-    """Did this Bets row win? True / False / None (can't settle yet: no
-    final, unmatched player, or a doubleheader day we can't pin to one
-    game — Bets rows carry no G#, so any multi-final matchup is
-    unsettleable rather than misgraded against a day sum). `row` is
-    {header: value}; `bat_pid` / `pit_pid` resolve a (game, name) to a
-    PlayerId."""
+    """Did this Bets row win? True / False / 'push' (stat landed exactly
+    on an integer line — stake returned, neither won nor lost) / None
+    (can't settle yet: no final, unmatched player, or a doubleheader
+    game we can't pin down).
+    Bets rows carry GamePk + G# since 2026-07-23: GamePk pins the final
+    exactly (a DH row whose own game isn't final yet stays unsettled
+    instead of grading against the other game); G# (first-pitch order)
+    is the fallback for rows without a pk. Legacy rows with neither
+    keep the old rule — settle only when the matchup has exactly one
+    final, never misgrade against a day sum. `row` is {header: value};
+    `bat_pid` / `pit_pid` resolve a (game, name) to a PlayerId."""
     game, prop = str(row.get("Game", "")), str(row.get("Prop", ""))
     side, line = str(row.get("Side", "")), row.get("Line")
 
@@ -280,6 +299,24 @@ def _settle_bet(row, batters, starters, games, bat_pid, pit_pid, bg, sg):
 
     def _one_final():
         finals = games.get(game, [])
+        try:
+            pk = int(row.get("GamePk"))
+        except (TypeError, ValueError):
+            pk = None
+        if pk is not None:
+            for f in finals:
+                if f["gamepk"] == pk:
+                    return f
+            return None                   # its own game isn't final yet
+        try:
+            g_num = int(row.get("G#"))
+        except (TypeError, ValueError):
+            g_num = None
+        if g_num is not None and len(finals) > 1:
+            k = g_num - 1
+            return finals[k] if 0 <= k < len(finals) else None
+        if g_num == 2 and len(finals) == 1:
+            return None                   # can't tell WHICH game is final
         return finals[0] if len(finals) == 1 else None
 
     if prop == "moneyline":                     # Side is the picked team
@@ -289,8 +326,15 @@ def _settle_bet(row, batters, starters, games, bat_pid, pit_pid, bg, sg):
         f, ln = _one_final(), _line()
         if f is None or ln is None:
             return None
+        if f["total"] == ln:
+            return "push"
         occ = f["total"] > ln
         return occ if side == "Over" else not occ
+    # the day-sum fallback is only safe when the matchup produced exactly
+    # one final — on a multi-final (DH) day a day sum mixes both games,
+    # so a pinned row without its own box line stays unsettled instead
+    day_ok = len(games.get(game, [])) == 1
+
     if prop.startswith("pitcher "):             # "pitcher strikeouts o6.5"
         rest = prop[len("pitcher "):]
         for lbl, stat in BET_PIT_STAT.items():
@@ -300,10 +344,12 @@ def _settle_bet(row, batters, starters, games, bat_pid, pit_pid, bg, sg):
                 if pid is None or f is None or ln is None:
                     return None
                 a = (sg or {}).get((int(pid), f["gamepk"]))
-                if a is None:
+                if a is None and day_ok:
                     a = starters.get(int(pid))
                 if a is None:
                     return None
+                if a[stat] == ln:
+                    return "push"
                 occ = a[stat] > ln
                 return occ if side == "Over" else not occ
         return None
@@ -312,13 +358,15 @@ def _settle_bet(row, batters, starters, games, bat_pid, pit_pid, bg, sg):
     if pid is None or f is None or ln is None:
         return None
     s = (bg or {}).get((int(pid), f["gamepk"]))
-    if s is None:
+    if s is None and day_ok:
         s = batters.get(int(pid))
     if s is None:
         return None
     actual = _bat_actual(s, prop)
     if actual is None:
         return None
+    if actual == ln:
+        return "push"
     occ = actual > ln
     return occ if side == "Over" else not occ
 
@@ -361,10 +409,16 @@ def _grade_bets(wb, batters, starters, games, stats, bg, sg):
         won = _settle_bet(row, batters, starters, games, bat_pid, pit_pid,
                           bg, sg)
         stats["bets"] = stats.get("bets", 0) + 1
-        if won:
-            stats["bets_won"] = stats.get("bets_won", 0) + 1
-            for j in range(1, ncol + 1):
-                ws.cell(row=i, column=j).fill = BETS_WIN
+        if won == "push":
+            stats["bets_push"] = stats.get("bets_push", 0) + 1
+        elif won is None:
+            stats["bets_open"] = stats.get("bets_open", 0) + 1
+        else:
+            stats["bets_settled"] = stats.get("bets_settled", 0) + 1
+            if won:
+                stats["bets_won"] = stats.get("bets_won", 0) + 1
+                for j in range(1, ncol + 1):
+                    ws.cell(row=i, column=j).fill = BETS_WIN
 
 
 class GradeError(RuntimeError):
@@ -384,6 +438,16 @@ def grade(path):
         raise GradeError(f"no box scores for {date} in "
                          f"Data/mlb_game_batting.csv — run  "
                          f"python Scrapers/scrape_gamelogs.py  first")
+
+    # transition safety net: the serve now writes a pristine copy to
+    # Predictions/as_served/ itself; for workbooks served before that
+    # existed, snapshot the file before the first repaint (a
+    # graded-then-copied file is imperfect but strictly better than
+    # nothing, and this is a no-op once the serve-time copy exists)
+    pristine = PRED_DIR / "as_served" / Path(path).name
+    if not pristine.exists():
+        pristine.parent.mkdir(exist_ok=True)
+        shutil.copy2(path, pristine)
 
     wb = openpyxl.load_workbook(path)
     for ws in wb.worksheets:
@@ -536,16 +600,20 @@ def main():
         print("grading workbooks:")
         for p in books:
             try:
-                _, s, _, painted = grade(p)
+                d_, s, _, painted = grade(p)
             except GradeError as e:
                 print(f"  ! {p.name}: {e}")
                 continue
+            _settle_ledger(d_)
             days += 1
             for k, v in s.items():
                 tot[k] = tot.get(k, 0) + v
             line = f"  {p.name}: {s['cells']:,} cells, {s['hit']:,} occurred"
             if s.get("bets"):
-                line += f"; bets won {s.get('bets_won', 0)}/{s['bets']}"
+                line += (f"; bets won {s.get('bets_won', 0)}"
+                         f"/{s.get('bets_settled', 0)} settled"
+                         f" ({s.get('bets_push', 0)} push,"
+                         f" {s.get('bets_open', 0)} unsettled)")
             if s.get("missing_rows"):
                 line += f"; {s['missing_rows']} row(s) no box score"
             if not painted:
@@ -558,8 +626,10 @@ def main():
         print(f"\ngraded {days} workbook(s): {tot.get('cells', 0):,} cells "
               f"checked, {tot.get('hit', 0):,} stats occurred")
         if tot.get("bets"):
-            print(f"Bets (all days): {tot.get('bets_won', 0)} of "
-                  f"{tot['bets']} bet(s) won")
+            print(f"Bets (all days): won {tot.get('bets_won', 0)} of "
+                  f"{tot.get('bets_settled', 0)} settled "
+                  f"({tot.get('bets_push', 0)} push, "
+                  f"{tot.get('bets_open', 0)} unsettled)")
         if tot.get("missing_rows"):
             print(f"{tot['missing_rows']} row(s) had no final box score — "
                   f"run  python Scrapers/scrape_gamelogs.py  and re-run")
@@ -581,13 +651,16 @@ def main():
     if not painted:
         sys.exit(f"{path} is open in Excel (it holds the file lock) — "
                  f"close it there, then run this again.")
+    _settle_ledger(date)
     print(f"graded {path}")
     print("")
     print(f"  {date}: {s['cells']:,} cells checked, {s['hit']:,} stats "
           f"occurred (now solid green)")
     if s.get("bets"):
-        print(f"  Bets sheet: {s.get('bets_won', 0)} of {s['bets']} bet(s) "
-              f"won -> row highlighted solid green")
+        print(f"  Bets sheet: won {s.get('bets_won', 0)} of "
+              f"{s.get('bets_settled', 0)} settled "
+              f"({s.get('bets_push', 0)} push, {s.get('bets_open', 0)} "
+              f"unsettled) -> winners highlighted solid green")
     if s["missing_rows"]:
         print(f"  {s['missing_rows']} row(s) had no final box score yet — "
               f"run  python Scrapers/scrape_gamelogs.py  and grade again")

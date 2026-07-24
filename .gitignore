@@ -11,7 +11,10 @@ __pycache__/
 .pytest_cache/
 
 # Run outputs
+.task_lock*/
 Logs/
+# append-only paper-trading record (data, not code; OneDrive-synced)
+Ledger/
 Predictions/
 Tools/PROP_RANKINGS.xlsx
 Model/artifacts/

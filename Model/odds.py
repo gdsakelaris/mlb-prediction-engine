@@ -6,9 +6,11 @@ here, in one place, shared by the capture tool ("Tools/2) Scrape Odds.py")
 and every future consumer. This module defines:
 
   ODDS_COLUMNS     the store's column set. One row per (Date, PlayerId,
-                   Market, Line, Book) — for game-market rows (blank
-                   PlayerId: h2h, totals, team_totals) the Team column
-                   is the identity instead.
+                   Market, Line, Book, GamePk) — for game-market rows
+                   (blank PlayerId: h2h, totals, team_totals) the Team
+                   column is the identity instead. GamePk (stamped since
+                   2026-07-23) keeps a doubleheader's two games apart;
+                   older rows carry it blank.
                    OverPrice/UnderPrice/CapturedAt
                    are the LATEST capture (the closing side);
                    OpenOverPrice/OpenUnderPrice/OpenCapturedAt the
@@ -129,6 +131,59 @@ def no_vig(over_price, under_price):
     if po is None or pu is None or po + pu <= 0:
         return None
     return po / (po + pu), pu / (po + pu)
+
+
+def shin_no_vig(over_price, under_price):
+    """Two-sided american prices -> fair over-probability by the Shin
+    (1992) two-outcome closed form, or None when either side is missing.
+
+    Proportional de-vig spreads the overround evenly; Shin models it as
+    insider trading, which books price into LONGSHOTS — so Shin shades
+    longshot fairs lower and favorite fairs higher than proportional.
+    On a symmetric -110/-110 pair the two methods agree exactly (0.5).
+    z = ((sqrt(b^2 + 4(1-b)*(po^2)/b) - b) / (2(1-b)) with b = po + pu
+    per side, normalized. DIAGNOSTIC ONLY until the late-Aug evidence
+    review — no serving/grading consumer reads it."""
+    po, pu = american_to_prob(over_price), american_to_prob(under_price)
+    if po is None or pu is None or po + pu <= 0:
+        return None
+    b = po + pu                       # booksum (1 + overround)
+    if b <= 1.0:                      # no vig to remodel: proportional
+        return po / b
+    # exact two-outcome solution: with p_i = (sqrt(z^2 + 4(1-z)pi^2/B)
+    # - z) / (2(1-z)) and p1 + p2 = 1, the insider fraction z solves in
+    # closed form via a = (1-z)/B:
+    denom = (po * po - pu * pu) ** 2 - b * b
+    if denom == 0:
+        return po / b
+    a = 2.0 * (po * po + pu * pu - b) / denom
+    z = 1.0 - a * b
+    if not 0.0 <= z < 1.0:            # degenerate prices: proportional
+        return po / b
+    d = a * (po * po - pu * pu)
+    return (1.0 + d - z) / (2.0 * (1.0 - z))
+
+
+def shin_fair(rows):
+    """shin_no_vig aggregated exactly like sharp_fair: sharp book wins
+    outright, else median across two-sided books; None when no book has
+    both sides. Diagnostic twin of sharp_fair for the gate's
+    Shin-vs-proportional comparison."""
+    fair = {}
+    for r in rows:
+        get = r.get if hasattr(r, "get") else lambda k, _r=r: getattr(_r, k)
+        f = shin_no_vig(get("OverPrice"), get("UnderPrice"))
+        if f is not None:
+            fair.setdefault(str(get("Book")).lower(), []).append(f)
+    for book in SHARP_BOOKS:
+        if book in fair:
+            ps = fair[book]
+            return sum(ps) / len(ps)
+    ps = sorted(p for v in fair.values() for p in v)
+    if not ps:
+        return None
+    mid = len(ps) // 2
+    return ps[mid] if len(ps) % 2 else (ps[mid - 1] + ps[mid]) / 2.0
 
 
 def sharp_fair(rows):
