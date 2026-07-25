@@ -19,9 +19,13 @@ have their coordinates here. The game-start hour is approximated from
 DayNight in park-local time (day -> 13:00, night -> 19:00); Open-Meteo's
 timezone=auto returns hourly arrays already in local time.
 
-Default run is incremental — only games missing from the output CSV are
-fetched (seconds in the daily job, right after scrape_gamelogs adds
-yesterday's finals). --backfill refetches everything (~5-10 minutes).
+Default run is incremental — fetched are: games missing from the output
+CSV, stored rows with null Humidity/Pressure (an endpoint gap must not be
+cached forever), and games still inside the archive-lag window, whose
+stored values are forecast-model output and are refreshed daily until the
+archive's observations cover them. Seconds in the daily job, right after
+scrape_gamelogs adds yesterday's finals. --backfill refetches everything
+(~5-10 minutes).
 
 Usage:
     python scrape_weather.py [-o output.csv] [--backfill]
@@ -168,7 +172,20 @@ def main():
     stored = None
     if out_path.exists() and not args.backfill:
         stored = pd.read_csv(out_path, encoding="utf-8-sig")
-        games = games[~games["GamePk"].isin(set(stored["GamePk"]))]
+        # a stored row is FINAL only once it has values and is old enough
+        # to have come from the archive endpoint. Two repair classes are
+        # re-fetched instead of being cached forever: (a) null rows — an
+        # Open-Meteo response that didn't cover the game hour used to be
+        # permanent NaNs; (b) rows still inside the archive lag window,
+        # whose values are forecast-model output — re-pulled daily until
+        # the archive covers them, so the games nearest the training
+        # frontier don't permanently keep lower-grade weather.
+        sd = pd.to_datetime(stored["Date"]).dt.date
+        redo = (stored["Humidity"].isna() | stored["Pressure"].isna()
+                | (sd >= date.today()
+                   - timedelta(days=ARCHIVE_LAG_DAYS + 2)))
+        done = set(stored.loc[~redo, "GamePk"])
+        games = games[~games["GamePk"].isin(done)]
     print(f"{len(games):,} games need weather", flush=True)
 
     coords = venue_coords()
@@ -204,7 +221,15 @@ def main():
                                         "Humidity", "Pressure", "Precip"])
     if stored is not None:
         fresh = pd.concat([stored, fresh], ignore_index=True)
-    fresh = (fresh.drop_duplicates("GamePk", keep="last")
+    # last capture wins (archive refresh replaces stored forecast values),
+    # EXCEPT a refetch that came back empty must not clobber stored values
+    # (transient endpoint gap): value-bearing rows outrank null rows
+    has_val = fresh["Humidity"].notna() | fresh["Pressure"].notna()
+    fresh = (fresh.assign(_rank=has_val.astype(int),
+                          _ord=range(len(fresh)))
+             .sort_values(["GamePk", "_rank", "_ord"])
+             .drop_duplicates("GamePk", keep="last")
+             .drop(columns=["_rank", "_ord"])
              .sort_values(["Date", "GamePk"]))
     out_path.parent.mkdir(exist_ok=True)
     with atomic_write(out_path, "w", newline="", encoding="utf-8-sig") as f:

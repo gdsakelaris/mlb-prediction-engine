@@ -154,19 +154,31 @@ def test_reliever_rotation_on_exit():
 
 def test_steals_caught_only():
     # walk-only offense, attempt prob 1, success prob 0: every inning is
-    # walk/CS x3, nobody scores, no SB ever
+    # walk/CS x3, nobody advances past first, no SB ever. Pre-2020 (no
+    # ghost runner) the game rides 0-0 to the MAX_INNINGS safety cap,
+    # where the fair-coin tiebreak (2026-07-25) awards exactly ONE
+    # deciding run — a tie must never leak into (home > away) win
+    # accounting, which counted capped ties as home losses.
     walks = synth.class_vec(BB=1.0)
     prep = synth.make_prep(away_vec=walks, home_vec=walks, sb_att=1.0,
                            sb_suc=0.0)
     res = S.run(prep, n_sims=200, seed=26, season=2019)
     t, sc = res["tensor"], res["score"]
     assert res["leftover"] == 0
-    assert (sc == 0).all()
+    # tiebreak: every capped tie ends 1-0 (one run total, margin 1)
+    assert (sc.sum(axis=1) == 1).all()
+    assert (np.abs(sc[:, 1] - sc[:, 0]) == 1).all()
+    hw = (sc[:, 1] > sc[:, 0]).mean()
+    assert 0.0 < hw < 1.0                        # a fair coin, not a rule
+    # the deciding run lands in the winner's batter-R ledger too, so
+    # scoreboard == player run ledger still holds per team
+    for rows, side in ((synth.AWAY_BATS, 0), (synth.HOME_BATS, 1)):
+        assert (t[:, rows, S.SIDX["R"]].sum(1) == sc[:, side]).all()
     assert (t[..., S.SIDX["SB"]] == 0).all()
     cs = t[..., S.SIDX["CS"]].sum(1)
     outs = t[..., S.SIDX["OUTS"]].sum(1)
     assert (cs == outs).all()                    # every out was a CS
-    assert (cs == 2 * 3 * S.MAX_INNINGS).all()   # 19 full tied innings
+    assert (cs == 2 * 3 * S.MAX_INNINGS).all()   # 25 full tied innings
 
 
 def test_steals_successful_advance():

@@ -132,7 +132,9 @@ K_HOOK_PREV = 40.0       # starts of shrinkage for that prior-season
 LG_SPRINT = 27.0         # ft/s league sprint speed (leg-hit pivot)
 SEA_LVL_FT = 0.005       # ft of HR carry per ft of park elevation
 PORCH_REF = 330.0        # nominal pull-fence distance porch terms center on
-AIR_REF = 0.1017         # Pressure/tempK at 29.92 inHg & 70F ("thin air" 0)
+AIR_REF = 1013.25 / 294.26   # Pressure/tempK at sea level & 70F ("thin
+                         # air" 0) — Pressure is hPa on BOTH paths
+                         # (boxscore weather AND the open-meteo scrape)
 PITCH_CLASS = {          # arsenal codes -> fast / breaking / offspeed
     "FF": "fast", "SI": "fast", "FC": "fast",
     "SL": "brk", "ST": "brk", "CU": "brk", "KC": "brk", "SV": "brk",
@@ -165,9 +167,12 @@ EVENT_TO_CLASS = {
 }
 BBTYPES = ["ground_ball", "fly_ball", "line_drive", "popup"]
 
-# wind direction -> radial factor (+1 blowing out, -1 blowing in, 0 cross)
-WIND_RADIAL = {"Out To CF": 1.0, "Out To LF": 0.8, "Out To RF": 0.8,
-               "In From CF": -1.0, "In From LF": -0.8, "In From RF": -0.8,
+# wind direction -> radial factor (+1 blowing out, -1 blowing in, 0
+# cross). Keys are TITLE case: consumers .str.title() the WindDir series
+# first, so the boxscore casing ("Out To CF") and the live-slate casing
+# ("Out To Cf") resolve identically by construction
+WIND_RADIAL = {"Out To Cf": 1.0, "Out To Lf": 0.8, "Out To Rf": 0.8,
+               "In From Cf": -1.0, "In From Lf": -0.8, "In From Rf": -0.8,
                "L To R": 0.0, "R To L": 0.0, "Calm": 0.0, "None": 0.0,
                "Varies": 0.0}
 
@@ -341,17 +346,24 @@ def build_pa_table():
     pa["rest_b"] = _num(pa["batter_days_since_prev_game"])
     pa["rest_p"] = _num(pa["pitcher_days_since_prev_game"])
 
+    # duplicate-key guard on every game-grain merge: a crashed-then-
+    # rerun scraper appending a second copy of a game would otherwise
+    # silently multiply that game's PAs through every downstream panel
+    # (keep="first" = the original row, deterministically)
     games = read_csv("mlb_games.csv",
                      usecols=["GamePk", "Venue", "DayNight", "Temp",
                               "WindSpeed", "WindDir", "Condition"])
     games["GamePk"] = _num(games["GamePk"])
+    games = games.drop_duplicates("GamePk")
     pa = pa.merge(games, left_on="game_pk", right_on="GamePk", how="left")
     wx = read_csv("mlb_weather.csv",
                   usecols=["GamePk", "Humidity", "Pressure"])
     wx["GamePk"] = _num(wx["GamePk"])
+    wx = wx.drop_duplicates("GamePk")
     pa = pa.merge(wx, on="GamePk", how="left")
     umps = read_csv("mlb_umpires.csv", usecols=["GamePk", "HpUmpId"])
     umps["GamePk"] = _num(umps["GamePk"])
+    umps = umps.drop_duplicates("GamePk")
     pa = pa.merge(umps, on="GamePk", how="left")
 
     keep = ["game_pk", "Date", "Season", "at_bat_number", "BatterId",
@@ -680,9 +692,16 @@ def build_thresh_panel():
                   usecols=["GamePk", "PlayerId", "PA", "H", "R", "RBI"])
     for c in gb.columns:
         gb[c] = _num(gb[c])
+    # one line per player-game: a duplicated (GamePk, PlayerId) row (a
+    # rerun-appended scrape) would double-count his game; keep the row
+    # with the most PA — a phantom PA=0 twin must never displace the
+    # real stat line
+    gb = (gb.sort_values("PA", ascending=False, kind="stable")
+            .drop_duplicates(["GamePk", "PlayerId"]))
     games = read_csv("mlb_games.csv", usecols=["GamePk", "Date"])
     games["Date"] = pd.to_datetime(games["Date"])
     games["GamePk"] = _num(games["GamePk"])
+    games = games.drop_duplicates("GamePk")
     df = gb[gb["PA"].fillna(0) > 0].merge(games, on="GamePk",
                                           how="inner")
     hrr = df["H"].fillna(0) + df["R"].fillna(0) + df["RBI"].fillna(0)
@@ -878,12 +897,13 @@ def build_hrpt_tables():
 
 def build_park_factors(pa):
     """Per (Venue, Year): class-rate multipliers vs league, pooled over
-    the PRIOR `PRIOR_SEASONS_PARK` seasons and shrunk toward 1. The
-    CURRENT season's row additionally pools its own season-to-date PAs
-    (hierarchical in-season evidence — strictly before today at serve
-    time, and never seen by training, which stops at the calibration
-    year)."""
-    cur = int(pa.Season.max())
+    the PRIOR `PRIOR_SEASONS_PARK` seasons and shrunk toward 1 —
+    prior-season keying ONLY, uniform with every other season-grain
+    store. (Current-season season-to-date pooling was removed: it was
+    honest for a same-morning serve but poisoned every replay/A-B of an
+    earlier current-season date with games played after that date,
+    including the replayed games' own PAs. Replay integrity over the
+    marginal in-season serve signal — accepted tradeoff.)"""
     rates = pa.groupby(["Venue", "Season"], sort=False).agg(
         pa_n=("label", "size"),
         **{c: ("label", lambda s, c=c: (s == c).sum()) for c in CLASSES}
@@ -893,15 +913,13 @@ def build_park_factors(pa):
     rows = []
     for year in range(int(pa.Season.min()) + 1, int(pa.Season.max()) + 2):
         in_win = ((rates.Season >= year - PRIOR_SEASONS_PARK)
-                  & ((rates.Season < year)
-                     | ((rates.Season == year) & (year == cur))))
+                  & (rates.Season < year))
         window = rates[in_win]
         if window.empty:
             continue
         agg = window.groupby("Venue")[["pa_n"] + CLASSES].sum().reset_index()
         lgw = lg[(lg.Season >= year - PRIOR_SEASONS_PARK)
-                 & ((lg.Season < year)
-                    | ((lg.Season == year) & (year == cur)))]
+                 & (lg.Season < year)]
         lgr = lgw.groupby("label")["lg_rate"].mean()
         for c in CLASSES:
             obs = agg[c] / agg["pa_n"].clip(lower=1)
@@ -927,16 +945,14 @@ def build_park_factors(pa):
     for year in range(int(pa.Season.min()) + 1,
                       int(pa.Season.max()) + 2):
         in_win = ((ratesh.Season >= year - PRIOR_SEASONS_PARK)
-                  & ((ratesh.Season < year)
-                     | ((ratesh.Season == year) & (year == cur))))
+                  & (ratesh.Season < year))
         window = ratesh[in_win]
         if window.empty:
             continue
         agg = window.groupby(["Venue", "stand"])[["pa_n", "HR"]].sum(
             ).reset_index()
         lw = lgh_[(lgh_.Season >= year - PRIOR_SEASONS_PARK)
-                  & ((lgh_.Season < year)
-                     | ((lgh_.Season == year) & (year == cur)))]
+                  & (lgh_.Season < year)]
         lr = lw.groupby("stand")["rate"].mean()
         obs = agg["HR"] / agg["pa_n"].clip(lower=1)
         f = obs / agg["stand"].map(lr).clip(lower=1e-9)
@@ -991,11 +1007,11 @@ def build_park_geometry(pa):
 
 
 def build_ump_factors(pa):
-    """Per (HpUmpId, Year) K/BB multipliers from prior seasons, shrunk
-    toward 1; the CURRENT season's row also pools its own season-to-date
-    games (matters most in the ABS-challenge era, where historical ump
-    effects may compress)."""
-    cur = int(pa.Season.max())
+    """Per (HpUmpId, Year) K/BB multipliers from PRIOR seasons only,
+    shrunk toward 1. (Current-season season-to-date pooling was removed
+    for the same reason as the park factors: it leaked post-date games
+    into every replay/A-B of an earlier current-season date. The
+    ABS-era compression now rides in via the era_abs flag instead.)"""
     sub = pa.dropna(subset=["HpUmpId"]).copy()
     sub["HpUmpId"] = _num(sub["HpUmpId"]).astype("int64")
     rates = sub.groupby(["HpUmpId", "Season"], sort=False).agg(
@@ -1008,16 +1024,13 @@ def build_ump_factors(pa):
     rows = []
     for year in range(int(sub.Season.min()) + 1,
                       int(sub.Season.max()) + 2):
-        in_win = ((rates.Season < year)
-                  | ((rates.Season == year) & (year == cur)))
+        in_win = rates.Season < year
         window = rates[in_win]
         if window.empty:
             continue
         agg = window.groupby("HpUmpId")[["pa_n", "K", "BB"]].sum(
             ).reset_index()
-        lgw = lg[(lg.Season < year)
-                 | ((lg.Season == year) & (year == cur))][
-            ["lgK", "lgBB"]].mean()
+        lgw = lg[lg.Season < year][["lgK", "lgBB"]].mean()
         w = agg["pa_n"] / (agg["pa_n"] + K_UMP)
         agg["uf_K"] = 1.0 + w * ((agg["K"] / agg["pa_n"].clip(lower=1))
                                  / max(lgw["lgK"], 1e-9) - 1.0)
@@ -1045,16 +1058,13 @@ def build_ump_factors(pa):
     lgr = g.groupby("Season")["runs"].mean().rename("lg_rg").reset_index()
     rrows = []
     for year in range(int(g.Season.min()) + 1, int(g.Season.max()) + 2):
-        in_win = ((gr.Season < year)
-                  | ((gr.Season == year) & (year == cur)))
+        in_win = gr.Season < year
         window = gr[in_win]
         if window.empty:
             continue
         agg = window.groupby("HpUmpId")[["g_n", "r_sum"]].sum(
             ).reset_index()
-        lgw = float(lgr[(lgr.Season < year)
-                        | ((lgr.Season == year) & (year == cur))][
-            "lg_rg"].mean())
+        lgw = float(lgr[lgr.Season < year]["lg_rg"].mean())
         w = agg["g_n"] / (agg["g_n"] + K_UMP_G)
         agg["uf_R"] = 1.0 + w * ((agg["r_sum"]
                                   / agg["g_n"].clip(lower=1))
@@ -1413,6 +1423,12 @@ def build_pattern_table(pa):
         [pbp["IsOut"] == 1, pbp["EndBase"] == "H", pbp["EndBase"] == "1B",
          pbp["EndBase"] == "2B", pbp["EndBase"] == "3B"],
         [0, 4, 1, 2, 3], default=DEST_HELD)
+    # a runner whose collapsed movement ends on his own start base did
+    # not advance — canonicalize to HELD so a self-destination row can
+    # never enter the bank as a distinct pattern for the same physics
+    self_dest = ((pbp["EndBase"] == pbp["StartBase"])
+                 & (pbp["IsOut"] != 1)).to_numpy()
+    dest = np.where(self_dest, DEST_HELD, dest)
     pbp = pbp.assign(dest=dest)
     slot = pbp["StartBase"].map({"": "b", "1B": "r1", "2B": "r2",
                                  "3B": "r3"})
@@ -2197,7 +2213,9 @@ def build_participation(pa):
     Risk rows: every slot PA while the starter still occupies the slot,
     plus the first substitute PA (the event). Later sub PAs are not at
     risk (the starter is already gone). The same-hand covariate is the
-    STARTER's side vs the pitcher on the mound at that PA."""
+    STARTER's PLATOON-RESOLVED side vs the pitcher on the mound at that
+    PA — a switch hitter always takes the advantaged side, so he is
+    never same-hand (the sim's serve-time rule: side S -> same=0)."""
     gb = read_csv("mlb_game_batting.csv",
                   usecols=["GamePk", "Season", "PlayerId", "Team",
                            "BattingOrder", "Position"])
@@ -2208,8 +2226,11 @@ def build_participation(pa):
     gb = gb[(gb["slot"] >= 1) & (gb["slot"] <= 9)]
     gb["is_start"] = (gb["bo"] % 100 == 0)
     gb["game_pk"] = _num(gb["GamePk"])
+    # one line per player-game: a duplicated (GamePk, PlayerId) row
+    # would silently duplicate his PAs through the risk set
     slot_map = gb[["game_pk", "PlayerId", "Team", "slot", "is_start",
-                   "Position"]]
+                   "Position"]].drop_duplicates(
+        ["game_pk", "PlayerId", "Team"])
 
     sub = pa[pa["Season"] >= 2022][
         ["game_pk", "at_bat_number", "BatterId", "bat_team", "stand",
@@ -2221,11 +2242,18 @@ def build_participation(pa):
     j["k"] = j.groupby(keys).cumcount() + 1
     j["sub_seq"] = (~j["is_start"]).groupby(
         [j[k] for k in keys]).cumsum()
-    # starter identity per slot: side and catcher flag from his rows
+    # starter identity per slot: id, side and catcher flag from his rows
     st = j[j["is_start"]].groupby(keys).agg(
+        st_id=("BatterId", "first"),
         st_stand=("stand", "first"),
         st_pos=("Position", "first")).reset_index()
     j = j.merge(st, on=keys, how="left")
+    # switch hitters (both sides >= 10% of their PAs): the first-PA side
+    # is stale the moment a new pitcher hand enters — they flip
+    switch_share = (sub.assign(_l=(sub["stand"].astype(str) == "L"))
+                    .groupby("BatterId")["_l"].mean())
+    switch_ids = set(
+        switch_share[(switch_share >= 0.1) & (switch_share <= 0.9)].index)
 
     risk = j[(j["is_start"]) | (~j["is_start"] & (j["sub_seq"] == 1))]
     risk = risk.dropna(subset=["st_stand"]).copy()
@@ -2238,8 +2266,12 @@ def build_participation(pa):
     inn = _num(risk["inning"]).fillna(1)
     risk["inn_b"] = np.select([inn <= 6, inn == 7, inn == 8],
                               [0, 1, 2], default=3)
-    risk["same"] = (risk["st_stand"].astype(str)
-                    == risk["p_throws"].astype(str)).astype(int)
+    # platoon-resolved: a switch-hitting starter bats opposite any
+    # pitcher's hand, so same=0 for him always — mirroring the sim's
+    # serve-time covariate ((side == throws) & (side != S))
+    risk["same"] = ((risk["st_stand"].astype(str)
+                     == risk["p_throws"].astype(str))
+                    & ~risk["st_id"].isin(switch_ids)).astype(int)
     risk["isc"] = (risk["st_pos"].astype(str) == "C").astype(int)
 
     cells = ["k", "inn_b", "margin_b", "lead", "same", "isc"]
@@ -2477,8 +2509,13 @@ def assemble_features(rows, stores):
         index=["Season", "p_throws"], columns="label", values="rate")
     lgs = stores["league_rates_stand"].pivot(
         index=["Season", "stand"], columns="label", values="rate")
-    prior_seas = rows["Season"].clip(lower=int(lg.index.min()),
-                                     upper=int(lg.index.max()))
+    # priors index the PRIOR season (clipped to available seasons): a
+    # training row must never be shrunk toward its own season's FULL-
+    # season league rate (months of in-season future data), and serve
+    # then reads the same completed-season prior — one regime, both
+    # paths, for every pri_b/pri_p/hand/stand consumer below
+    prior_seas = (rows["Season"] - 1).clip(lower=int(lg.index.min()),
+                                           upper=int(lg.index.max()))
     milb = stores["milb_priors"].sort_values(["PlayerId", "Year"])
     mrows = rows[["BatterId", "Season"]].copy()
     mrows["Season"] = mrows["Season"].astype("int64")
@@ -2766,7 +2803,11 @@ def assemble_features(rows, stores):
     dome = rows["Condition"].astype(str).str.contains(
         "Dome|Roof Closed", case=False, na=False)
     out["dome"] = dome.astype(float)
-    radial = rows["WindDir"].map(WIND_RADIAL)
+    # normalize WindDir casing ONCE: training rows carry the boxscore
+    # form ("Out To CF"), the live slate the title form ("Out To Cf") —
+    # title-casing here makes every wind map hit on both paths
+    wdir = rows["WindDir"].astype("string").str.title()
+    radial = _num(wdir.map(WIND_RADIAL))
     out["wind_out"] = np.where(dome, 0.0,
                                _num(rows["WindSpeed"]) * radial)
     out["night"] = (rows["DayNight"].astype(str).str.lower()
@@ -2929,8 +2970,8 @@ def assemble_features(rows, stores):
     pull_share = ((m["pl_pull"].fillna(0.0) + PULL_K * LG_PULL)
                   / (m["pl_air"].fillna(0.0) + PULL_K))
     out["b_pull"] = pull_share
-    wf = rows["WindDir"].map(_WIND_FIELD)
-    ws_ = rows["WindDir"].map(_WIND_SIGN)
+    wf = wdir.map(_WIND_FIELD)      # wdir = title-cased WindDir above
+    ws_ = _num(wdir.map(_WIND_SIGN))
     pull_field = np.where(rows["stand"].astype(str) == "R", "L", "R")
     wgt = np.where(wf == pull_field, 1.0,
                    np.where(wf == "C", CARRY_CF_W,
@@ -3198,9 +3239,11 @@ def assemble_features(rows, stores):
                   "mx_oaa_air"):
             out[c] = np.full(n, np.nan)
 
+    # raw decayed counts never reach X — the design is rates + log_pa
+    # only, for EVERY panel family (od_/pv_ included)
     drop = {f"{p}{cl}"
             for p in ("b_", "bh_", "bl_", "p_", "ph_", "pt_",
-                      "btr_", "ptr_")
+                      "btr_", "ptr_", "od_", "pv_")
             for cl in CLASSES + ["pa", "HBP", "IPO"]} | {"Date", "Season"}
     # fast-panel helper columns: only the b_tr_/p_tr_ DELTAS survive
     drop |= {f"{p}{c}_rate" for p in ("btr_", "ptr_")
@@ -3263,9 +3306,15 @@ def _team_game_maps():
         np_=("NP", "sum"))
     st = gp[gs == 1].groupby(["GamePk", "Team"])["outs"].sum()
     gb = read_csv("mlb_game_batting.csv",
-                  usecols=["GamePk", "Team", "AB", "H", "2B", "3B",
-                           "HR", "BB", "HBP", "TB", "R"])
+                  usecols=["GamePk", "PlayerId", "Team", "AB", "H",
+                           "2B", "3B", "HR", "BB", "HBP", "TB", "R"])
     gb["GamePk"] = pd.to_numeric(gb["GamePk"], errors="coerce")
+    # one line per player-game PER TEAM (matching the participation
+    # guard): a phantom other-club twin of a real line must not
+    # displace it from its own team's BaseRuns sums — the phantom's
+    # zeros are harmless in its club's sum, dropping the real line
+    # is not
+    gb = gb.drop_duplicates(["GamePk", "PlayerId", "Team"])
     for c in ("AB", "H", "2B", "3B", "HR", "BB", "HBP", "TB", "R"):
         gb[c] = pd.to_numeric(gb[c], errors="coerce").fillna(0)
     bat = gb.groupby(["GamePk", "Team"])[["AB", "H", "HR", "BB", "HBP",
@@ -3297,11 +3346,55 @@ def _ctx_inputs():
 def _context_rows(games, coords, pen_map, st_map, bat_map):
     """The pre-game state machine, one emitted row per game. Games with
     NaN scores contribute no post-game update — which is exactly how an
-    upcoming slate rides through: state from history, no result."""
+    upcoming slate rides through: state from history, no result.
+
+    Score updates apply at DATE boundaries, not per game: a serve-time
+    row can never know a same-day result (mlb_games only gets scores at
+    the nightly scrape), so no emitted row may see one — in particular
+    doubleheader game 2 sees game 1 only as same-day prev state
+    (rest/venue), never its score/Elo/pen line."""
     elo, season_seen, state = {}, {}, {}
     rows = []
+    pending = []    # completed games whose score updates wait for the
+    last_date = None    # date boundary
+
+    def _apply(g):
+        pk, date = int(g.GamePk), g.Date
+        hw = float(g.HomeScore > g.AwayScore)
+        e_home = 1.0 / (1.0 + 10 ** (-(elo[g.HomeTeam] + ELO_HFA
+                                       - elo[g.AwayTeam]) / 400))
+        elo[g.HomeTeam] += ELO_K * (hw - e_home)
+        elo[g.AwayTeam] -= ELO_K * (hw - e_home)
+        for team, mine, theirs, won in (
+                (g.HomeTeam, g.HomeScore, g.AwayScore, hw),
+                (g.AwayTeam, g.AwayScore, g.HomeScore, 1 - hw)):
+            st = state[team]
+            st["recent"].append((won, mine, theirs))
+            st["rf"] += mine
+            st["ra"] += theirs
+            st["w"] += won
+            st["n"] += 1
+            pg_ = pen_map.get((pk, team))
+            if pg_:
+                st["pen"].append((pg_["er"], pg_["outs"]))
+                st["np3"].append((date, pg_["np_"]))
+            so_ = st_map.get((pk, team))
+            if so_ is not None:
+                st["st_outs"].append(so_)
+            bg_ = bat_map.get((pk, team))
+            if bg_:
+                st["bsr"].append(bg_["R"] - _baseruns(
+                    bg_["H"], bg_["BB"], bg_["HBP"], bg_["TB"],
+                    bg_["HR"], bg_["AB"]))
+
     for g in games.itertuples(index=False):
         date, pk = g.Date, int(g.GamePk)
+        # ---- date boundary: earlier dates' results become visible
+        if last_date is not None and date != last_date:
+            for gd in pending:
+                _apply(gd)
+            pending.clear()
+        last_date = date
         side_vals = {}
         for side, team in (("away", g.AwayTeam), ("home", g.HomeTeam)):
             if season_seen.get(team) != g.Season:
@@ -3365,39 +3458,20 @@ def _context_rows(games, coords, pen_map, st_map, bat_map):
                            - side_vals["away"]["elo"] + ELO_HFA)
         rows.append(row)
 
-        # ---- post-game updates (never visible to this game's row)
+        # ---- post-game updates: deferred to the next date boundary so
+        # no same-date row (DH game 2) ever sees this game's result
         if g.HomeScore == g.HomeScore and g.AwayScore == g.AwayScore:
-            hw = float(g.HomeScore > g.AwayScore)
-            e_home = 1.0 / (1.0 + 10 ** (-(elo[g.HomeTeam] + ELO_HFA
-                                           - elo[g.AwayTeam]) / 400))
-            elo[g.HomeTeam] += ELO_K * (hw - e_home)
-            elo[g.AwayTeam] -= ELO_K * (hw - e_home)
-            for team, mine, theirs, won in (
-                    (g.HomeTeam, g.HomeScore, g.AwayScore, hw),
-                    (g.AwayTeam, g.AwayScore, g.HomeScore, 1 - hw)):
-                st = state[team]
-                st["recent"].append((won, mine, theirs))
-                st["rf"] += mine
-                st["ra"] += theirs
-                st["w"] += won
-                st["n"] += 1
-                pg_ = pen_map.get((pk, team))
-                if pg_:
-                    st["pen"].append((pg_["er"], pg_["outs"]))
-                    st["np3"].append((date, pg_["np_"]))
-                so_ = st_map.get((pk, team))
-                if so_ is not None:
-                    st["st_outs"].append(so_)
-                bg_ = bat_map.get((pk, team))
-                if bg_:
-                    st["bsr"].append(bg_["R"] - _baseruns(
-                        bg_["H"], bg_["BB"], bg_["HBP"], bg_["TB"],
-                        bg_["HR"], bg_["AB"]))
+            pending.append(g)
+        # prev_date/venue/dn update immediately — same-day sequencing
+        # is real pre-game knowledge and the serve pseudo-rows
+        # reproduce it (DH game 2 knows game 1 happened, not its score)
         for team in (g.AwayTeam, g.HomeTeam):
             st = state[team]
             st["prev_date"] = date
             st["prev_venue"] = g.Venue
             st["prev_dn"] = str(g.DayNight)
+    for gd in pending:    # final date's updates keep the returned elo
+        _apply(gd)        # dict (and its printed spread) post-game
     return rows, elo
 
 
@@ -3417,12 +3491,26 @@ _SLATE_PK = 2_000_000_000    # pseudo GamePks sort after any real pk
 
 def slate_context(specs):
     """Pre-game context for an upcoming slate (spec dicts as loaded
-    from todays_games.json). Runs the identical state machine over all
-    completed games plus one scoreless pseudo-row per slate game, and
-    returns row dicts (away_*/home_*/elo_diff keys) aligned to specs
-    order. Doubleheader game 2 sees game 1 only as same-day prev state
-    (no result exists yet — the correct pre-game truth)."""
+    from todays_games.json). Runs the identical state machine over
+    completed games STRICTLY BEFORE the slate date plus one scoreless
+    pseudo-row per slate game, and returns row dicts
+    (away_*/home_*/elo_diff keys) aligned to specs order. Doubleheader
+    game 2 sees game 1 only as same-day prev state (no result exists
+    yet — the correct pre-game truth).
+
+    The strictly-before cut is what makes REPLAYS honest: at live serve
+    mlb_games has no rows for today (scores land at the nightly
+    scrape), but a historical replay finds the slate's own games
+    already scored on the same date — without the cut the state machine
+    would credit a replayed game's own result (Elo/form/pen) and set
+    prev_date/venue to the game itself (rest/travel collapse to 0)
+    before the pseudo-row is emitted. Cutting reproduces the live
+    morning state exactly, for serve and replay alike."""
     games = _load_games()
+    if not specs:
+        return []
+    d0 = min(pd.Timestamp(sp["date"]) for sp in specs)
+    games = games[games["Date"] < d0]
     pseudo = []
     for i, sp in enumerate(specs):
         d = pd.Timestamp(sp["date"])

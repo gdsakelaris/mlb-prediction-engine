@@ -936,12 +936,25 @@ class App(tk.Tk):
         if old.get("names"):     # keep scraped display names for re-loading
             spec["names"] = old["names"]
         # scraped fields with no form widget — carry them through the edit
-        # (DH flags, game identity, lineup provenance, next scheduled off-days)
-        for k in ("is_dh", "dh_game2", "game_pk",
-                  "away_lineup_src", "home_lineup_src",
-                  "away_next_offday", "home_next_offday"):
-            if old.get(k) is not None:
-                spec[k] = old[k]
+        # (DH flags, game identity, lineup provenance, next scheduled
+        # off-days) — but ONLY while it is still the same game. A
+        # repurposed row (matchup or date changed) must NOT keep the old
+        # game's MLB gamePk: it would ride into the Bets rows and the
+        # staking ledger and settle against the WRONG game's final
+        # (staking.settle joins h2h by GamePk alone — a definite wrong
+        # win/loss, not just an open row). The DH flags, lineup
+        # provenance and off-days belong to the old game too, so they
+        # clear together and the new spec is served identity-less (safe:
+        # blank pk is the never-guess convention everywhere downstream).
+        same_game = (spec.get("date") == old.get("date")
+                     and spec.get("away_team") == old.get("away_team")
+                     and spec.get("home_team") == old.get("home_team"))
+        if same_game:
+            for k in ("is_dh", "dh_game2", "game_pk",
+                      "away_lineup_src", "home_lineup_src",
+                      "away_next_offday", "home_next_offday"):
+                if old.get(k) is not None:
+                    spec[k] = old[k]
         self.slate[idx] = spec
         self.lb_slate.delete(idx)
         self.lb_slate.insert(idx, self._slate_row_text(spec))

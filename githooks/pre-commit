@@ -6,21 +6,86 @@
 # (sim.py / sim_batch.py / predict.py) the slow lane (golden + artifact
 # parity) runs too: engine drift can only be caught there. Escape hatch
 # for emergencies: git commit --no-verify.
+#
+# The suite must test what is being COMMITTED, not whatever happens to
+# sit in the working tree (partial staging let untested combinations
+# land green — 2026-07-25 audit). Unstaged edits are saved to a patch
+# and the worktree is reset to the index around the run, then the patch
+# is re-applied byte-exact (a stash pop MERGES and silently loses
+# unstaged hunks that revert staged ones — patch apply cannot).
+# Untracked files are moved aside the same way so a new unstaged module
+# can't satisfy an import the commit would break. Everything restores
+# even on a red suite or Ctrl-C; if a restore ever fails the files are
+# kept and their location printed — never deleted.
 cd "$(git rev-parse --show-toplevel)" || exit 1
 
 PY="$LOCALAPPDATA/Programs/Python/Python313/python.exe"
 [ -x "$PY" ] || PY=python
 
-"$PY" -m pytest Tests -q || {
-    echo "pre-commit: fast suite RED - fix it (or git commit --no-verify)"
-    exit 1
+REPO=$(pwd)
+GITDIR=$(git rev-parse --git-dir)
+PATCH=
+UNTRACKED_TMP=
+
+restore() {
+    if [ -n "$PATCH" ]; then
+        P=$PATCH; PATCH=
+        if git apply --whitespace=nowarn "$P"; then
+            rm -f "$P"
+        else
+            echo "pre-commit: COULD NOT re-apply your unstaged changes automatically."
+            echo "pre-commit: they are SAFE in '$P' - run: git apply \"$P\""
+        fi
+    fi
+    if [ -n "$UNTRACKED_TMP" ]; then
+        D=$UNTRACKED_TMP; UNTRACKED_TMP=
+        (cd "$D" && find . -type f -print) | sed 's|^\./||' | while IFS= read -r f; do
+            if [ -e "$REPO/$f" ]; then
+                echo "pre-commit: NOT restoring untracked '$f' (name now taken) - original kept in '$D/$f'"
+            else
+                mkdir -p "$REPO/$(dirname "$f")"
+                mv "$D/$f" "$REPO/$f"
+            fi
+        done
+        find "$D" -type d -empty -delete 2>/dev/null
+        [ -d "$D" ] && echo "pre-commit: leftover files in '$D' - inspect and remove by hand"
+    fi
 }
 
-if git diff --cached --name-only | grep -qE '^Model/(sim|sim_batch|predict)\.py$'; then
+# tracked unstaged edits -> patch, worktree -> index state
+if ! git diff --quiet; then
+    PATCH="$GITDIR/pre-commit-unstaged.$$.patch"
+    if git diff --binary --no-color > "$PATCH" && git checkout -- .; then
+        trap restore EXIT INT TERM
+        echo "pre-commit: unstaged changes set aside - testing the staged index"
+    else
+        rm -f "$PATCH"; PATCH=
+        echo "pre-commit: WARNING - could not set aside unstaged changes: testing the WORKING TREE, which differs from what is being committed"
+    fi
+fi
+# untracked files -> moved aside (plain renames, restored after)
+UT=$(git ls-files --others --exclude-standard)
+if [ -n "$UT" ]; then
+    UNTRACKED_TMP="$GITDIR/pre-commit-untracked.$$"
+    trap restore EXIT INT TERM
+    printf '%s\n' "$UT" | while IFS= read -r f; do
+        mkdir -p "$UNTRACKED_TMP/$(dirname "$f")"
+        mv "$f" "$UNTRACKED_TMP/$f"
+    done
+fi
+
+RC=0
+"$PY" -m pytest Tests -q || {
+    echo "pre-commit: fast suite RED - fix it (or git commit --no-verify)"
+    RC=1
+}
+
+if [ "$RC" -eq 0 ] && git diff --cached --name-only | grep -qE '^Model/(sim|sim_batch|predict)\.py$'; then
     echo "pre-commit: engine file staged - running slow lane"
     "$PY" -m pytest Tests -q -m slow || {
         echo "pre-commit: SLOW lane RED - the engine change breaks golden/parity"
-        exit 1
+        RC=1
     }
 fi
-exit 0
+
+exit $RC

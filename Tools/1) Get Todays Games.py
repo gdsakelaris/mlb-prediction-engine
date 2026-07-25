@@ -793,8 +793,26 @@ def main():
                 g.setdefault("away_next_offday", None)
                 g.setdefault("home_next_offday", None)
 
-    games.sort(key=lambda g: (g.get("start_et") or "99:99",
-                              g["away_team"]))
+    # sort by first pitch — but a started game's time may have been
+    # dropped by EVERY source (mlb.com and rotowire both blank a live
+    # game's box), and coercing it to "99:99" would flip a doubleheader's
+    # order (game 1 sorting AFTER game 2 swaps dh_game2 AND the schedule
+    # gamePk stamp below). A game missing its time therefore borrows the
+    # matchup's earliest known time, and ties break on the scraped page
+    # order — every source lists a DH's games in true first-pitch order
+    # (game 1 first), so the pair can never flip on a dropped time.
+    grp_time = {}
+    for g in games:
+        key = (g["away_team"], g["home_team"])
+        t = g.get("start_et")
+        if t and t < grp_time.get(key, "99:99"):
+            grp_time[key] = t
+    page_order = {id(g): i for i, g in enumerate(games)}
+    games.sort(key=lambda g: (g.get("start_et")
+                              or grp_time.get((g["away_team"],
+                                               g["home_team"]), "99:99"),
+                              g["away_team"], g["home_team"],
+                              page_order[id(g)]))
     # doubleheader flags: same matchup twice today; game 2 = the later
     # first pitch (games are start-time sorted right above). The GUI
     # passes these through to the spec.

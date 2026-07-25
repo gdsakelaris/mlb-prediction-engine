@@ -6,6 +6,12 @@ REM                             served top-K tracker (automated 2026-07-23;
 REM                             skipped if the update failed so grading only
 REM                             ever sees validated finals)
 REM   3. Sundays only           CLV gate refresh over the captured-odds window
+REM                             (also skipped on a failed update, 2026-07-25:
+REM                             the gate must never grade restored/incomplete
+REM                             finals - its verdicts drive staking)
+REM Every stage outcome lands in Logs\cmd_status.json (atomic write) so
+REM Tools\check_health.ps1 can see cmd-level failures (red suite, skipped
+REM retrain, grading/gate) that update_all's own status JSON cannot.
 REM Serving stays MANUAL by design (user preference 2026-07-19): GUI or
 REM "Model/predict.py --serve". Slate fetch + odds capture (Tools/1, Tools/2)
 REM also run by hand, but a noon safety-net task (Tools\run_noon_slate.cmd,
@@ -82,18 +88,40 @@ REM admin-owned dirs in the user's shared pytest temp root that a later
 REM interactive pytest cannot clean (crashes its teardown, exit 1 -
 REM which blocked a commit via the pre-commit hook on 2026-07-24). A
 REM task-private temp root keeps the two contexts apart for good.
-set "TESTS_RED="
+set "TESTS_RED=0"
 "%PY%" -m pytest "%ROOT%\Tests" -q --basetemp "%ROOT%\Logs\pytest_tmp" >> "%LOG%" 2>&1
 if errorlevel 1 set "TESTS_RED=1"
-if defined TESTS_RED echo pytest RED - degrading to data-only update (no retrain) >> "%LOG%"
-if defined TESTS_RED set "FAIL=1"
+if "%TESTS_RED%"=="1" echo pytest RED - degrading to data-only update (no retrain) >> "%LOG%"
+if "%TESTS_RED%"=="1" set "FAIL=1"
 
-if defined TESTS_RED (
+set "DATA_OK=1"
+if "%TESTS_RED%"=="1" (
     "%PY%" "%ROOT%\Scrapers\update_all.py" >> "%LOG%" 2>&1
 ) else (
     "%PY%" "%ROOT%\Scrapers\update_all.py" --retrain >> "%LOG%" 2>&1
 )
-if errorlevel 1 set "FAIL=1"
+if errorlevel 1 (set "DATA_OK=0" & set "FAIL=1")
+
+REM Stage outcomes for the watchdog: update_all's status JSON cannot see
+REM cmd-level state (red suite -> silently skipped retrain, grading/gate
+REM failures), so every stage below records into cmd_status.json at
+REM :status and Tools\check_health.ps1 reads it - a degraded morning can
+REM no longer present as healthy.
+set "GRADE=skipped"
+set "GATE=skipped"
+set "SLOW=skipped"
+if /I not "%DOW%"=="Sunday" set "GATE=not-sunday"
+if /I not "%DOW%"=="Sunday" set "SLOW=not-sunday"
+
+REM Validated-finals guard: a failed update means Data\ holds the
+REM restored backup missing the newest finals, so grading AND the Sunday
+REM CLV-gate refresh AND the slow lane all skip (the old jump target let
+REM the gate grade a truncated window whose PASS/NO-EDGE verdicts
+REM staking trusts - fixed 2026-07-25).
+if "%DATA_OK%"=="0" (
+    echo Data update FAILED - skipping grading, gate refresh and slow lane >> "%LOG%"
+    goto :status
+)
 
 REM Grade the newest served workbook against last night's finals, then
 REM refresh the served top-K precision tracker (feeds the late-Aug W4.21
@@ -101,25 +129,36 @@ REM decision). Both are display/ledger-only - no model input. Grading is
 REM idempotent, so a failure here (e.g. the workbook left open in Excel
 REM locks the file) is retried harmlessly tomorrow. Tools/6 reads the
 REM workbook + CSVs directly, so it runs even if Tools/4 failed.
-if defined FAIL goto :gate
+set "GRADE=ok"
 "%PY%" "%ROOT%\Tools\4) Grade Results.py" >> "%LOG%" 2>&1
-if errorlevel 1 set "FAIL=1"
+if errorlevel 1 (set "FAIL=1" & set "GRADE=failed")
 "%PY%" "%ROOT%\Tools\6) Goal Tracker.py" >> "%LOG%" 2>&1
-if errorlevel 1 set "FAIL=1"
+if errorlevel 1 (set "FAIL=1" & set "GRADE=failed")
 
-:gate
-if /I not "%DOW%"=="Sunday" goto :finish
+if /I not "%DOW%"=="Sunday" goto :status
 for /f %%y in ('powershell -NoProfile -Command "Get-Date (Get-Date).AddDays(-1) -Format yyyy-MM-dd"') do set "YDAY=%%y"
 REM --start auto = day after the served calibrators' fit window ends, so
 REM the Sunday verdict is never graded in-sample and the window resets
 REM itself at every calibration refresh (bounded runtime).
+set "GATE=ok"
 "%PY%" "%ROOT%\Model\evaluate.py" --gate --start auto --end %YDAY% --sims 4000 >> "%LOG%" 2>&1
-if errorlevel 1 set "FAIL=1"
+if errorlevel 1 (set "FAIL=1" & set "GATE=failed")
 REM weekly slow lane: golden replay + artifact-dependent tests run where
 REM they can never be skipped by a fast local loop (same private temp
 REM root - see the --basetemp note above)
+set "SLOW=ok"
 "%PY%" -m pytest "%ROOT%\Tests" -q -m slow --basetemp "%ROOT%\Logs\pytest_tmp" >> "%LOG%" 2>&1
-if errorlevel 1 set "FAIL=1"
+if errorlevel 1 (set "FAIL=1" & set "SLOW=failed")
+
+:status
+REM machine-readable cmd-stage status for Tools\check_health.ps1; atomic
+REM write (tmp + os.replace) so a crash can never leave a truncated file
+set "FAILFLAG=0"
+if defined FAIL set "FAILFLAG=1"
+set "RETRAIN=1"
+if "%TESTS_RED%"=="1" set "RETRAIN=0"
+"%PY%" -c "import json,os,sys,datetime as dt; p=sys.argv[1]; t=p+'.tmp'; s={'date':sys.argv[2],'finished':dt.datetime.now().isoformat(timespec='seconds'),'tests_red':sys.argv[3]=='1','retrain_attempted':sys.argv[4]=='1','data_update_ok':sys.argv[5]=='1','grading':sys.argv[6],'gate':sys.argv[7],'slow_lane':sys.argv[8],'ok':sys.argv[9]=='0'}; f=open(t,'w'); json.dump(s,f,indent=1); f.close(); os.replace(t,p)" "%ROOT%\Logs\cmd_status.json" "%TODAY%" "%TESTS_RED%" "%RETRAIN%" "%DATA_OK%" "%GRADE%" "%GATE%" "%SLOW%" "%FAILFLAG%" >> "%LOG%" 2>&1
+if errorlevel 1 echo cmd_status.json write FAILED - watchdog will flag stage-missing >> "%LOG%"
 
 :finish
 echo Morning run finished %date% %time% (fail=%FAIL%) >> "%LOG%"

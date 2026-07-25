@@ -1,0 +1,7 @@
+# Line-ending pins so checkouts and the pre-commit save/restore cycle
+# can never rewrite endings out from under the interpreters:
+# cmd.exe requires CRLF; sh hooks must stay LF; PowerShell tolerates
+# both but is authored LF here.
+*.cmd text eol=crlf
+*.ps1 text eol=lf
+githooks/pre-commit text eol=lf

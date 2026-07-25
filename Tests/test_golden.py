@@ -40,14 +40,20 @@ def ctx():
     assert spec is not None, "no complete 2025 game found"
     # mirror predict_slate: slate context (Elo/travel/park/ump) goes
     # into the spec before prepare_game; prepare_games resolves the
-    # same context from stores, so parity needs it injected here too
+    # same context from stores, so parity needs it injected here too.
+    # ONLY missing-environment errors may skip (a store parquet or data
+    # CSV absent on this machine); any other exception is a genuine
+    # serve-path crash-regression and must FAIL the slow lane — the
+    # old broad `except Exception -> skip` let a broken slate_context
+    # turn the whole golden module into green skips (exit 0) at the
+    # pre-commit and Sunday gates.
     import features as F
     try:
         cx = F.slate_context([spec])[0]
         cx["park_hr"], cx["ump_r"] = P._game_effects(spec)
         spec["_ctx"] = cx
-    except Exception as e:                    # noqa: BLE001
-        pytest.skip(f"slate context unavailable: {e}")
+    except FileNotFoundError as e:
+        pytest.skip(f"slate-context store/data missing here: {e}")
     return P, spec
 
 

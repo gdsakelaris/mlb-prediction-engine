@@ -5,9 +5,16 @@ REM                                     + Data/slates archive
 REM   2. Tools/2) Scrape Odds.py        odds capture (pins the opening
 REM                                     price; a later manual rerun near
 REM                                     first pitch tightens the close)
-REM Guarantees every game day has at least one archived slate and one
-REM early-ish odds capture even if the manual game-day workflow is missed.
-REM Manual serving is unchanged; grading + the served tracker were folded
+REM   3. Model/predict.py --serve       headless noon serve (added
+REM                                     2026-07-25): a projected-lineup
+REM                                     floor so a day away from the GUI
+REM                                     still produces served evidence;
+REM                                     an evening confirmed-lineup GUI
+REM                                     serve supersedes its ledger rows.
+REM                                     Set NOON_SERVE=0 to disable.
+REM Guarantees every game day has at least one archived slate, one
+REM early-ish odds capture, and one served workbook even if the manual
+REM game-day workflow is missed. Grading + the served tracker were folded
 REM into the 6 AM job 2026-07-23 (Scrapers\run_daily_update.cmd).
 REM Logs to Logs\noon_YYYY-MM-DD.log; exit 1 if any step failed.
 
@@ -72,6 +79,24 @@ if errorlevel 1 set "FAIL=1"
 
 "%PY%" "%ROOT%\Tools\2) Scrape Odds.py" >> "%LOG%" 2>&1
 if errorlevel 1 set "FAIL=1"
+
+REM ---- headless serve: only off a FRESH slate + odds capture (a failed
+REM step above means todays_games.json or the odds store may be stale -
+REM never serve that), and only when not opted out via NOON_SERVE=0
+if defined FAIL (
+    echo Noon serve skipped: slate/odds capture failed >> "%LOG%"
+    goto :served
+)
+if /i "%NOON_SERVE%"=="0" (
+    echo Noon serve skipped: NOON_SERVE=0 >> "%LOG%"
+    goto :served
+)
+"%PY%" "%ROOT%\Model\predict.py" --serve >> "%LOG%" 2>&1
+if errorlevel 1 (
+    set "FAIL=1"
+    echo Noon serve FAILED %date% %time% >> "%LOG%"
+)
+:served
 
 echo Noon slate run finished %date% %time% (fail=%FAIL%) >> "%LOG%"
 if defined LOCKOWNED if exist "%LOCKDIR%\t%LOCKTOKEN%" rmdir /s /q "%LOCKDIR%" 2>nul

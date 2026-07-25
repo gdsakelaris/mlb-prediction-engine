@@ -3,11 +3,15 @@
 THE evaluation regime (replaces freeze/forward-test, user decision
 2026-07-20): for each eval season Y the model is built exactly the way
 production builds the serving model — trained on seasons <= Y-2 with
-early stopping + vector scaling on season Y-1 — and scored on season Y,
-which it has never seen in any form. Rolling the origin across seasons
-gives several honest out-of-sample folds instead of one design year;
-the aggregate is the model-quality number, the per-fold spread is its
-stability.
+early stopping + vector scaling on season Y-1 — and scored on season Y.
+Honesty caveat: the T1/T3 hyperparameters (artifacts/xgb_params.json,
+Optuna trained <=2023 / selected on 2024) and the bag/decay config were
+chosen against the design cal year, so a fold whose eval season is <=
+that year scores a season the hyperparameter selection already saw.
+Those folds are still computed and printed, marked "design-seen", but
+only folds with Y > the design year enter the headline PA-weighted
+aggregate — that aggregate is the model-quality number, the per-fold
+spread is its stability.
 
 This is PA-level (composite 8-class log loss vs the league and
 batter-marginal baselines — the exact metric train.py optimizes).
@@ -42,6 +46,18 @@ STORES = ART / "stores"
 CLASSES = T.CLASSES
 
 
+def _design_year():
+    """Newest season the hyperparameter design has seen: the Optuna
+    sweep selected on xgb_params.json's cal_year, and the bag/decay
+    config was design-eval gated on the same year. Folds evaluating a
+    season <= this are 'design-seen' and stay out of the headline."""
+    try:
+        return int(json.loads((ART / "xgb_params.json").read_text())
+                   .get("cal_year", T.DESIGN_CAL_YEAR))
+    except Exception:
+        return T.DESIGN_CAL_YEAR
+
+
 def _compose_eval(a1, a2, Xe):
     p1 = a1["t1"]["scaler"].transform(a1["t1"]["model"].predict_proba(Xe))
     p2 = a2["scaler"].transform(a2["model"].predict_proba(Xe))
@@ -63,6 +79,7 @@ def run(years):
     print(f"features assembled: {len(cols)} "
           f"({time.time() - t0:.0f}s)", flush=True)
     y8 = pa["label"].map({c: i for i, c in enumerate(CLASSES)}).values
+    dy = _design_year()
 
     folds = []
     for Y in years:
@@ -73,8 +90,10 @@ def run(years):
             print(f"fold {Y}: skipped (train rows {need.sum():,}, "
                   f"eval rows {ev.sum():,})", flush=True)
             continue
+        seen = Y <= dy
         T._banner(f"WALK-FORWARD FOLD — train <= {cal - 1}, "
-                  f"calibrate {cal}, evaluate {Y}")
+                  f"calibrate {cal}, evaluate {Y}"
+                  f"{'  [design-seen]' if seen else ''}")
         sub = (pa.Season <= cal).values
         pa_f = pa[sub].reset_index(drop=True)
         X_f = X[sub].reset_index(drop=True)
@@ -93,6 +112,7 @@ def run(years):
         folds.append(dict(eval_year=Y, n_train=int((pa.Season < cal).sum()),
                           n_cal=int((pa.Season == cal).sum()),
                           n_eval=int(ev.sum()),
+                          design_seen=bool(seen),
                           logloss=round(float(ll), 5),
                           league=round(float(ll_league), 5),
                           batter_marginal=round(float(ll_marg), 5),
@@ -104,23 +124,48 @@ def run(years):
     df = pd.DataFrame(folds)
     T._banner("WALK-FORWARD SUMMARY (rolling origin)")
     print(df.to_string(index=False), flush=True)
-    w = df.n_eval.to_numpy(dtype=float)
-    agg = {k: float(np.average(df[k], weights=w))
-           for k in ("logloss", "gain_vs_league", "gain_vs_marginal")}
-    print(f"\nPA-weighted across folds: logloss {agg['logloss']:.5f}  "
-          f"gain vs league {agg['gain_vs_league']:+.5f}  "
-          f"vs batter-marginal {agg['gain_vs_marginal']:+.5f}",
-          flush=True)
-    print(f"fold spread (gain vs league): "
-          f"{df.gain_vs_league.min():+.5f} .. "
-          f"{df.gain_vs_league.max():+.5f}", flush=True)
+
+    def _agg(sub):
+        w = sub.n_eval.to_numpy(dtype=float)
+        return {k: float(np.average(sub[k], weights=w))
+                for k in ("logloss", "gain_vs_league",
+                          "gain_vs_marginal")}
+
+    # headline = honest folds only; design-seen folds (eval season <=
+    # the xgb_params.json design year) informed hyperparameter/config
+    # selection, so averaging them in would flatter the baseline every
+    # ship/rollback decision is judged against
+    hon = df[~df.design_seen]
+    agg = _agg(hon) if len(hon) else None
+    if agg is not None:
+        print(f"\nPA-weighted across honest folds (eval > {dy}): "
+              f"logloss {agg['logloss']:.5f}  "
+              f"gain vs league {agg['gain_vs_league']:+.5f}  "
+              f"vs batter-marginal {agg['gain_vs_marginal']:+.5f}",
+              flush=True)
+        print(f"fold spread (gain vs league, honest folds): "
+              f"{hon.gain_vs_league.min():+.5f} .. "
+              f"{hon.gain_vs_league.max():+.5f}", flush=True)
+    else:
+        print(f"\nall folds are design-seen (eval <= design year {dy}); "
+              f"headline aggregate withheld", flush=True)
+    ds = df[df.design_seen]
+    agg_seen = _agg(ds) if len(ds) else None
+    if agg_seen is not None:
+        print(f"design-seen folds (eval <= {dy}, hyperparams selected "
+              f"on these seasons — NOT the headline): "
+              f"logloss {agg_seen['logloss']:.5f}  "
+              f"gain vs league {agg_seen['gain_vs_league']:+.5f}",
+              flush=True)
 
     report = dict(generated=time.strftime("%Y-%m-%d %H:%M:%S"),
                   scheme="train<=Y-2, calibrate Y-1, evaluate Y",
-                  folds=folds, aggregate=agg,
+                  design_year=dy, folds=folds, aggregate=agg,
+                  aggregate_design_seen=agg_seen,
                   minutes=round((time.time() - t0) / 60, 1))
     out = ART / "walkforward_report.json"
-    out.write_text(json.dumps(report, indent=1))
+    F.write_artifact(out,
+                     lambda p: p.write_text(json.dumps(report, indent=1)))
     print(f"\nreport -> {out}", flush=True)
 
 

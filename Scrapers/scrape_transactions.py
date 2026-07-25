@@ -72,18 +72,23 @@ def classify(desc):
     return None, None
 
 
-def fetch_year(year, tries=4):
-    """All MLB IL-related events for one calendar year (monthly windows —
-    the endpoint caps long ranges)."""
+def fetch_year(year, end=None, tries=4):
+    """All MLB IL-related events from Jan 1 of `year` through `end`
+    (default Dec 31 of `year`; monthly windows — the endpoint caps long
+    ranges), clipped to today. The current season passes end=today, which
+    in January/February reaches into the NEXT calendar year: offseason IL
+    moves before the March 1 season rollover (e.g. the activation of a
+    60-day stint opened in September) belong to the stored season and
+    were previously unfetchable until March — stints stayed open and
+    early-spring il_ret/availability features ran on incomplete data."""
+    end = min(end if end is not None else date(year, 12, 31), date.today())
     rows = []
-    for month in range(1, 13):
-        d0 = date(year, month, 1)
-        d1 = (date(year, month + 1, 1) if month < 12
-              else date(year + 1, 1, 1))
-        if d0 > date.today():
-            break
+    d0 = date(year, 1, 1)
+    while d0 <= end:
+        d1 = (date(d0.year, d0.month + 1, 1) if d0.month < 12
+              else date(d0.year + 1, 1, 1))
         params = {"startDate": str(d0),
-                  "endDate": str(min(d1, date.today())), "sportId": 1}
+                  "endDate": str(min(d1, end)), "sportId": 1}
         for attempt in range(tries):
             try:
                 r = requests.get(API_URL, params=params, headers=HEADERS,
@@ -108,6 +113,7 @@ def fetch_year(year, tries=4):
             rows.append({"PlayerId": pid, "Date": t.get("date"),
                          "Kind": kind, "ILDays": days})
         time.sleep(0.5)
+        d0 = d1
     df = pd.DataFrame(rows, columns=EVENT_COLS)
     return df.drop_duplicates(EVENT_COLS)
 
@@ -169,7 +175,10 @@ def main():
             frames.append(rows[EVENT_COLS])
             print(f"{year}: {len(rows):,} IL events (stored)", flush=True)
             continue
-        df = fetch_year(year)
+        # the current season's window runs through TODAY, which in Jan/Feb
+        # extends into the next calendar year (see fetch_year)
+        df = fetch_year(year, end=date.today()
+                        if year == CURRENT_SEASON else None)
         frames.append(df)
         print(f"{year}: {len(df):,} IL events", flush=True)
 

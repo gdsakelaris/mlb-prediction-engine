@@ -33,8 +33,11 @@ Savant from 1.
 The game universe is mlb_games.csv (the authoritative list of played
 games). Games already in the output CSV are cached — only new GamePks hit
 the network, concurrently like scrape_gamelogs.py, and completed rows are
-APPENDED batch-by-batch (never a full-file rewrite), so an interrupted
-backfill resumes where it stopped. --backfill starts the file over.
+APPENDED batch-by-batch through an atomic copy-append-replace
+(seasons.atomic_append: a kill can only lose the whole in-flight batch,
+never leave a torn or half-written game the resume cache would skip), so
+an interrupted backfill resumes where it stopped. --backfill starts the
+file over.
 
 Usage:
     python scrape_pbp.py [-o output.csv] [--backfill] [--limit N]
@@ -52,6 +55,8 @@ from pathlib import Path
 
 import pandas as pd
 import requests
+
+from seasons import atomic_append, trim_torn_tail
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "Data"
 DEFAULT_OUT = DATA_DIR / "mlb_pbp.csv"
@@ -147,16 +152,20 @@ def parse_game(pk, season, date, pbp):
 
 
 def append_rows(out_path, rows, write_header):
-    """Serialize a batch once and append it in a single write, so a killed
-    run can only lose the in-flight batch, not corrupt finished ones."""
+    """Serialize a batch once and append it CRASH-SAFELY: the batch goes
+    onto a copy of the file which then atomically replaces the original
+    (seasons.atomic_append), so a killed run can only lose the whole
+    in-flight batch — the published file always ends on a complete batch
+    boundary. A plain append could be cut mid-write, leaving a torn
+    final line plus a partially-written game that the GamePk resume
+    cache then treated as done forever."""
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=COLS)
     if write_header:
         w.writeheader()
     w.writerows(rows)
-    with open(out_path, "a", newline="", encoding="utf-8-sig" if write_header
-              else "utf-8") as f:
-        f.write(buf.getvalue())
+    atomic_append(out_path, buf.getvalue(),
+                  encoding="utf-8-sig" if write_header else "utf-8")
 
 
 def main():
@@ -178,6 +187,10 @@ def main():
     out_path = Path(args.output)
     if args.backfill and out_path.exists():
         out_path.unlink()
+    # heal a torn tail left by a mid-append kill under the old plain-
+    # append code: drops the partial final game block so it is refetched
+    # complete instead of being cached as done (no-op on a clean file)
+    trim_torn_tail(out_path)
     have = set()
     if out_path.exists():
         have = set(pd.to_numeric(

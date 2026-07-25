@@ -127,6 +127,33 @@ Rows are written at bet time; `CloseAmerican/CLV/Outcome/PnL` fill at
 grading. The ledger is append-only — corrections are new rows with a
 `void` marker, never edits.
 
+> **2026-07-25 implementation notes** (`Model/staking.py`, post-audit
+> fixes — clarifying, not changing, the pre-registered design):
+>
+> - The ledger lives at `Ledger/staking_ledger.csv` (kept off the
+>   artifacts path so a relocation can never move the permanent record).
+> - §3's bet identity — one bet per (player, market, line) per game —
+>   is **side-agnostic**, and excludes Team for `h2h` (Team encodes the
+>   side there). A re-serve therefore supersedes the old generation even
+>   when the higher-EV side flipped, and both moneyline sides of one
+>   game can never coexist.
+> - Supersede mechanics: the replacement row appends, a `void` marker
+>   row preserves the audit trail, and the superseded original is
+>   stamped `Outcome='superseded'` — the one in-place field write,
+>   required so settlement can never grade both generations. Money
+>   fields (price, stake, PnL) are never rewritten.
+> - §5 mark-to-market: stake fractions and the per-bet cap apply to
+>   START + cumulative settled PnL read from the ledger at serve time.
+> - Did-not-play: a player row whose game went final with no stat line
+>   (or 0 PA) settles `Status='void'`, `Outcome='void'`, PnL 0 on the
+>   first settle run **after** its date — the book's DNP rule; same-date
+>   rows stay open one run so a box score lagging the final can't void
+>   a gradeable bet early.
+> - CLV backfill joins the odds store by GamePk (pk-exact on
+>   doubleheaders); totals and away-side moneylines resolve through the
+>   home-keyed store row (away fair = 1 − home fair on the two-sided
+>   no-vig close).
+
 ## 10. What this document forbids
 
 - Changing λ, the 0.03 edge floor, the 0.5 shrinkage weight, or any cap in

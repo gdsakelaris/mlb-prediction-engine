@@ -33,6 +33,96 @@ def _assert_close(m1, m2, label):
             f"(diff {diff:.4f}, 4.5se {4.5 * se:.4f})"
 
 
+# per-family/per-market tail battery: the probabilities the engines
+# actually SERVE (game_frame/build_bets price exactly these tail
+# events), so parity is asserted on the betting quantities themselves,
+# not just 9 slate-level means. Lines mirror the served ladders
+# (predict.TOTAL_LINES / TEAM_TOTAL_LINES / K, Outs, ER, Hits, BB).
+_TT_LINES = (0.5, 1.5, 2.5, 3.5, 4.5)
+_TOT_LINES = (5.5, 6.5, 7.5, 8.5, 9.5, 10.5)
+_PK_LINES = (2.5, 4.5, 6.5)
+_POUT_LINES = (8.5, 11.5, 14.5, 17.5)
+_PER_LINES = (1.5, 2.5, 3.5)
+_PHA_LINES = (3.5, 5.5, 7.5)
+_PBB_LINES = (0.5, 1.5)
+
+
+def _market_battery(res):
+    """{market: per-sim 0/1 indicator} for every served market family:
+    ml, tot, tt, the starter ladders (pk/pout/per/pha/pbb), per-slot
+    batter props (h/hr/tb/r/rbi/bb/bk/hrr/sb families), plus the
+    distribution-shape events the mean lane can never see (walk-off
+    frequency AND margin mix, extra innings, steal accounting)."""
+    t = np.asarray(res["tensor"], dtype=np.float64)
+    sc = np.asarray(res["score"], dtype=np.float64)
+    X = S.SIDX
+    ev = {}
+    ev["ml/homewin"] = (sc[:, 1] > sc[:, 0]).astype(float)
+    total = sc.sum(1)
+    for x in _TOT_LINES:
+        ev[f"tot/runs>{x}"] = (total > x).astype(float)
+    for col, side in ((0, "away"), (1, "home")):
+        for x in _TT_LINES:
+            ev[f"tt/{side}>{x}"] = (sc[:, col] > x).astype(float)
+    for row, tag in ((18, "a"), (19, "h")):
+        for fam, stat, lines in (("pk", "PK_", _PK_LINES),
+                                 ("pout", "OUTS", _POUT_LINES),
+                                 ("per", "PER", _PER_LINES),
+                                 ("pha", "PH", _PHA_LINES),
+                                 ("pbb", "PBB", _PBB_LINES)):
+            for x in lines:
+                ev[f"{fam}/{tag}>{x}"] = \
+                    (t[:, row, X[stat]] > x).astype(float)
+    for row in range(18):
+        sub = t[:, row]
+        tb = (sub[:, X["B1"]] + 2 * sub[:, X["B2"]]
+              + 3 * sub[:, X["B3"]] + 4 * sub[:, X["HR"]])
+        hrr = sub[:, X["H"]] + sub[:, X["R"]] + sub[:, X["RBI"]]
+        for fam, arr, x in (("h", sub[:, X["H"]], 0.5),
+                            ("h", sub[:, X["H"]], 1.5),
+                            ("hr", sub[:, X["HR"]], 0.5),
+                            ("tb", tb, 1.5), ("tb", tb, 3.5),
+                            ("r", sub[:, X["R"]], 0.5),
+                            ("rbi", sub[:, X["RBI"]], 0.5),
+                            ("bb", sub[:, X["BB"]], 0.5),
+                            ("bk", sub[:, X["K"]], 0.5),
+                            ("hrr", hrr, 1.5),
+                            ("sb", sub[:, X["SB"]], 0.5)):
+            ev[f"{fam}/b{row}>{x}"] = (arr > x).astype(float)
+    # distribution shape: walk-off rate and margin mix (joint events, so
+    # plain binomial bounds apply), extra innings, steal/CS accounting
+    away_outs = t[:, synth.AWAY_STAFF, X["OUTS"]].sum(1)
+    home_outs = t[:, synth.HOME_STAFF, X["OUTS"]].sum(1)
+    walkoff = (sc[:, 1] > sc[:, 0]) & (away_outs % 3 != 0)
+    ev["shape/walkoff"] = walkoff.astype(float)
+    margin = sc[:, 1] - sc[:, 0]
+    for k in (1, 2, 3, 4):
+        ev[f"shape/walkoff_m{k}"] = (walkoff & (margin == k)).astype(float)
+    ev["shape/extras"] = (home_outs > 27).astype(float)
+    ev["shape/sb1"] = (t[..., X["SB"]].sum(1) > 0.5).astype(float)
+    ev["shape/cs1"] = (t[..., X["CS"]].sum(1) > 0.5).astype(float)
+    return ev
+
+
+def _assert_battery_close(e1, e2, label):
+    """Two-sample binomial bound per market: |p1-p2| < 5.0*SE. At
+    n=20,000/engine that is ~2.5 points at p=0.5, ~1.5 at p=0.1 and
+    ~0.7 at p=0.02 — the served-probability scale where divergence is
+    money-relevant. z=5.0 (per-test alpha 5.7e-7) keeps the familywise
+    false-alarm over the ~250 comparisons/game near 1.5e-4 under the
+    null, and the seeds are fixed anyway; anything caught here is a
+    real engine drift, not noise. The 1e-9 floor covers degenerate
+    all-zero markets (e.g. sb in the quiet prep) where SE collapses."""
+    for k in e1:
+        a, b = e1[k], e2[k]
+        p1, p2 = a.mean(), b.mean()
+        se = np.sqrt(p1 * (1 - p1) / a.size + p2 * (1 - p2) / b.size)
+        diff = abs(p1 - p2)
+        assert diff < max(5.0 * se, 1e-9), \
+            f"{label}/{k}: {p1:.4f} vs {p2:.4f} " \
+            f"(diff {diff:.4f}, 5.0se {5.0 * se:.4f})"
+
+
 LAT = dict(mu_env=0.05, sigma_env=0.06, sigma_offense=0.0,
            sigma_pitcher=0.0, sigma_hr=0.15, sigma_k=0.2)
 
@@ -51,7 +141,12 @@ def _preps():
 def _run_parity(backend):
     import sim_batch as SB
     preps = _preps()
-    n = 6000
+    # n=20,000 (raised from 6,000 with the per-market battery): the
+    # slate-mean lane keeps its 4.5*SE gate — now ~0.2 runs on a total
+    # instead of ~0.37 — and the battery bound above is what makes the
+    # "probabilistically equivalent" contract mean served probabilities,
+    # not just means
+    n = 20000
     seasons = [2024, 2024]
     batch = SB.run_batch(preps, n_sims=n, seed=101, seasons=seasons,
                          is_dh=[False, False], backend=backend)
@@ -61,6 +156,9 @@ def _run_parity(backend):
         synth.ledger_checks(batch[i])
         _assert_close(_measure(classic), _measure(batch[i]),
                       f"game{i}[{backend}]")
+        _assert_battery_close(_market_battery(classic),
+                              _market_battery(batch[i]),
+                              f"game{i}[{backend}]")
 
 
 def test_batch_cpu_matches_classic():

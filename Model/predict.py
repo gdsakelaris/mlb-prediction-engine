@@ -520,9 +520,17 @@ class Predictor:
         """Available relievers with usage weights: roster bullpen minus
         arms that threw on both of the last two days (or 25+ pitches
         yesterday), minus arms on the IL or last seen pitching for
-        another club (historical replays reconstruct availability from
-        IL spans + game logs; the roster snapshot only exists for
-        today)."""
+        another club.
+
+        REPLAY CAVEAT (no per-date roster archive exists): the
+        'Bullpen' membership list is TODAY's mlb_rosters.csv snapshot
+        for ANY requested date. IL spans + the 30-day game-log filters
+        partially reconstruct as-of availability, but a replay across a
+        trade deadline builds pens from post-trade rosters — a reliever
+        dealt away is dropped from his old club's replayed pen and
+        appears in the new one. predict_slate prints this warning once
+        per process on any historical serve; replay-derived evidence
+        (calibrators, gate, A/B) inherits the discrepancy."""
         cache = getattr(self, "_gp_team_cache", None)
         if cache is None:
             gp_all = self.stores.raw["gp"]
@@ -1027,8 +1035,20 @@ class Predictor:
         cache[key] = float(th)
         return cache[key]
 
-    # MIRROR[prep_hazard]: twin in Model/sim_batch.py _hazard_grids — change BOTH or parity drifts
-    def _hazard_grid(self, ppid, date, season, team=None, post=0.0):
+    # part of the prep_hazard mirror region below: sim_batch's
+    # _hazard_grids must call THIS helper for its leash inputs
+    def _leash_fields(self, ppid, date):
+        """Leash-panel hazard inputs for one starter, decayed forward to
+        `date` exactly as the training join does (fit_hazard routes
+        through features.merge_asof_panel, which multiplies the panel
+        sums by 2^(-gap/DECAY_HL) for the gap since the last start).
+        The ratio features cancel the factor, but leash_starts — a
+        HAZ_FEATS input — and the outs_sd starts>=5 gate do not:
+        undecayed, an IL returnee's leash_starts would be overstated
+        ~60% after a 60-day layoff and outs_sd computed where training
+        emits NaN. Returns (leash_starts, leash_np, leash_bf, ppb,
+        outs_sd); shared with sim_batch._hazard_grids so the twins
+        cannot drift."""
         leash = self.fstores.get("panel_leash")
         lz = None
         if leash is not None:
@@ -1036,22 +1056,31 @@ class Predictor:
                          & (leash.Date < pd.Timestamp(date))]
             if len(mine):
                 lz = mine.sort_values("Date").iloc[-1]
-        starts = float(lz["starts_d"]) if lz is not None else np.nan
-        np_avg = (float(lz["np_sum_d"]) / max(starts, 1e-9)
-                  if lz is not None else np.nan)
-        bf_avg = (float(lz["bf_sum_d"]) / max(starts, 1e-9)
-                  if lz is not None else np.nan)
+        if lz is None:
+            return np.nan, np.nan, np.nan, 3.9, np.nan
+        gap = float((pd.Timestamp(date) - lz["Date"]).days)
+        dk = float(2.0 ** (-gap / F.DECAY_HL))
+        starts = float(lz["starts_d"]) * dk
+        np_avg = float(lz["np_sum_d"]) * dk / max(starts, 1e-9)
+        bf_avg = float(lz["bf_sum_d"]) * dk / max(starts, 1e-9)
         ppb = (np_avg / bf_avg) if np_avg and bf_avg and bf_avg > 0 \
             else 3.9
         # start-length dispersion from the leash panel's squared sums
-        # (decay factors cancel in the ratio)
+        # (decay factors cancel in the ratio; the >=5 gate is on the
+        # DECAYED start count, as training's np.where mask is)
         outs_sd = np.nan
-        if (lz is not None and "outs2_sum_d" in lz.index
-                and starts == starts and starts >= 5):
-            mu_o = float(lz["outs_sum_d"]) / max(starts, 1e-9)
-            var_o = (float(lz["outs2_sum_d"]) / max(starts, 1e-9)
+        if ("outs2_sum_d" in lz.index and starts == starts
+                and starts >= 5):
+            mu_o = float(lz["outs_sum_d"]) * dk / max(starts, 1e-9)
+            var_o = (float(lz["outs2_sum_d"]) * dk / max(starts, 1e-9)
                      - mu_o ** 2)
             outs_sd = float(np.sqrt(max(var_o, 0.0)))
+        return starts, np_avg, bf_avg, ppb, outs_sd
+
+    # MIRROR[prep_hazard]: twin in Model/sim_batch.py _hazard_grids — change BOTH or parity drifts
+    def _hazard_grid(self, ppid, date, season, team=None, post=0.0):
+        starts, np_avg, bf_avg, ppb, outs_sd = \
+            self._leash_fields(ppid, date)
         # previous-start regime (ramp-up / opener-short) + IL recency
         d = pd.Timestamp(date)
         gp = self.stores.raw["gp"]
@@ -1099,6 +1128,39 @@ class Predictor:
             self.hz["model"].predict_proba(Xh)[:, 1])
         return p.reshape(41, 11)
 
+    # part of the prep_sb mirror region below: sim_batch's _sb_matrices
+    # must call THIS helper for its battery covariates
+    def _catcher_pop_csaa(self, lineup, season):
+        """(PopTime, CSAA) for the catcher in `lineup` (the fielding
+        club's 9): per-catcher prior-season values from the
+        catcher_player store (Year = consumption season), the exact
+        covariates sb_table trained on — the actual game catcher joined
+        by (CatcherId, Season). A known catcher without a prior season
+        gets (NaN, NaN), matching his training rows; None when no
+        rostered catcher is in the lineup (caller falls back to the
+        team aggregate)."""
+        catp = getattr(self, "_catp_map", None)
+        if catp is None:
+            catp = {}
+            p_ = F.STORES / "catcher_player.parquet"
+            if p_.exists():
+                cf = pd.read_parquet(p_)
+                catp = {(int(y), int(p)): (float(pt), float(cs))
+                        for y, p, pt, cs in zip(
+                            pd.to_numeric(cf.Year, errors="coerce"),
+                            pd.to_numeric(cf.PlayerId,
+                                          errors="coerce"),
+                            cf.PopTime.astype(float),
+                            cf.CSAA.astype(float))
+                        if y == y and p == p}
+            self._catp_map = catp
+        cid = next((int(p) for p in lineup
+                    if p is not None and p >= 0
+                    and int(p) in self._catchers), None)
+        if cid is None:
+            return None
+        return catp.get((int(season), cid), (np.nan, np.nan))
+
     # MIRROR[prep_sb]: twin in Model/sim_batch.py _sb_matrices — change BOTH or parity drifts
     def _sb_matrices(self, players, pit_rows, bat_rows_all, date, season,
                      away, home, post=0.0):
@@ -1135,6 +1197,17 @@ class Predictor:
             return (float(r.PopTime.iloc[0]) if len(r) and
                     pd.notna(r.PopTime.iloc[0]) else np.nan)
 
+        # battery covariates as trained: the fielding club's lineup
+        # catcher's own prior-season PopTime/CSAA (sb_table joins the
+        # actual game catcher). The old team-aggregate PopTime +
+        # always-NaN CSAA fed the imputer median on every serve row —
+        # elite and weak throwers priced identically. Team aggregate
+        # remains the fallback only when no rostered catcher is listed.
+        cat_of = {}
+        for t, lu in ((away, players[0:9]), (home, players[9:18])):
+            pc = self._catcher_pop_csaa(lu, season)
+            cat_of[t] = pc if pc is not None else (team_pop(t), np.nan)
+
         era_new = float(season >= 2023)
         att = np.zeros((n_players, n_players))
         suc = np.zeros((n_players, n_players))
@@ -1153,19 +1226,20 @@ class Predictor:
                                20 <= prow < 20 + MAX_PEN) else home
                 lhp = float(str(self._throws.get(ppid, "R")) == "L")
                 sspd = (spd.get(bpid, np.nan) if bpid >= 0 else np.nan)
+                pop_c, csaa_c = cat_of[fld]
                 rows_a.append(dict(
                     SprintSpeed=sspd,
                     speed_miss=float(np.isnan(sspd)),
                     speed2=(sspd - spc) ** 2,
                     sb_allowed_rate=sbr.get(ppid, np.nan),
                     cs_rate=csr.get(ppid, np.nan),
-                    PopTime=team_pop(fld), CSAA=np.nan,
+                    PopTime=pop_c, CSAA=csaa_c,
                     outs=1, outs1=1.0, score_close=1.0,
                     era_new=era_new, lhp=lhp, post=post))
                 rows_s.append(dict(
                     SprintSpeed=spd.get(bpid, np.nan),
                     cs_rate=csr.get(ppid, np.nan),
-                    PopTime=team_pop(fld), CSAA=np.nan, lhp=lhp,
+                    PopTime=pop_c, CSAA=csaa_c, lhp=lhp,
                     era_new=era_new, post=post))
                 pos.append((brow, prow))
         A = pd.DataFrame(rows_a)[self.sb["att_features"]]
@@ -1216,6 +1290,25 @@ class Predictor:
 
     def predict_slate(self, specs, n_sims=None, progress=None):
         tick = progress or (lambda m: None)
+        # historical replays have no per-date roster archive: bullpen
+        # membership, catcher/fielder identities and primary positions
+        # all come from TODAY's mlb_rosters.csv snapshot (IL spans +
+        # 30-day game logs partially reconstruct availability). Say so
+        # once per process, loudly — the calibrator/gate/A-B evidence
+        # replayed across a trade deadline inherits post-trade pens.
+        if specs and not getattr(self, "_replay_warned", False):
+            try:
+                d0 = pd.Timestamp(specs[0]["date"]).date()
+                if (dt.date.today() - d0).days > 1:
+                    self._replay_warned = True
+                    print(f"NOTE: historical serve for {d0} — pens/"
+                          f"catchers/fielders reconstructed from "
+                          f"TODAY's roster snapshot (no per-date "
+                          f"roster archive); post-trade/callup rosters "
+                          f"may differ from the true pregame ones",
+                          flush=True)
+            except Exception:               # noqa: BLE001
+                pass
         hctx = None
         tick("building slate context...")
         try:
@@ -1237,19 +1330,44 @@ class Predictor:
                 print(f"batched sim path unavailable ({e}); per-game "
                       f"fallback at {N_SIMS:,} sims", flush=True)
                 n_sims = min(n_sims, N_SIMS)
+        idxs = list(range(len(specs)))
         if out is None:
-            out = []
+            # per-game fault isolation: one malformed spec (bad team
+            # abbrev, corrupted venue) must not abort the other N-1
+            # games' serve — skip it, keep the original index for
+            # seeds/hctx, and surface the failure on the status sheet
+            # (self.degraded also drives headless exit code 3)
+            out, idxs = [], []
             for gi, spec in enumerate(specs):
                 tick(f"game {gi + 1}/{len(specs)}: preparing...")
-                prep, meta = self.prepare_game(spec, n_sims=n_sims)
-                tick(f"game {gi + 1}/{len(specs)}: simulating...")
-                res = sim.run(prep, n_sims=n_sims,
-                              seed=int(pd.Timestamp(spec["date"])
-                                       .toordinal()) * 100 + gi,
-                              season=meta["season"],
-                              is_dh_game=bool(spec.get("is_dh")))
+                try:
+                    prep, meta = self.prepare_game(spec, n_sims=n_sims)
+                    tick(f"game {gi + 1}/{len(specs)}: simulating...")
+                    res = sim.run(prep, n_sims=n_sims,
+                                  seed=int(pd.Timestamp(spec["date"])
+                                           .toordinal()) * 100 + gi,
+                                  season=meta["season"],
+                                  is_dh_game=bool(spec.get("is_dh")))
+                except Exception as e:      # noqa: BLE001
+                    label = (f'{spec.get("away_team", "?")}@'
+                             f'{spec.get("home_team", "?")}')
+                    msg = (f"game {label} {spec.get('date', '')} FAILED "
+                           f"({type(e).__name__}: {e}) — slate served "
+                           f"WITHOUT it")
+                    print(f"ERROR: {msg}", file=sys.stderr, flush=True)
+                    self.degraded.append(msg)
+                    continue
                 res["meta"] = meta
                 out.append(res)
+                idxs.append(gi)
+            if specs and not out:
+                # nothing survived: a partial workbook can't be served,
+                # and single-game callers (evaluate's replay loops do
+                # predict_slate([spec])[0]) need the real failure, not
+                # an IndexError on an empty list
+                raise RuntimeError(
+                    f"all {len(specs)} game(s) failed to prepare/sim — "
+                    f"see ERROR lines above")
         mf = None
         if MKT_BLEND and getattr(self, "mkt_blend", True) and specs:
             try:
@@ -1257,7 +1375,8 @@ class Predictor:
             except Exception as e:          # noqa: BLE001
                 print(f"market blend unavailable ({e}); serving pure "
                       f"model", flush=True)
-        for gi, (spec, res) in enumerate(zip(specs, out)):
+        for gi, res in zip(idxs, out):
+            spec = specs[gi]
             res["spec"] = spec
             res["calib"] = self.calib
             res["degraded"] = list(self.degraded)
@@ -1515,7 +1634,12 @@ def _mkt_lookup(dst, key0, col, gpk):
         return None
     if gpk in d:
         return d[gpk]
-    return next(iter(d.values())) if len(d) == 1 else None
+    # only the legacy blank-pk sentinel (-1) may answer for any
+    # requested game. A single entry keyed to a DIFFERENT real GamePk
+    # is a partial-capture doubleheader (books posted game 1's props
+    # before Tools/2 ran, game 2's after) — returning it would blend
+    # the OTHER matchup's price into this game's display cells.
+    return d.get(-1)
 
 
 def _blend_market(mf, spec, bat_rows, pit_rows, grow, away, home):
@@ -1811,7 +1935,13 @@ def game_frame(res):
     home_wp = _cal(calib, "ml",
                    float((sc[:, 1] > sc[:, 0]).mean()))
     lineup_hr = float(t[:, :18, s["HR"]].sum(axis=1).mean())
-    grow = {"Game": label, "Date": str(spec.get("date", "")),
+    gpk_ = int(spec.get("game_pk") or -1)
+    # G#/GamePk give the game row (and its pure-sidecar copy) the same
+    # DH identity the bat/pit rows carry — without them both games of a
+    # doubleheader emit indistinguishable 'AWY@HOM' rows
+    grow = {"Game": label, "G#": gnum,
+            "GamePk": (gpk_ if gpk_ != -1 else None),
+            "Date": str(spec.get("date", "")),
             "Venue": spec.get("venue", ""),
             "Winner": home if home_wp >= 0.5 else away,
             "Win Prob": max(home_wp, 1 - home_wp)}
@@ -1849,8 +1979,8 @@ def game_frame(res):
                 pure=pure)
 
 
-GAME_COLS = (["Game", "Date", "Venue", "Winner", "Win Prob",
-              "Away Score"]
+GAME_COLS = (["Game", "G#", "GamePk", "Date", "Venue", "Winner",
+              "Win Prob", "Away Score"]
              + [f"Away Runs > {x}" for x in TEAM_TOTAL_LINES]
              + ["Home Score"]
              + [f"Home Runs > {x}" for x in TEAM_TOTAL_LINES]
@@ -1934,11 +2064,16 @@ def build_bets(out, date):
     # two-way player appears in BOTH; routing pitcher markets through
     # by_pit (and batter markets through by_bat) prices each market off
     # the right tensor slot instead of whichever was appended first.
-    by_bat, by_pit, by_game = {}, {}, {}
+    by_bat, by_pit, by_game, by_club = {}, {}, {}, {}
     for res in out:
         meta = res["meta"]
         label = f'{meta["away"]}@{meta["home"]}'
         by_game.setdefault(meta["home"], []).append((res, label))
+        # team_totals rows carry the club whose total it is — either
+        # side of the game — so they need a both-clubs lookup (h2h and
+        # totals stay home-keyed: their fair is the home/Over side)
+        for club in (meta["home"], meta["away"]):
+            by_club.setdefault(club, []).append((res, label))
         for row_i, pid in enumerate(meta["players"]):
             if pid < 0 or row_i >= 20:
                 continue
@@ -1949,6 +2084,7 @@ def build_bets(out, date):
         return int(res["spec"].get("game_pk") or -1)
 
     slate_has_pks = any(spec_pk(r) != -1 for r in out)
+    skipped_pks = {}          # gpk -> label, for the post-loop warning
 
     def pick(hits, gpk):
         """The sim result an odds group belongs to. On a pk-stamped slate
@@ -1958,12 +2094,23 @@ def build_bets(out, date):
         odds with game 1's model would fabricate an edge and stamp it
         with game 1's identity. Legacy blank-pk groups (-1), and pk'd
         stores meeting a wholly un-stamped slate (old slate JSON /
-        schedule outage), keep the pre-GamePk behavior: the first hit."""
+        schedule outage), keep the pre-GamePk behavior: the first hit.
+        MIXED slates (one spec's pk stamp failed while Tools/2 stamped
+        its odds): a sole un-stamped candidate on a SINGLE-game day
+        must be that game — emit its bets without pk pinning rather
+        than silently dropping a whole game from the money path. On a
+        DH day the sole blank could be the OTHER game of the pair
+        (partially served DH), so any remaining ambiguity skips, with a
+        warning naming the game."""
         if gpk == -1 or not slate_has_pks:
             return hits[0]
         for h in hits:
             if spec_pk(h[0]) == gpk:
                 return h
+        blanks = [h for h in hits if spec_pk(h[0]) == -1]
+        if len(blanks) == 1 and not blanks[0][0]["spec"].get("is_dh"):
+            return blanks[0]
+        skipped_pks.setdefault(gpk, hits[0][-1])
         return None
 
     def _lk(v):
@@ -2104,20 +2251,24 @@ def build_bets(out, date):
                  g, "UnderPrice", note, gnum, gpk_out,
                  market, int(pid))
 
-    # game markets: h2h (Over = home side) and totals; same stale-legacy
+    # game markets: h2h (Over = home side), totals, and team_totals (the
+    # tt family — captured by Tools/2, blended, calibrated, head-
+    # adjusted and gate-graded; excluded from Bets/ledger until
+    # 2026-07-25 with no declared reason); same stale-legacy
     # suppression as the props loop
-    gm = odds[odds.Market.isin(["h2h", "totals"])
+    gm = odds[odds.Market.isin(["h2h", "totals", "team_totals"])
               & pd.to_numeric(odds.PlayerId, errors="coerce").isna()]
     pk_games = {(str(t), m, _lk(l)) for t, m, l in
                 zip(gm.loc[gm._gpk != -1, "Team"],
                     gm.loc[gm._gpk != -1, "Market"],
                     gm.loc[gm._gpk != -1, "Line"])}
-    tot_buf = {}
+    tot_buf, tt_buf = {}, {}
     for (team, market, line, gpk), g in gm.groupby(
             ["Team", "Market", "Line", "_gpk"], dropna=False):
         if gpk == -1 and (str(team), market, _lk(line)) in pk_games:
             continue
-        hits = by_game.get(team)
+        hits = (by_club if market == "team_totals"
+                else by_game).get(team)
         if not hits:
             continue
         picked = pick(hits, gpk)
@@ -2137,6 +2288,18 @@ def build_bets(out, date):
             emit(label, "", meta["away"], "moneyline", meta["away"], "",
                  1 - hw, (1 - fair) if fair is not None else None, g,
                  "UnderPrice", note, gnum, gpk_out, "h2h")
+        elif market == "team_totals":
+            try:
+                line = float(line)
+            except (TypeError, ValueError):
+                continue
+            side_i = int(str(team) == meta["home"])
+            p_over = _cal(res.get("calib"), "tt",
+                          float((res["score"][:, side_i]
+                                 > line).mean()))
+            p_over = head_adj(res, "tt", line, p_over, side_i, -1)
+            tt_buf.setdefault((label, str(team), gpk), []).append(
+                (line, p_over, fair, g, gnum, gpk_out))
         else:
             try:
                 line = float(line)
@@ -2162,6 +2325,28 @@ def build_bets(out, date):
             emit(label, "", "", "total runs", "Under", line, 1 - p_over,
                  (1 - fair) if fair is not None else None, g,
                  "UnderPrice", [], gnum, gpk_out, "totals")
+
+    # team-totals ladder clamp, mirroring the Games sheet's per-side
+    # Away/Home Runs > x columns
+    for (label, team, gpk), cand in tt_buf.items():
+        cand.sort(key=lambda c: c[0])
+        lo = None
+        for (line, p_over, fair, g, gnum, gpk_out) in cand:
+            if lo is not None and p_over > lo:
+                p_over = lo
+            lo = p_over
+            emit(label, "", team, "team total runs", "Over", line,
+                 p_over, fair, g, "OverPrice", [], gnum, gpk_out,
+                 "team_totals")
+            emit(label, "", team, "team total runs", "Under", line,
+                 1 - p_over, (1 - fair) if fair is not None else None,
+                 g, "UnderPrice", [], gnum, gpk_out, "team_totals")
+
+    for gpk, label in sorted(skipped_pks.items()):
+        print(f"WARNING: Bets/ledger skipped odds stamped GamePk {gpk} "
+              f"({label}): no served game matches and no single "
+              f"un-stamped candidate to pin them to",
+              file=sys.stderr, flush=True)
 
     rows.sort(key=lambda r: -(r["EV%"] or 0))
     return rows
@@ -2220,7 +2405,7 @@ def _status_sheet(wb, degraded, date):
 
 # sidecar identity columns per sheet (everything else numeric is a
 # served value worth archiving; these are join keys, not measurements)
-_PURE_ID_KEYS = {"ID", "G#", "Slot", "Career G"}
+_PURE_ID_KEYS = {"ID", "G#", "GamePk", "Slot", "Career G"}
 
 
 def write_pure_sidecar(frames, xlsx_path):
@@ -2228,8 +2413,8 @@ def write_pure_sidecar(frames, xlsx_path):
 
     Since the 2026-07-22 market blend, display-sheet cells are 50/50
     model/market — the pure numbers exist only in memory at serve time.
-    This dumps them (long format: sheet, Game, Team, G#, Name, ID, col,
-    p) to Predictions/pure/<workbook stem>.csv so the per-prop
+    This dumps them (long format: sheet, Game, Team, G#, GamePk, Name,
+    ID, col, p) to Predictions/pure/<workbook stem>.csv so the per-prop
     model-vs-market benchmark keeps accumulating evidence after the
     blend ship. A frame without a `pure` snapshot (blend off or no
     prices captured) contributes its live rows — those ARE pure.
@@ -2248,6 +2433,7 @@ def write_pure_sidecar(frames, xlsx_path):
                             _PURE_ID_KEYS):
                         recs.append((sheet, r.get("Game", ""),
                                      r.get("Team", ""), r.get("G#", ""),
+                                     r.get("GamePk", "") or "",
                                      r.get("Name", ""), r.get("ID", ""),
                                      col, float(v)))
     out_dir = Path(xlsx_path).parent / "pure"
@@ -2256,8 +2442,8 @@ def write_pure_sidecar(frames, xlsx_path):
     fd, tmp = tempfile.mkstemp(dir=out_dir, suffix=".tmp")
     with os.fdopen(fd, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
-        w.writerow(["sheet", "Game", "Team", "G#", "Name", "ID",
-                    "col", "p"])
+        w.writerow(["sheet", "Game", "Team", "G#", "GamePk", "Name",
+                    "ID", "col", "p"])
         w.writerows(recs)
     os.replace(tmp, dest)
     return dest
@@ -2286,17 +2472,9 @@ def save_excel_slate(specs, out, path=None, ledger=True):
             k += 1
 
     bet_rows = build_bets(out, date)
-    # paper-trading ledger (STAKING_DESIGN §9): record every Bets row at
-    # its captured price. LEDGER=0 disables; smoke serves are excluded
-    # by the caller (main passes ledger=False for --sims runs). The
-    # ledger must never block a serve.
-    if bet_rows and ledger and os.environ.get("LEDGER", "1") != "0":
-        try:
-            import staking
-            staking.append(staking.enrich(bet_rows, date, MKT_FAM))
-        except Exception as e:              # noqa: BLE001
-            print(f"staking ledger unavailable ({e}); serve continues",
-                  file=sys.stderr, flush=True)
+    # (staking-ledger append happens AFTER the workbook save below: a
+    # failed save must never leave permanent ledger rows for a workbook
+    # that does not exist)
 
     wb = Workbook()
     white_bold = Font(color="FFFFFFFF", bold=True)
@@ -2390,17 +2568,51 @@ def save_excel_slate(specs, out, path=None, ledger=True):
         print(f"WARNING: DEGRADED SERVE -> {'; '.join(deg)}",
               file=sys.stderr, flush=True)
 
-    wb.save(path)
-    # pristine as-served copy: grading recolors the workbook in place,
-    # so the exact file the user was served survives here for the
-    # late-Aug served-precision judgments (and any honest replay)
-    served = PRED_DIR / "as_served"
-    served.mkdir(exist_ok=True)
-    shutil.copy2(path, served / Path(path).name)
-    # pure-model sidecar: real serves only (same rule as the ledger —
-    # smoke serves must not pollute the evidence series), and never
-    # allowed to block a serve
+    # atomic workbook write (tmp + os.replace, the atomic_write
+    # pattern): a crash mid-save can never leave a truncated .xlsx at
+    # the date name for Tools/4 to open — and the collision loop above
+    # never sees a half-written base name, so a retry can't get bumped
+    # to _2 by its own wreckage
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=Path(path).parent,
+                               suffix=".xlsx.tmp")
+    os.close(fd)
+    try:
+        wb.save(tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+    # paper-trading ledger (STAKING_DESIGN §9): record every Bets row
+    # at its captured price — only now that the workbook exists on
+    # disk. LEDGER=0 disables; smoke serves are excluded by the caller
+    # (main passes ledger=False for sub-standard --sims runs). The
+    # ledger must never block a serve.
+    if bet_rows and ledger and os.environ.get("LEDGER", "1") != "0":
+        try:
+            import staking
+            staking.append(staking.enrich(bet_rows, date, MKT_FAM))
+        except Exception as e:              # noqa: BLE001
+            print(f"staking ledger unavailable ({e}); serve continues",
+                  file=sys.stderr, flush=True)
+
     if ledger:
+        # pristine as-served copy: grading recolors the workbook in
+        # place, so the exact file the user was served survives here
+        # for the late-Aug served-precision judgments (and any honest
+        # replay). Real serves only — same rule as the ledger: a smoke
+        # serve archived under the date-based name would BE the
+        # as-served record for that date.
+        served = PRED_DIR / "as_served"
+        served.mkdir(exist_ok=True)
+        shutil.copy2(path, served / Path(path).name)
+        # pure-model sidecar: real serves only (smoke serves must not
+        # pollute the evidence series), and never allowed to block a
+        # serve
         try:
             sc = write_pure_sidecar(frames, path)
             print(f"  pure-model sidecar: {sc}", flush=True)
@@ -2483,6 +2695,19 @@ def main():
         ap.error("nothing to do: pass --serve")
 
     _serve_health_warning()
+    # real serve vs smoke: an explicit --sims at (or above) the serve
+    # standard is still a REAL serve — the ledger, pure sidecar and
+    # as-served archive must not silently vanish because the operator
+    # typed the default count out. Only sub-standard sim counts are
+    # smoke serves, and gating them off is announced loudly.
+    use_batch = os.environ.get("SERVE_BATCH", "1") != "0"
+    serve_std = N_SIMS_SERVE if use_batch else N_SIMS
+    real_serve = args.sims is None or args.sims >= serve_std
+    if not real_serve:
+        print(f"NOTICE: --sims {args.sims:,} is below the "
+              f"{serve_std:,}-sim serve standard — SMOKE SERVE: "
+              f"staking ledger, pure sidecar and as-served archive "
+              f"all DISABLED for this run", flush=True)
     P = None  # models load once, first slate that has games
     served = 0
     for jpath in args.json:
@@ -2502,15 +2727,13 @@ def main():
             P = Predictor(progress=lambda m: print(m, flush=True))
         out = P.predict_slate(specs, n_sims=args.sims,
                               progress=lambda m: print(m, flush=True))
-        # ledger only on full-sim serves: --sims smoke tests must never
-        # write permanent paper-trade rows
-        path = save_excel_slate(specs, out, ledger=args.sims is None)
+        # ledger/sidecar/archive only on full-standard serves: smoke
+        # tests must never write permanent evidence rows
+        path = save_excel_slate(specs, out, ledger=real_serve)
         n_conf = sum(1 for s in specs
                      if s.get("away_lineup_src", "mlb") == "mlb"
                      and s.get("home_lineup_src", "mlb") == "mlb")
-        n_shown = args.sims or (
-            N_SIMS_SERVE if os.environ.get("SERVE_BATCH", "1") != "0"
-            else N_SIMS)
+        n_shown = args.sims or serve_std
         print(f"served {len(specs)} games at {n_shown:,} sims "
               f"({n_conf} confirmed-lineup, {len(specs) - n_conf} "
               f"projected) -> {path}")

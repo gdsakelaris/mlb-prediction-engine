@@ -125,7 +125,16 @@ CI = {c: i for i, c in enumerate(CLASSES)}
 ONBASE = np.array([CI[c] for c in ("BB", "HBP", "1B", "2B", "3B", "HR")])
 HITS = {CI["1B"]: "B1", CI["2B"]: "B2", CI["3B"]: "B3", CI["HR"]: "HR"}
 
-MAX_INNINGS = 19
+MAX_INNINGS = 25         # safety cap, raised from 19 (2026-07-25) so
+                         # pre-ghost games extend until decided; the
+                         # residual tie at the cap is resolved by one
+                         # fair Bernoulli in _end_half — a tie must
+                         # never leak into (home > away) win accounting
+# merged WP/PB pre-event: share of events that are PASSED BALLS
+# (league ~550 PB vs ~1600 WP per season). PB advances/scores are
+# UNEARNED per MLB scoring; WP runs stay earned — the sim draws the
+# event type per occurrence to classify the ER charge.
+PB_SHARE = 0.26
 PLATOON_WIN = 3          # pen entry: a same-hand arm within the first
                          # N slots of the leverage order jumps the queue
                          # (3-batter-minimum era: matching is real but
@@ -208,10 +217,22 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
     bat_ptr = np.zeros((S, 2), dtype=np.int8)
     cur_pit = np.tile(np.array(prep.starters, dtype=np.int16), (S, 1))
     pit_bf = np.zeros((S, 2), dtype=np.int16)
+    # cur_bf: the CURRENT pitcher's batters faced, reset on every
+    # pitching change — this is the tto index (matches the per-pitcher
+    # n_thruorder_pitcher the model trains on). pit_bf stays the
+    # team-side cumulative counter the starter hazard grid indexes.
+    cur_bf = np.zeros((S, 2), dtype=np.int16)
     pit_runs = np.zeros((S, 2), dtype=np.int16)
     starter_in = np.ones((S, 2), dtype=bool)
     pen_next = np.zeros((S, 2), dtype=np.int8)
     stint_outs = np.zeros((S, 2), dtype=np.int8)
+    # ent_outs: outs already gone in the half-inning when the current
+    # arm entered — the inning-break stint credit is 3 - ent_outs, so a
+    # mid-inning entrant is not credited a full 3 outs of stint work
+    ent_outs = np.zeros((S, 2), dtype=np.int8)
+    # uearn: runner-on-base UNEARNED flag (ghost runner, passed-ball
+    # advance); flagged runners never charge PER when they score
+    uearn = np.zeros((S, 3), dtype=bool)
     done = np.zeros(S, dtype=bool)
 
     # batter participation state: is each lineup slot's STARTER still in,
@@ -339,10 +360,13 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
             outs[idx] += 1
             bases[idx, 0] = -1
             resp[idx, 0] = -1
+            uearn[idx, 0] = False
         u = rng.random(a.size)
         wp = any_on & (u < pre_wp2[ft]) & (outs[a] < 3)
         if wp.any():
             idx = a[wp]
+            # WP vs PB draw (merged rate): PB advances/scores UNEARNED
+            is_pb = rng.random(idx.size) < PB_SHARE
             for b in (2, 1, 0):                      # lead runners first
                 mv = bases[idx, b] >= 0
                 if not mv.any():
@@ -359,18 +383,27 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
                     pr = resp[src, 2]
                     ok = pr >= 0
                     np.add.at(tensor, (src[ok], pr[ok], SIDX["PR"]), 1)
-                    np.add.at(tensor, (src[ok], pr[ok], SIDX["PER"]), 1)
+                    # earned only on a WILD PITCH and only for a runner
+                    # not already flagged unearned (ghost / PB advance)
+                    ern = ok & ~is_pb[mv] & ~uearn[src, 2]
+                    np.add.at(tensor, (src[ern], pr[ern], SIDX["PER"]),
+                              1)
                     src_fld = (1 - half[src]).astype(np.int16)
                     np.add.at(pit_runs, (src, src_fld), 1)
                     bases[src, 2] = -1
                     resp[src, 2] = -1
+                    uearn[src, 2] = False
                 else:
                     open_ = bases[src, b + 1] < 0
                     mvs = src[open_]
                     bases[mvs, b + 1] = bases[mvs, b]
                     resp[mvs, b + 1] = resp[mvs, b]
+                    # a PB advance taints the runner's eventual run
+                    uearn[mvs, b + 1] = (uearn[mvs, b]
+                                         | is_pb[mv][open_])
                     bases[mvs, b] = -1
                     resp[mvs, b] = -1
+                    uearn[mvs, b] = False
             # a go-ahead run scoring on a wild pitch in the bottom of
             # the 9th or later is a walk-off
             wo_wp = idx[(half[idx] == 1) & (inning[idx] >= REG)
@@ -414,14 +447,17 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
                 np.add.at(tensor, (w, g_row[win], SIDX["SB"]), 1)
                 bases[w, 1] = bases[w, 0]
                 resp[w, 1] = resp[w, 0]
+                uearn[w, 1] = uearn[w, 0]
                 bases[w, 0] = -1
                 resp[w, 0] = -1
+                uearn[w, 0] = False
                 np.add.at(tensor, (l, g_row[~win], SIDX["CS"]), 1)
                 l_fld = (1 - half[l]).astype(np.int16)
                 np.add.at(tensor, (l, cur_pit[l, l_fld], SIDX["OUTS"]), 1)
                 outs[l] += 1
                 bases[l, 0] = -1
                 resp[l, 0] = -1
+                uearn[l, 0] = False
 
         # an inning that ended on CS/PK settles NOW; every other sim
         # still takes its PA this iteration
@@ -431,7 +467,8 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
             _end_half(self_ended, inning, half, outs, bases, resp, score,
                       runs_f5, runs_i1, bat_ptr, done, stint_outs,
                       cur_pit, starter_in, pen_next, prep, rng, tensor,
-                      REG, rules, active, bench, pen_pick)
+                      REG, rules, active, bench, cur_bf, ent_outs,
+                      uearn, pen_pick)
             keep = ~self_ended[a] & ~done[a]
             a = a[keep]
             if a.size == 0:
@@ -469,6 +506,12 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
                 has = nxt >= 0
                 cur_pit[oidx[has], oft[has]] = nxt[has]
                 stint_outs[oidx, oft] = 0
+                # stint starts NOW: credit only the remaining outs of
+                # this half-inning at the break (mid-inning entrant)
+                ent_outs[oidx, oft] = outs[oidx]
+                # a NEW arm faces the order fresh (tto counter reset);
+                # pen empty -> same pitcher stays, count keeps running
+                cur_bf[oidx[has], oft[has]] = 0
         pit = cur_pit[a, ft]
 
         # ---- 3b. batter participation hazard for the due slot: the
@@ -502,8 +545,11 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
         batter_row, _ = occ_row(a, bt, slot)
         kpa[a, idx18] = np.minimum(kpa[a, idx18] + 1, 7)
 
-        # ---- 4. outcome sample with latent multipliers
-        tto = np.minimum(pit_bf[a, ft] // 9, 2)
+        # ---- 4. outcome sample with latent multipliers. tto indexes
+        # the CURRENT pitcher's own pass through the order (cur_bf,
+        # reset on pitching change) — a fresh reliever is served the
+        # tto-0 slice, not the team-BF slice trained on starters
+        tto = np.minimum(cur_bf[a, ft] // 9, 2)
         P = prep.avec[pit, bat_axis(batter_row), tto].copy()
         mult = np.ones_like(P)
         mult[:, ONBASE] *= np.exp(z_env[a])[:, None]
@@ -548,6 +594,7 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
         np.add.at(tensor, (a, batter_row, SIDX["PA"]), 1)
         np.add.at(tensor, (a, pit, SIDX["BF"]), 1)
         pit_bf[a, ft] += 1
+        cur_bf[a, ft] += 1
 
         # ---- 6. advancement pattern per (class, bb, state, outs)
         st = ((bases[a, 0] >= 0).astype(np.int8)
@@ -614,7 +661,8 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
             dests[ci[:, None], np.array([3, 2, 1, 0])[None, :]] = dsub
 
         _apply_pattern(a, bt, cls, dests, oadd, pruns, prbi, pearn,
-                       bases, resp, outs, score, tensor, batter_row, pit)
+                       bases, resp, uearn, outs, score, tensor,
+                       batter_row, pit)
         np.add.at(pit_runs, (a, ft), pruns.astype(np.int16))
         f5 = inning[a] <= 5
         np.add.at(runs_f5, (a[f5], bt[f5]), pruns[f5].astype(np.int16))
@@ -632,7 +680,8 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
             _end_half(over, inning, half, outs, bases, resp, score,
                       runs_f5, runs_i1, bat_ptr, done, stint_outs,
                       cur_pit, starter_in, pen_next, prep, rng, tensor,
-                      REG, rules, active, bench, pen_pick)
+                      REG, rules, active, bench, cur_bf, ent_outs,
+                      uearn, pen_pick)
 
     leftover = int((~done).sum())
     if leftover:
@@ -664,7 +713,7 @@ def _fallback_pattern(k, pat, cache):
 
 
 def _apply_pattern(a, bt, cls, dests, oadd, pruns, prbi, pearn, bases,
-                   resp, outs, score, tensor, batter_row, pit):
+                   resp, uearn, outs, score, tensor, batter_row, pit):
     outs[a] += oadd
     np.add.at(score, (a, bt), pruns.astype(np.int16))
 
@@ -694,12 +743,17 @@ def _apply_pattern(a, bt, cls, dests, oadd, pruns, prbi, pearn, bases,
     # trailing runners processed after them. bases hold PLAYER ROWS.
     new_bases = bases[a].copy()
     new_resp = resp[a].copy()
+    new_uearn = uearn[a].copy()
     earned_left = pearn.copy()
     for b in (2, 1, 0):                       # r3, r2, r1
         d = dests[:, b + 1]
         occ = bases[a, b] >= 0
         runner_row = bases[a, b]
-        moved = occ & (d != 9)
+        # self-destination guard: dest == own base is HELD (defense in
+        # depth — builder rows encoding EndBase==StartBase would first
+        # rewrite the runner onto his base and then erase him in the
+        # origin-clearing step below: silent runner deletion)
+        moved = occ & (d != 9) & (d != b + 1)
         if not moved.any():
             continue
         scored = moved & (d == 4)
@@ -709,20 +763,25 @@ def _apply_pattern(a, bt, cls, dests, oadd, pruns, prbi, pearn, bases,
             pr = resp[a[scored], b]
             ok = pr >= 0
             np.add.at(tensor, (a[scored][ok], pr[ok], SIDX["PR"]), 1)
-            has_e = earned_left[scored] > 0
-            np.add.at(tensor, (a[scored][ok & has_e], pr[ok & has_e],
+            # an UNEARNED-flagged runner (ghost, PB advance) never
+            # charges PER and never consumes the pattern's earned budget
+            elig = (earned_left[scored] > 0) & ~uearn[a[scored], b]
+            np.add.at(tensor, (a[scored][ok & elig], pr[ok & elig],
                                SIDX["PER"]), 1)
-            earned_left[np.flatnonzero(scored)[has_e]] -= 1
+            earned_left[np.flatnonzero(scored)[elig]] -= 1
         for tgt, code in ((0, 1), (1, 2), (2, 3)):
             mv = moved & (d == code)
             if mv.any():
                 new_bases[mv, tgt] = runner_row[mv]
                 new_resp[mv, tgt] = resp[a[mv], b]
+                new_uearn[mv, tgt] = uearn[a[mv], b]
         new_bases[moved, b] = np.where(
             new_bases[moved, b] == runner_row[moved], -1,
             new_bases[moved, b])
         new_resp[moved, b] = np.where(
             new_bases[moved, b] == -1, -1, new_resp[moved, b])
+        new_uearn[moved, b] = np.where(
+            new_bases[moved, b] == -1, False, new_uearn[moved, b])
 
     bd = dests[:, 0]
     b_sc = bd == 4
@@ -737,16 +796,20 @@ def _apply_pattern(a, bt, cls, dests, oadd, pruns, prbi, pearn, bases,
         if m.any():
             new_bases[m, tgt] = batter_row[m]
             new_resp[m, tgt] = pit[m]
+            new_uearn[m, tgt] = False
 
     bases[a] = new_bases
     resp[a] = new_resp
+    uearn[a] = new_uearn
 
 
 # MIRROR[loop_endhalf]: twin in Model/sim_batch.py end_half — change BOTH or parity drifts
 def _end_half(mask, inning, half, outs, bases, resp, score, runs_f5,
               runs_i1, bat_ptr, done, stint_outs, cur_pit, starter_in,
               pen_next, prep, rng, tensor, REG, rules, active, bench,
-              pen_pick=None):
+              cur_bf=None, ent_outs=None, uearn=None, pen_pick=None):
+    # cur_bf/ent_outs/uearn default None for direct harness callers
+    # (Tests/test_rules.py) — None behaves as the all-zero state
     idx = np.flatnonzero(mask)
     was_top = half[idx] == 0
     top_done = idx[was_top]
@@ -759,13 +822,35 @@ def _end_half(mask, inning, half, outs, bases, resp, score, runs_f5,
     done[over_home] = True
     done[over_away] = True
     done[hard_cap] = True
+    # residual tie at the raised safety cap: decided by ONE fair
+    # Bernoulli (2026-07-25) — a tied score would read as a home loss
+    # in every (home > away) consumer. The deciding run is credited to
+    # the winner's most recent batter and charged (unearned) to the
+    # loser's current pitcher so the run/PR conservation ledgers hold.
+    tied = hard_cap[score[hard_cap, 0] == score[hard_cap, 1]]
+    if tied.size:
+        wside = (rng.random(tied.size) < 0.5).astype(np.int16)  # 1=home
+        np.add.at(score, (tied, wside), 1)
+        prev = (bat_ptr[tied, wside] - 1) % 9
+        idx18 = prev.astype(np.int16) + 9 * wside
+        act = active[tied, idx18]
+        row = np.where(act, idx18, bench[wside])
+        np.add.at(tensor, (tied, row, SIDX["R"]), 1)
+        np.add.at(tensor, (tied, cur_pit[tied, 1 - wside],
+                           SIDX["PR"]), 1)
 
     fld = np.where(was_top, 1, 0)
     non_start = ~starter_in[idx, fld]
     if non_start.any():
         ridx = idx[non_start]
         rfld = fld[non_start]
-        stint_outs[ridx, rfld] += 3
+        # a mid-inning entrant is credited only the outs he actually
+        # covered this half (3 - outs already gone at entry)
+        if ent_outs is not None:
+            stint_outs[ridx, rfld] += 3 - ent_outs[ridx, rfld]
+            ent_outs[ridx, rfld] = 0
+        else:
+            stint_outs[ridx, rfld] += 3
         so = np.clip(stint_outs[ridx, rfld], 0, 10)
         ret = np.asarray(prep.relief_exit)
         exit_p = (ret[cur_pit[ridx, rfld], so] if ret.ndim == 2
@@ -796,10 +881,14 @@ def _end_half(mask, inning, half, outs, bases, resp, score, runs_f5,
             has = nxt >= 0
             cur_pit[lidx[has], lfld[has]] = nxt[has]
             stint_outs[lidx, lfld] = 0
+            if cur_bf is not None:               # fresh arm: tto reset
+                cur_bf[lidx[has], lfld[has]] = 0
 
     outs[idx] = 0
     bases[idx] = -1
     resp[idx] = -1
+    if uearn is not None:
+        uearn[idx] = False
     half[idx] = np.where(was_top, 1, 0)
     inning[idx] += (~was_top).astype(np.int8)
 
@@ -813,3 +902,6 @@ def _end_half(mask, inning, half, outs, bases, resp, score, runs_f5,
         act = active[ghost, idx18]
         bases[ghost, 1] = np.where(act, idx18, bench[bt])
         resp[ghost, 1] = cur_pit[ghost, 1 - bt]
+        if uearn is not None:
+            # MLB scoring: the placed runner's run is always UNEARNED
+            uearn[ghost, 1] = True

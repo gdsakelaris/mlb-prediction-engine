@@ -383,10 +383,15 @@ def _binent(b):
     return -(b * np.log(b) + (1 - b) * np.log(1 - b))
 
 
-def _prep_binlike(day_id, D, p, y):
+def _prep_binlike(day_id, D, p, y, winner=False):
     """Precompute everything one priced line needs so a resample is pure
     reweighting: per-day aggregates for edge/base/lift, fixed sort orders +
-    tie blocks for weighted AUC/ECE, and a warm-start calibration line."""
+    tie blocks for weighted AUC/ECE, and a warm-start calibration line.
+    `winner` prices the lift pillar the way the point estimate does for
+    WINNER_FAMS: the day's single most CONFIDENT call (top1_lift), not
+    the top-10-by-p picks — Score and Score_lo must grade the SAME
+    metric, or the bootstrap lower bound (the column tiers cut on)
+    prices a different pillar than the headline Score."""
     p = np.clip(np.asarray(p, float), 1e-4, 1 - 1e-4)
     y = np.asarray(y, float)
     z = np.log(p / (1 - p))
@@ -398,15 +403,27 @@ def _prep_binlike(day_id, D, p, y):
     aesum = np.bincount(day_id, np.abs(p - y), D)         # MAE numerator
     hitsum = np.bincount(day_id,                          # accuracy numerator
                          ((p >= 0.5) == (y > 0.5)).astype(float), D)
-    # per-day top-10-by-p y-sum (fixed under day resampling)
-    o = np.lexsort((-p, day_id))
-    did_s, y_s = day_id[o], y[o]
-    gstart = np.flatnonzero(np.concatenate(([True], did_s[1:] != did_s[:-1])))
-    pos = np.arange(len(o)) - np.repeat(
-        gstart, np.diff(np.append(gstart, len(o))))
-    tm = pos < 10
-    picks_sumy = np.bincount(did_s[tm], y_s[tm], D)
-    picks_k = np.bincount(did_s[tm], minlength=D).astype(float)
+    if winner:
+        # per-day top-1-by-CONFIDENCE pick, scored on side-correctness
+        # (top1_lift's metric) — fixed under day resampling
+        conf = np.maximum(p, 1 - p)
+        hit = ((p >= 0.5) == (y > 0.5)).astype(float)
+        o = np.lexsort((-conf, day_id))
+        did_s = day_id[o]
+        first = np.concatenate(([True], did_s[1:] != did_s[:-1]))
+        picks_sumy = np.bincount(did_s[first], hit[o][first], D)
+        picks_k = np.bincount(did_s[first], minlength=D).astype(float)
+    else:
+        # per-day top-10-by-p y-sum (fixed under day resampling)
+        o = np.lexsort((-p, day_id))
+        did_s, y_s = day_id[o], y[o]
+        gstart = np.flatnonzero(np.concatenate(([True],
+                                                did_s[1:] != did_s[:-1])))
+        pos = np.arange(len(o)) - np.repeat(
+            gstart, np.diff(np.append(gstart, len(o))))
+        tm = pos < 10
+        picks_sumy = np.bincount(did_s[tm], y_s[tm], D)
+        picks_k = np.bincount(did_s[tm], minlength=D).astype(float)
     od = np.argsort(-p, kind="mergesort")           # AUC: descending, ties
     ps_d = p[od]
     starts = np.concatenate(([0], np.nonzero(np.diff(ps_d))[0] + 1))
@@ -630,7 +647,8 @@ def build_table(boot=BOOT_B, rows=None):
                                  size=boot).astype(float)
             preps = [_prep_binlike(day_id[mask], D,
                                    fam_df["p_cal"].to_numpy()[mask],
-                                   fam_df["y"].to_numpy(dtype=float)[mask])
+                                   fam_df["y"].to_numpy(dtype=float)[mask],
+                                   winner=fam in WINNER_FAMS)
                      for _, _, _, mask in mkts]
             sc = _family_boot(preps, Wm, m["vsclose"])
             sc = sc[np.isfinite(sc)]

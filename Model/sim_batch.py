@@ -104,6 +104,12 @@ class BatchPrep:
         self.pen = xp.asarray(
             np.stack([np.asarray(p.pen_order[0]) for p in preps]),
             dtype=np.int16)
+        # starters honored per game (was hard-coded [18, 19] in
+        # run_batch — a prep with non-default starter rows would have
+        # silently simulated the wrong pitchers on the batched path)
+        self.starters = xp.asarray(
+            np.stack([np.asarray(p.starters) for p in preps]),
+            dtype=np.int16)
         self.sb_att = xp.asarray(
             np.stack([p.sb_att for p in preps]), dtype=f32)
         self.sb_suc = xp.asarray(
@@ -223,12 +229,24 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
     bases = -xp.ones((N, 3), dtype=xp.int16)
     resp = -xp.ones((N, 3), dtype=xp.int16)
     bat_ptr = xp.zeros((N, 2), dtype=xp.int8)
-    cur_pit = xp.tile(xp.asarray([18, 19], dtype=xp.int16), (N, 1))
+    cur_pit = bp.starters[gidx].astype(xp.int16)   # per-prep starters
     pit_bf = xp.zeros((N, 2), dtype=xp.int16)
+    # cur_bf: the CURRENT pitcher's batters faced, reset on every
+    # pitching change — this is the tto index (matches the per-pitcher
+    # n_thruorder_pitcher the model trains on). pit_bf stays the
+    # team-side cumulative counter the starter hazard grid indexes.
+    cur_bf = xp.zeros((N, 2), dtype=xp.int16)
     pit_runs = xp.zeros((N, 2), dtype=it_acc)
     starter_in = xp.ones((N, 2), dtype=bool)
     pen_next = xp.zeros((N, 2), dtype=xp.int8)
     stint_outs = xp.zeros((N, 2), dtype=xp.int8)
+    # ent_outs: outs already gone in the half-inning when the current
+    # arm entered — the inning-break stint credit is 3 - ent_outs, so a
+    # mid-inning entrant is not credited a full 3 outs of stint work
+    ent_outs = xp.zeros((N, 2), dtype=xp.int8)
+    # uearn: runner-on-base UNEARNED flag (ghost runner, passed-ball
+    # advance); flagged runners never charge PER when they score
+    uearn = xp.zeros((N, 3), dtype=bool)
     done = xp.zeros(N, dtype=bool)
     active = xp.ones((N, 18), dtype=bool)
     kpa = xp.zeros((N, 18), dtype=xp.int8)
@@ -330,13 +348,35 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
         done[over_home] = True
         done[over_away] = True
         done[hard_cap] = True
+        # residual tie at the raised safety cap: decided by ONE fair
+        # Bernoulli (2026-07-25) — a tied score would read as a home
+        # loss in every (home > away) consumer. The deciding run is
+        # credited to the winner's most recent batter and charged
+        # (unearned) to the loser's current pitcher so the run/PR
+        # conservation ledgers hold. See sim.py _end_half.
+        tied = hard_cap[score[hard_cap, 0] == score[hard_cap, 1]]
+        if tied.size:
+            wside = (rng.random(int(tied.size), dtype=xp.float32)
+                     < 0.5).astype(xp.int16)                 # 1 = home
+            sadd(score, (tied, wside.astype(xp.int32)), 1)
+            prev = (bat_ptr[tied, wside] - 1) % 9
+            idx18 = (prev.astype(xp.int16) + 9 * wside).astype(xp.int32)
+            act = active[tied, idx18]
+            row = xp.where(act, idx18,
+                           bp.bench[gidx[tied], wside].astype(xp.int32))
+            sadd(tensor, (tied, row, SIDX["R"]), 1)
+            sadd(tensor, (tied, cur_pit[tied, 1 - wside].astype(
+                xp.int32), SIDX["PR"]), 1)
 
         fld = xp.where(was_top, 1, 0).astype(xp.int16)
         non_start = ~starter_in[idx, fld]
         if bool(non_start.any()):
             ridx = idx[non_start]
             rfld = fld[non_start]
-            stint_outs[ridx, rfld] += 3
+            # a mid-inning entrant is credited only the outs he
+            # actually covered this half (3 - outs gone at entry)
+            stint_outs[ridx, rfld] += 3 - ent_outs[ridx, rfld]
+            ent_outs[ridx, rfld] = 0
             exit_p = bp.relief[gidx[ridx],
                                cur_pit[ridx, rfld].astype(xp.int32),
                                xp.clip(stint_outs[ridx, rfld],
@@ -365,10 +405,12 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
                 has = nxt >= 0
                 cur_pit[lidx[has], lfld[has]] = nxt[has]
                 stint_outs[lidx, lfld] = 0
+                cur_bf[lidx[has], lfld[has]] = 0  # fresh arm: tto reset
 
         outs[idx] = 0
         bases[idx] = -1
         resp[idx] = -1
+        uearn[idx] = False
         half[idx] = xp.where(was_top, 1, 0).astype(xp.int8)
         inning[idx] += (~was_top).astype(xp.int8)
 
@@ -383,6 +425,8 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
                 bases[gh, 1] = xp.where(act, idx18,
                                         bp.bench[gidx[gh], bt])
                 resp[gh, 1] = cur_pit[gh, 1 - bt]
+                # MLB scoring: the placed runner is always UNEARNED
+                uearn[gh, 1] = True
 
     for _step in range(400):
         act_mask = ~done
@@ -409,11 +453,15 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
             outs[idx] += 1
             bases[idx, 0] = -1
             resp[idx, 0] = -1
+            uearn[idx, 0] = False
         u = rng.random(int(a.size), dtype=xp.float32)
         wp = any_on & (u < bp.pre_wp[ga, ft.astype(xp.int32)]) \
             & (outs[a] < 3)
         if bool(wp.any()):
             idx = a[wp]
+            # WP vs PB draw (merged rate): PB advances/scores UNEARNED
+            is_pb = rng.random(int(idx.size),
+                               dtype=xp.float32) < S_.PB_SHARE
             for b in (2, 1, 0):
                 mv = bases[idx, b] >= 0
                 if not bool(mv.any()):
@@ -434,19 +482,27 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
                     ok = pr >= 0
                     sadd(tensor, (src[ok], pr[ok].astype(xp.int32),
                                   SIDX["PR"]), 1)
-                    sadd(tensor, (src[ok], pr[ok].astype(xp.int32),
+                    # earned only on a WILD PITCH and only for a runner
+                    # not already flagged unearned (ghost / PB advance)
+                    ern = ok & ~is_pb[mv] & ~uearn[src, 2]
+                    sadd(tensor, (src[ern], pr[ern].astype(xp.int32),
                                   SIDX["PER"]), 1)
                     src_fld = (1 - half[src]).astype(xp.int32)
                     sadd(pit_runs, (src, src_fld), 1)
                     bases[src, 2] = -1
                     resp[src, 2] = -1
+                    uearn[src, 2] = False
                 else:
                     open_ = bases[src, b + 1] < 0
                     mvs = src[open_]
                     bases[mvs, b + 1] = bases[mvs, b]
                     resp[mvs, b + 1] = resp[mvs, b]
+                    # a PB advance taints the runner's eventual run
+                    uearn[mvs, b + 1] = (uearn[mvs, b]
+                                         | is_pb[mv][open_])
                     bases[mvs, b] = -1
                     resp[mvs, b] = -1
+                    uearn[mvs, b] = False
             wo_wp = idx[(half[idx] == 1) & (inning[idx] >= reg_n[idx])
                         & (score[idx, 1] > score[idx, 0])]
             done[wo_wp] = True
@@ -491,8 +547,10 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
                 sadd(tensor, (w, g_row[win], SIDX["SB"]), 1)
                 bases[w, 1] = bases[w, 0]
                 resp[w, 1] = resp[w, 0]
+                uearn[w, 1] = uearn[w, 0]
                 bases[w, 0] = -1
                 resp[w, 0] = -1
+                uearn[w, 0] = False
                 sadd(tensor, (l, g_row[~win], SIDX["CS"]), 1)
                 l_fld = (1 - half[l]).astype(xp.int16)
                 sadd(tensor, (l, cur_pit[l, l_fld].astype(xp.int32),
@@ -500,6 +558,7 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
                 outs[l] += 1
                 bases[l, 0] = -1
                 resp[l, 0] = -1
+                uearn[l, 0] = False
 
         self_ended = xp.zeros(N, dtype=bool)
         self_ended[a] = outs[a] >= 3
@@ -545,6 +604,12 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
                 has = nxt >= 0
                 cur_pit[oidx[has], oft[has]] = nxt[has]
                 stint_outs[oidx, oft] = 0
+                # stint starts NOW: credit only the remaining outs of
+                # this half-inning at the break (mid-inning entrant)
+                ent_outs[oidx, oft] = outs[oidx]
+                # a NEW arm faces the order fresh (tto counter reset);
+                # pen empty -> same pitcher stays, count keeps running
+                cur_bf[oidx[has], oft[has]] = 0
         pit = cur_pit[a, ft].astype(xp.int32)
 
         # ---- 3b. batter participation hazard
@@ -585,8 +650,11 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
                               bp.bench[ga, bt]).astype(xp.int32)
         kpa[a, idx18] = xp.minimum(kpa[a, idx18] + 1, 7)
 
-        # ---- 4. outcome sample with latent multipliers
-        tto = xp.minimum(pit_bf[a, ft] // 9, 2).astype(xp.int32)
+        # ---- 4. outcome sample with latent multipliers. tto indexes
+        # the CURRENT pitcher's own pass through the order (cur_bf,
+        # reset on pitching change) — a fresh reliever is served the
+        # tto-0 slice, not the team-BF slice trained on starters
+        tto = xp.minimum(cur_bf[a, ft] // 9, 2).astype(xp.int32)
         P = bp.avec[ga, pit, bat_axis(batter_row), tto].copy()
         mult = xp.ones_like(P)
         mult[:, ONBASE] *= xp.exp(z_env[a])[:, None]
@@ -640,6 +708,7 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
         sadd(tensor, (a, batter_row, SIDX["PA"]), 1)
         sadd(tensor, (a, pit, SIDX["BF"]), 1)
         pit_bf[a, ft] += 1
+        cur_bf[a, ft] += 1
 
         # ---- 6. advancement pattern (dense bank: two gathers)
         st = ((bases[a, 0] >= 0).astype(xp.int32)
@@ -721,12 +790,17 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
 
         new_bases = bases[a].copy()
         new_resp = resp[a].copy()
+        new_uearn = uearn[a].copy()
         earned_left = pearn.copy()
         for b in (2, 1, 0):
             d = dests[:, b + 1]
             occ = bases[a, b] >= 0
             runner_row = bases[a, b].astype(xp.int32)
-            moved = occ & (d != 9)
+            # self-destination guard: dest == own base is HELD (defense
+            # in depth — builder rows encoding EndBase==StartBase would
+            # first rewrite the runner onto his base and then erase him
+            # in the origin-clearing step below: silent runner deletion)
+            moved = occ & (d != 9) & (d != b + 1)
             if not bool(moved.any()):
                 continue
             scored = moved & (d == 4)
@@ -737,24 +811,29 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
                 ok = pr >= 0
                 sadd(tensor, (a[scored][ok], pr[ok].astype(xp.int32),
                               SIDX["PR"]), 1)
-                has_e = earned_left[scored] > 0
-                sadd(tensor, (a[scored][ok & has_e],
-                              pr[ok & has_e].astype(xp.int32),
+                # an UNEARNED-flagged runner (ghost, PB advance) never
+                # charges PER and never consumes the earned budget
+                elig = (earned_left[scored] > 0) & ~uearn[a[scored], b]
+                sadd(tensor, (a[scored][ok & elig],
+                              pr[ok & elig].astype(xp.int32),
                               SIDX["PER"]), 1)
                 sc_idx = xp.flatnonzero(scored)
-                dec = sc_idx[has_e]
+                dec = sc_idx[elig]
                 earned_left[dec] -= 1
             for tgt, code in ((0, 1), (1, 2), (2, 3)):
                 mv = moved & (d == code)
                 if bool(mv.any()):
                     new_bases[mv, tgt] = runner_row[mv].astype(xp.int16)
                     new_resp[mv, tgt] = resp[a[mv], b]
+                    new_uearn[mv, tgt] = uearn[a[mv], b]
             rr16 = runner_row.astype(xp.int16)
             new_bases[moved, b] = xp.where(
                 new_bases[moved, b] == rr16[moved], -1,
                 new_bases[moved, b])
             new_resp[moved, b] = xp.where(
                 new_bases[moved, b] == -1, -1, new_resp[moved, b])
+            new_uearn[moved, b] = xp.where(
+                new_bases[moved, b] == -1, False, new_uearn[moved, b])
 
         bd = dests[:, 0]
         b_sc = bd == 4
@@ -769,8 +848,10 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
             if bool(m.any()):
                 new_bases[m, tgt] = batter_row[m].astype(xp.int16)
                 new_resp[m, tgt] = pit[m].astype(xp.int16)
+                new_uearn[m, tgt] = False
         bases[a] = new_bases
         resp[a] = new_resp
+        uearn[a] = new_uearn
 
         sadd(pit_runs, (a, ft.astype(xp.int32)), pruns)
         f5 = inning[a] <= 5
@@ -788,7 +869,11 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
         if bool(over.any()):
             end_half(over)
 
-    leftover = int((~done).sum())
+    # per-GAME leftover (rows are game-major: row n -> game n // S), so
+    # a truncated sim is attributed to its own game instead of a
+    # batch-wide count duplicated into every game's diagnostics
+    left_pg = (~done).reshape(G, S).sum(axis=1)
+    left_pg = left_pg.get() if xp is not np else left_pg
 
     # ---- split back to per-game results on host
     def host(x):
@@ -804,7 +889,8 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
         sl = slice(g * S, (g + 1) * S)
         out.append(dict(tensor=tensor_h[sl], score=score_h[sl],
                         runs_f5=f5_h[sl], runs_i1=i1_h[sl],
-                        leftover=leftover, stats=STATS, seed=seed))
+                        leftover=int(left_pg[g]), stats=STATS,
+                        seed=seed))
     return out
 
 
@@ -1029,7 +1115,6 @@ def _start_hist(P):
 def _hazard_grids(P, resolved):
     """Batched serve-side hazard grids: same fields as
     Predictor._hazard_grid, one model call for all starters."""
-    leash = P.fstores.get("panel_leash")
     hist, il_hist = _start_hist(P)
     B_, R_ = np.meshgrid(np.arange(41), np.arange(11), indexing="ij")
     base_bf = B_.ravel()
@@ -1042,26 +1127,10 @@ def _hazard_grids(P, resolved):
         for si, prow in enumerate((18, 19)):
             ppid = rv["players"][prow]
             team = rv["away"] if si == 0 else rv["home"]
-            lz = None
-            if leash is not None:
-                mine = leash[(leash.PlayerId == ppid)
-                             & (leash.Date < d)]
-                if len(mine):
-                    lz = mine.sort_values("Date").iloc[-1]
-            starts = float(lz["starts_d"]) if lz is not None else np.nan
-            np_avg = (float(lz["np_sum_d"]) / max(starts, 1e-9)
-                      if lz is not None else np.nan)
-            bf_avg = (float(lz["bf_sum_d"]) / max(starts, 1e-9)
-                      if lz is not None else np.nan)
-            ppb = (np_avg / bf_avg) if np_avg and bf_avg and bf_avg > 0 \
-                else 3.9
-            outs_sd = np.nan
-            if (lz is not None and "outs2_sum_d" in lz.index
-                    and starts == starts and starts >= 5):
-                mu_o = float(lz["outs_sum_d"]) / max(starts, 1e-9)
-                var_o = (float(lz["outs2_sum_d"]) / max(starts, 1e-9)
-                         - mu_o ** 2)
-                outs_sd = float(np.sqrt(max(var_o, 0.0)))
+            # decayed leash inputs via the shared predict-side helper —
+            # the same forward exp-decay the training join applies
+            starts, np_avg, bf_avg, ppb, outs_sd = \
+                P._leash_fields(ppid, d)
             gap_days, ramp, prev_short = np.nan, 0.0, 0.0
             h = hist.get(int(ppid)) if ppid >= 0 else None
             if h is not None:
@@ -1130,6 +1199,14 @@ def _sb_matrices(P, resolved):
             return (float(r.PopTime.iloc[0]) if len(r)
                     and pd.notna(r.PopTime.iloc[0]) else np.nan)
 
+        # battery covariates as trained: the fielding club's lineup
+        # catcher's own prior-season PopTime/CSAA via the shared
+        # predict-side helper; team aggregate only as fallback
+        cat_of = {}
+        for t, lu in ((away, players[0:9]), (home, players[9:18])):
+            pc = P._catcher_pop_csaa(lu, season)
+            cat_of[t] = pc if pc is not None else (team_pop(t), np.nan)
+
         era_new = float(season >= 2023)
         post = PR.spec_postseason(rv["spec"])
         spc = P.sb.get("speed_center", 27.3)
@@ -1143,14 +1220,15 @@ def _sb_matrices(P, resolved):
                     home
                 lhp = float(str(P._throws.get(ppid, "R")) == "L")
                 sspd = (spd.get(bpid, np.nan) if bpid >= 0 else np.nan)
+                pop_f, csaa_f = cat_of[fld]
                 rows_a.append((
                     sspd, float(np.isnan(sspd)), (sspd - spc) ** 2,
                     sbr.get(ppid, np.nan), csr.get(ppid, np.nan),
-                    team_pop(fld), np.nan, 1, 1.0, 1.0, era_new, lhp,
+                    pop_f, csaa_f, 1, 1.0, 1.0, era_new, lhp,
                     post))
                 rows_s.append((
                     spd.get(bpid, np.nan), csr.get(ppid, np.nan),
-                    team_pop(fld), np.nan, lhp, era_new, post))
+                    pop_f, csaa_f, lhp, era_new, post))
                 n += 1
         sizes.append(n)
     A = pd.DataFrame(rows_a, columns=["SprintSpeed", "speed_miss",

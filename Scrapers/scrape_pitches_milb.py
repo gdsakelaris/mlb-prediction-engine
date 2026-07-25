@@ -183,8 +183,10 @@ def main():
     outdir = Path(args.outdir)
     p_path, b_path = outdir / OUT_PITCHERS, outdir / OUT_BATTERS
 
-    kept_p, start, have = SP.load_existing(p_path, args.backfill)
-    kept_b, _, _ = SP.load_existing(b_path, args.backfill)
+    # one shared watermark for the pair (see SP.load_pair): trim == fetch
+    # start for BOTH files, so a divergent batter file can't lose days
+    kept_p, kept_b, start, have = SP.load_pair(p_path, b_path,
+                                               args.backfill)
     if start is not None:
         print(f"incremental: {len(kept_p):,} pitcher-day rows kept, "
               f"refetching from {start}", flush=True)

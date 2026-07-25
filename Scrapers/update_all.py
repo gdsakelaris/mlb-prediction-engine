@@ -37,6 +37,7 @@ import time
 from pathlib import Path
 
 import validate_data as V
+from seasons import atomic_write
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 MODEL_TRAIN = SCRIPTS_DIR.parent / "Model" / "train.py"
@@ -104,14 +105,30 @@ def discover_jobs():
     return jobs
 
 
-def run(label, args):
+# generous per-job wall-clock caps. Jobs run sequentially, so a single
+# scraper blocked on a dead TCP connection (a Savant/StatsAPI stall with
+# no RST) used to hang until Task Scheduler's 3-hour kill — forfeiting
+# every later scraper, validation/restore, the retrain, and the status
+# file for the day. 30 minutes clears every normal scraper run by a wide
+# margin; the retrain gets its own larger cap. On timeout the child is
+# killed, the job is marked FAILED, and the run continues.
+JOB_TIMEOUT_S = 30 * 60
+RETRAIN_TIMEOUT_S = 150 * 60
+
+
+def run(label, args, timeout=JOB_TIMEOUT_S):
     print(f"\n{'=' * 70}\n>>> {label}\n{'=' * 70}", flush=True)
     t0 = time.time()
-    proc = subprocess.run([sys.executable, *args])
+    try:
+        proc = subprocess.run([sys.executable, *args], timeout=timeout)
+        outcome = "OK" if proc.returncode == 0 else \
+            f"FAILED (exit {proc.returncode})"
+        ok = proc.returncode == 0
+    except subprocess.TimeoutExpired:
+        outcome = f"FAILED (timed out after {timeout // 60} min; killed)"
+        ok = False
     took = time.time() - t0
-    ok = proc.returncode == 0
-    print(f">>> {label}: {'OK' if ok else f'FAILED (exit {proc.returncode})'} "
-          f"in {took:.0f}s", flush=True)
+    print(f">>> {label}: {outcome} in {took:.0f}s", flush=True)
     return ok, took
 
 
@@ -212,7 +229,8 @@ def main():
                             True, 0.0))
         else:
             ok, took = run("Model/train.py --rebuild",
-                           [str(MODEL_TRAIN), "--rebuild"])
+                           [str(MODEL_TRAIN), "--rebuild"],
+                           timeout=RETRAIN_TIMEOUT_S)
             results.append(("retrain models", ok, took))
             all_ok = all_ok and ok
 
@@ -221,11 +239,16 @@ def main():
         print(f"  {'OK    ' if ok else 'FAILED'}  {took:6.0f}s  {label}")
 
     STATUS_FILE.parent.mkdir(exist_ok=True)
-    STATUS_FILE.write_text(json.dumps({
-        "finished": dt.datetime.now().isoformat(timespec="seconds"),
-        "ok": all_ok,
-        "failed_jobs": [label for label, ok, _ in results if not ok],
-    }, indent=1))
+    # atomic (tmp + os.replace): this file is what the GUI and the health
+    # watchdog read, and both fail SOFT on a corrupt copy — a crash mid-
+    # write would silently disable exactly the alerting layer the crash
+    # makes necessary
+    with atomic_write(STATUS_FILE, "w", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "finished": dt.datetime.now().isoformat(timespec="seconds"),
+            "ok": all_ok,
+            "failed_jobs": [label for label, ok, _ in results if not ok],
+        }, indent=1))
 
     if not all_ok:
         print("\nRESULT: FAILED", flush=True)

@@ -21,9 +21,11 @@ PlayerId is the MLBAM id used everywhere, so these rows join the MLB files
 and the minors pitch aggregates directly.
 
 The game universe is the StatsAPI schedule per level-season (final
-regular-season games). Games already in the output are cached — only new
+regular-season games). Games already in BOTH outputs are cached — only new
 GamePks hit the network, concurrently, and completed rows are APPENDED
-batch-by-batch, so an interrupted backfill resumes where it stopped.
+batch-by-batch through an atomic copy-append-replace
+(seasons.atomic_append), so an interrupted backfill resumes where it
+stopped without ever caching a torn or half-paired game as done.
 --backfill starts the files over.
 
 Usage:
@@ -41,7 +43,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 
-from seasons import CURRENT_SEASON
+from seasons import CURRENT_SEASON, atomic_append, trim_torn_tail
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "Data"
 OUT_BAT = DATA_DIR / "milb_game_batting.csv"
@@ -183,16 +185,18 @@ def parse_boxscore(game, box, meta, season):
 
 
 def append_rows(path, rows, cols, write_header):
-    """Serialize a batch once and append it in a single write (a killed run
-    can only lose the in-flight batch)."""
+    """Serialize a batch once and append it CRASH-SAFELY: the batch goes
+    onto a copy of the file which then atomically replaces the original
+    (seasons.atomic_append), so a killed run can only lose the whole
+    in-flight batch — never a torn line or a half-written game the
+    resume cache would then skip forever."""
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=cols)
     if write_header:
         w.writeheader()
     w.writerows(rows)
-    with open(path, "a", newline="", encoding="utf-8-sig" if write_header
-              else "utf-8") as f:
-        f.write(buf.getvalue())
+    atomic_append(path, buf.getvalue(),
+                  encoding="utf-8-sig" if write_header else "utf-8")
 
 
 def main():
@@ -208,14 +212,32 @@ def main():
         for p in (OUT_BAT, OUT_PIT):
             if p.exists():
                 p.unlink()
-    have = set()
-    if OUT_BAT.exists():
-        have = set(pd.to_numeric(
-            pd.read_csv(OUT_BAT, encoding="utf-8-sig",
+    # heal torn tails left by mid-append kills under the old plain-
+    # append code (drops the partial final game block for refetch)
+    for p in (OUT_BAT, OUT_PIT):
+        trim_torn_tail(p)
+
+    def stored_pks(path):
+        if not path.exists():
+            return set()
+        return set(pd.to_numeric(
+            pd.read_csv(path, encoding="utf-8-sig",
                         usecols=["GamePk"])["GamePk"],
             errors="coerce").dropna().astype("int64"))
 
-    header_due = not OUT_BAT.exists()
+    # a game is complete only when it is in BOTH files: a crash between
+    # the paired appends leaves batting rows without their pitching
+    # siblings, and keying the cache on the batting file alone marked
+    # those games done forever. Each file receives only the rows it is
+    # actually missing, so the repair never duplicates the other file.
+    have_bat = stored_pks(OUT_BAT)
+    have_pit = stored_pks(OUT_PIT)
+    have = have_bat & have_pit
+
+    # header state per file — OUT_PIT missing while OUT_BAT exists used
+    # to get its pitching rows appended headerless
+    header_bat = not OUT_BAT.exists()
+    header_pit = not OUT_PIT.exists()
     n_bat = n_pit = n_fail = 0
     for season in range(FIRST_SEASON, CURRENT_SEASON + 1):
         universe = season_universe(season)
@@ -240,8 +262,12 @@ def main():
                 g = futures[fut]
                 try:
                     bats, pits = fut.result()
-                    bat_batch.extend(bats)
-                    pit_batch.extend(pits)
+                    # only the rows each file is missing (repairing a
+                    # half-landed game must not duplicate the other side)
+                    if g["GamePk"] not in have_bat:
+                        bat_batch.extend(bats)
+                    if g["GamePk"] not in have_pit:
+                        pit_batch.extend(pits)
                 except Exception as e:               # noqa: BLE001
                     n_fail += 1
                     print(f"  WARNING: {g['GamePk']} failed ({e}); skipping "
@@ -250,12 +276,15 @@ def main():
                 if len(bat_batch) >= BATCH_GAMES * 22 or \
                         n_done == len(futures):
                     if bat_batch:
-                        append_rows(OUT_BAT, bat_batch, BAT_COLS, header_due)
-                        append_rows(OUT_PIT, pit_batch, PIT_COLS, header_due)
-                        header_due = False
+                        append_rows(OUT_BAT, bat_batch, BAT_COLS, header_bat)
+                        header_bat = False
                         n_bat += len(bat_batch)
+                        bat_batch = []
+                    if pit_batch:
+                        append_rows(OUT_PIT, pit_batch, PIT_COLS, header_pit)
+                        header_pit = False
                         n_pit += len(pit_batch)
-                        bat_batch, pit_batch = [], []
+                        pit_batch = []
                 if n_done % 500 == 0:
                     print(f"  {season}: {n_done:,}/{len(futures):,}",
                           flush=True)

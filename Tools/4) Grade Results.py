@@ -27,14 +27,17 @@ fresh.
 
 Doubleheaders: prop rows carry a G# column, so every batter/pitcher row
 grades against ITS OWN game's box line (the tag's G#-th final, schedule
-order) — a game-1 prediction is never credited with a game-2 stat.
-Games-sheet rows are matched per game: the tag's i-th row grades against
-the day's i-th final for that matchup (schedule order); if only one of
-the two games is final the tag's rows are skipped until both are in.
+order) — a game-1 prediction is never credited with a game-2 stat. All
+G#-ordinal grading waits until the finals cover EVERY game the workbook
+knows the matchup had that day: with game 1 suspended and game 2 final,
+the lone final IS game 2, so the tag's rows skip rather than misgrade.
+Games-sheet rows are matched per game under the same coverage guard:
+the tag's i-th row grades against the day's i-th final for that matchup
+(schedule order) only once every predicted game is final.
 Bets rows carry GamePk + G# since 2026-07-23, so they settle against
 exactly their own game's final (a DH row whose game isn't final yet
-waits); legacy rows without either stay unsettled on multi-final days
-rather than misgraded.
+waits); legacy rows without either settle only when the day is known to
+have had exactly one game, never misgraded on multi-game days.
 
 If some games are missing (they weren't final at the last scrape), their
 rows are skipped and counted — run  python Scrapers/scrape_gamelogs.py
@@ -45,12 +48,15 @@ Usage:
     python "Tools/4) Grade Results.py" path\\to\\file.xlsx
     python "Tools/4) Grade Results.py" --all            # grade EVERY workbook
 
---all paints EVERY dated workbook in Predictions/ in place — the same
-recolor as the single-file mode, idempotent on already-graded books —
-and prints one summary line per day plus the pooled totals and Bets
-tally. A workbook that can't be graded yet (today's slate before
-finals) is skipped with a note; one that is open in Excel still counts
-in the totals but keeps its old paint.
+--all paints ONE workbook per date — a re-serve suffixes _2/_3 and
+SUPERSEDES the earlier book (same slate served again), so only the
+highest suffix per date is graded and pooled (the Tools/6 newest-per-
+date rule; superseded copies are skipped with a note, never double-
+counted). The recolor is the same as single-file mode, idempotent on
+already-graded books; one summary line per day plus the pooled totals
+and Bets tally. A workbook that can't be graded yet (today's slate
+before finals) is skipped with a note; one that is open in Excel still
+counts in the totals but keeps its old paint.
 """
 import argparse
 import re
@@ -71,11 +77,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "Model"))
 
 
 def _settle_ledger(date):
+    """Settle the paper-trade ledger for one date. Returns True on
+    success. A staking crash must never hide behind a one-line note —
+    unsettled money rows are exactly the kind of silent gap the audit
+    flagged — so a failure prints the FULL traceback plus a loud marker
+    line, and the caller surfaces it again in the grade summary."""
     try:
         import staking
         staking.settle(str(date))
-    except Exception as e:                              # noqa: BLE001
-        print(f"  ledger settle skipped ({e})", flush=True)
+        return True
+    except Exception:                                   # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        print(f"  !! LEDGER SETTLE FAILED for {date} — staking ledger "
+              f"rows for this date remain unsettled (traceback above)",
+              flush=True)
+        return False
 
 # the one grading color: solid green = the stat occurred
 GREEN = "00B050"
@@ -180,17 +197,24 @@ def load_actuals(date):
     return batters, starters, games, batters_game, starters_game
 
 
-def _row_stats(per_game, day_dict, games, pid, tag, gnum):
+def _row_stats(per_game, day_dict, games, pid, tag, gnum, day_n=None):
     """Actual stats for one workbook row: with a Game tag and a G# the
     row grades against its OWN game's line (None until that game is
     final); without them fall back to the day sum. Returns None when
-    unresolvable."""
+    unresolvable. `day_n` is how many games the matchup is KNOWN to have
+    had that day (workbook G# evidence) — the ordinal lookup is only
+    trusted when the finals cover ALL of them: with a partial day (game
+    1 suspended, game 2 final) the k-th final can be a DIFFERENT game
+    than the k-th scheduled, so the row waits instead of misgrading
+    (the same coverage guard the Games sheet has always applied)."""
     try:
         pid = int(pid)
     except (TypeError, ValueError):
         return None
     if tag is not None and gnum is not None:
         finals = games.get(tag, [])
+        if day_n is not None and len(finals) < day_n:
+            return None           # finals don't cover the whole day yet
         k = gnum - 1
         if k < 0 or k >= len(finals):
             return None                       # that game not final yet
@@ -276,7 +300,8 @@ def _bat_actual(s, prop):
     return None
 
 
-def _settle_bet(row, batters, starters, games, bat_pid, pit_pid, bg, sg):
+def _settle_bet(row, batters, starters, games, bat_pid, pit_pid, bg, sg,
+                day_n=None):
     """Did this Bets row win? True / False / 'push' (stat landed exactly
     on an integer line — stake returned, neither won nor lost) / None
     (can't settle yet: no final, unmatched player, or a doubleheader
@@ -284,12 +309,20 @@ def _settle_bet(row, batters, starters, games, bat_pid, pit_pid, bg, sg):
     Bets rows carry GamePk + G# since 2026-07-23: GamePk pins the final
     exactly (a DH row whose own game isn't final yet stays unsettled
     instead of grading against the other game); G# (first-pitch order)
-    is the fallback for rows without a pk. Legacy rows with neither
-    keep the old rule — settle only when the matchup has exactly one
-    final, never misgrade against a day sum. `row` is {header: value};
-    `bat_pid` / `pit_pid` resolve a (game, name) to a PlayerId."""
+    is the fallback for rows without a pk, trusted only when the finals
+    cover EVERY game the matchup is known to have had that day (`day_n`,
+    from the workbook's G# evidence) — a G#=1 row with one final on a
+    two-game day is exactly as ambiguous as a G#=2 row (the lone final
+    could be EITHER game). Legacy rows with neither settle only when the
+    day is known to have had exactly its one final, never misgrade
+    against a day sum. `row` is {header: value}; `bat_pid` / `pit_pid`
+    resolve a (game, name) to a PlayerId."""
     game, prop = str(row.get("Game", "")), str(row.get("Prop", ""))
     side, line = str(row.get("Side", "")), row.get("Line")
+    finals_n = len(games.get(game, []))
+    # games the matchup is known to have had today: the caller's stamped
+    # count when supplied, floored at the finals themselves
+    n_day = max(day_n or 0, finals_n)
 
     def _line():
         try:
@@ -312,12 +345,13 @@ def _settle_bet(row, batters, starters, games, bat_pid, pit_pid, bg, sg):
             g_num = int(row.get("G#"))
         except (TypeError, ValueError):
             g_num = None
-        if g_num is not None and len(finals) > 1:
+        if g_num is not None:
+            if len(finals) != n_day:
+                return None       # can't tell WHICH game(s) went final
             k = g_num - 1
             return finals[k] if 0 <= k < len(finals) else None
-        if g_num == 2 and len(finals) == 1:
-            return None                   # can't tell WHICH game is final
-        return finals[0] if len(finals) == 1 else None
+        # legacy row (neither id): only a known one-game day settles
+        return finals[0] if (len(finals) == 1 and n_day == 1) else None
 
     if prop == "moneyline":                     # Side is the picked team
         f = _one_final()
@@ -330,10 +364,21 @@ def _settle_bet(row, batters, starters, games, bat_pid, pit_pid, bg, sg):
             return "push"
         occ = f["total"] > ln
         return occ if side == "Over" else not occ
-    # the day-sum fallback is only safe when the matchup produced exactly
-    # one final — on a multi-final (DH) day a day sum mixes both games,
-    # so a pinned row without its own box line stays unsettled instead
-    day_ok = len(games.get(game, [])) == 1
+    if prop == "team total runs":       # Side Over/Under on one club
+        f, ln = _one_final(), _line()
+        if f is None or ln is None:
+            return None
+        home = game.split("@")[-1].strip()
+        sc = (f["home"] if str(row.get("Team", "")) == home
+              else f["away"])
+        if sc == ln:
+            return "push"
+        occ = sc > ln
+        return occ if side == "Over" else not occ
+    # the day-sum fallback is only safe when the matchup is KNOWN to have
+    # had exactly one game — with a DH sibling (final or not) a day sum
+    # can mix, or silently BE, the other game's line
+    day_ok = finals_n == 1 and n_day == 1
 
     if prop.startswith("pitcher "):             # "pitcher strikeouts o6.5"
         rest = prop[len("pitcher "):]
@@ -371,11 +416,12 @@ def _settle_bet(row, batters, starters, games, bat_pid, pit_pid, bg, sg):
     return occ if side == "Over" else not occ
 
 
-def _grade_bets(wb, batters, starters, games, stats, bg, sg):
+def _grade_bets(wb, batters, starters, games, stats, bg, sg, day_n=None):
     """Paint every WINNING bet row solid green; reset the rest to the
     light board first, so re-running is idempotent (the Bets sheet is
     skipped by _ungrade for exactly this reason). No-op rows without a
-    Prop (the 'no captured odds' note) are left alone."""
+    Prop (the 'no captured odds' note) are left alone. `day_n` is the
+    workbook's {tag: games-that-day} map for the DH coverage guard."""
     if "Bets" not in wb.sheetnames:
         return
     ws = wb["Bets"]
@@ -407,7 +453,7 @@ def _grade_bets(wb, batters, starters, games, stats, bg, sg):
             c.fill = BETS_BOARD
             c.font = Font()
         won = _settle_bet(row, batters, starters, games, bat_pid, pit_pid,
-                          bg, sg)
+                          bg, sg, (day_n or {}).get(str(row.get("Game", ""))))
         stats["bets"] = stats.get("bets", 0) + 1
         if won == "push":
             stats["bets_push"] = stats.get("bets_push", 0) + 1
@@ -471,6 +517,43 @@ def grade(path):
         except (TypeError, ValueError):
             return None, None
 
+    # DH coverage guard input: how many games the workbook knows each
+    # matchup had that day — the max G# stamped on any prop/Bets row plus
+    # the Games sheet's row count per tag. G#-indexed grading (grids,
+    # Bets G# fallback) only trusts the finals ordinally when they cover
+    # ALL of a matchup's games: with game 1 suspended and game 2 final,
+    # finals[0] IS game 2, and grading a G#=1 row against it paints the
+    # wrong game's stats (the Games sheet always guarded this; the grids
+    # and the Bets fallback now share the rule).
+    day_n = {}
+
+    def _bump(tag, n):
+        if tag and n and n > day_n.get(tag, 0):
+            day_n[tag] = n
+
+    for sheet in ("Batter Props", "Pitching Props", "Bets"):
+        if sheet not in wb.sheetnames:
+            continue
+        ws_ = wb[sheet]
+        h_ = headers_of(ws_)
+        g_j, gn_j = h_.get("Game"), h_.get("G#")
+        if g_j is None or gn_j is None:
+            continue
+        for i in range(2, ws_.max_row + 1):
+            try:
+                _bump(str(ws_.cell(row=i, column=g_j).value),
+                      int(ws_.cell(row=i, column=gn_j).value))
+            except (TypeError, ValueError):
+                continue
+    if "Games" in wb.sheetnames:
+        h_ = headers_of(wb["Games"])
+        if "Game" in h_:
+            ws_ = wb["Games"]
+            for tag, n in Counter(
+                    str(ws_.cell(row=i, column=h_["Game"]).value)
+                    for i in range(2, ws_.max_row + 1)).items():
+                _bump(tag, n)
+
     if "Batter Props" in wb.sheetnames:
         ws = wb["Batter Props"]
         hidx = headers_of(ws)
@@ -478,7 +561,8 @@ def grade(path):
         for i in range(2, ws.max_row + 1):
             pid = ws.cell(row=i, column=hidx["ID"]).value
             tag, gnum = _tag_gnum(ws, hidx, i)
-            s = _row_stats(bg, batters, games, pid, tag, gnum)
+            s = _row_stats(bg, batters, games, pid, tag, gnum,
+                           day_n.get(tag))
             if s is None:
                 stats["missing_rows"] += 1
                 continue
@@ -499,7 +583,8 @@ def grade(path):
         for i in range(2, ws.max_row + 1):
             pid = ws.cell(row=i, column=hidx["ID"]).value
             tag, gnum = _tag_gnum(ws, hidx, i)
-            a = _row_stats(sg, starters, games, pid, tag, gnum)
+            a = _row_stats(sg, starters, games, pid, tag, gnum,
+                           day_n.get(tag))
             if a is None:
                 stats["missing_rows"] += 1
                 continue
@@ -524,9 +609,14 @@ def grade(path):
         # Doubleheaders: the same "AWY@HOM" tag appears once per game, in
         # start-time order, and the finals list keeps the schedule's game
         # order — so match the sheet's i-th row for a tag to the i-th
-        # final. If the finals don't yet cover every predicted game of
-        # the tag (game 2 not final at the last scrape), skip the tag's
-        # rows rather than grade two predictions against one game.
+        # final, but ONLY when the sheet predicted every game the day is
+        # known to have had AND every one of them is final (the row->
+        # final pairing is ordinal, so a missing game on EITHER side can
+        # pair a prediction with the wrong game's box). Fewer finals than
+        # rows may still resolve (a suspended game's final lands late) —
+        # counted as waiting; MORE finals than the sheet's rows can never
+        # resolve (finals never shrink) and is counted as permanently
+        # ambiguous rather than misreported as a data lag.
         need = Counter(str(ws.cell(row=i, column=hidx["Game"]).value)
                        for i in range(2, ws.max_row + 1))
         seen = Counter()
@@ -535,9 +625,17 @@ def grade(path):
             finals = games.get(tag, [])
             k = seen[tag]
             seen[tag] += 1
-            g = finals[k] if len(finals) == need[tag] else None
+            ok = len(finals) == need[tag] == max(need[tag],
+                                                 day_n.get(tag, 0))
+            g = finals[k] if ok and k < len(finals) else None
             if g is None:
-                stats["missing_rows"] += 1
+                if len(finals) > need[tag]:
+                    # the matchup played more games than this sheet
+                    # predicted — no G#/GamePk column disambiguates,
+                    # so the tag's rows are ungradeable, permanently
+                    stats["ambig_rows"] = stats.get("ambig_rows", 0) + 1
+                else:
+                    stats["missing_rows"] += 1
                 continue
             if "Winner" in hidx:
                 cell = ws.cell(row=i, column=hidx["Winner"])
@@ -568,7 +666,7 @@ def grade(path):
                     rows.append(("Games", h, float(cell.value), occ))
                 _mark(cell, occ)
 
-    _grade_bets(wb, batters, starters, games, stats, bg, sg)
+    _grade_bets(wb, batters, starters, games, stats, bg, sg, day_n)
 
     # everything above is computed either way; a failed save only means the
     # paint didn't land (file open in Excel) — the stats stay usable, so
@@ -596,15 +694,39 @@ def main():
         books = sorted(PRED_DIR.glob("[0-9]*.xlsx"))
         if not books:
             sys.exit(f"no workbooks in {PRED_DIR}")
-        days, tot, unpainted = 0, {}, []
+        # one workbook per DATE: a re-serve suffixes _2/_3 and SUPERSEDES
+        # the earlier book (same slate served again), so pooling both
+        # would count every cell and bet twice for that day. Keep the
+        # highest suffix — the same newest-per-date rule Tools/6 uses —
+        # and skip the superseded copies with a note. Only strict serve
+        # names (date / date_N) compete; a hand-named dated book is its
+        # own entry, as before.
+        newest, superseded = {}, []
+        for p in books:
+            m = re.match(r"^(\d{4}-\d{2}-\d{2})(?:_(\d+))?$", p.stem)
+            d_key = m.group(1) if m else p.stem
+            k = int(m.group(2) or 1) if m else 1
+            cur = newest.get(d_key)
+            if cur is None or k > cur[0]:
+                if cur is not None:
+                    superseded.append(cur[1])
+                newest[d_key] = (k, p)
+            else:
+                superseded.append(p)
+        books = sorted(p for _, p in newest.values())
+        days, tot, unpainted, settle_fail = 0, {}, [], []
         print("grading workbooks:")
+        for p in superseded:
+            print(f"  - {p.name}: superseded by a re-serve — skipped "
+                  f"(not double-counted)")
         for p in books:
             try:
                 d_, s, _, painted = grade(p)
             except GradeError as e:
                 print(f"  ! {p.name}: {e}")
                 continue
-            _settle_ledger(d_)
+            if not _settle_ledger(d_):
+                settle_fail.append(d_)
             days += 1
             for k, v in s.items():
                 tot[k] = tot.get(k, 0) + v
@@ -632,10 +754,20 @@ def main():
                   f"{tot.get('bets_open', 0)} unsettled)")
         if tot.get("missing_rows"):
             print(f"{tot['missing_rows']} row(s) had no final box score — "
-                  f"run  python Scrapers/scrape_gamelogs.py  and re-run")
+                  f"run  python Scrapers/scrape_gamelogs.py  and re-run "
+                  f"(a permanently postponed DH game leaves its rows here "
+                  f"for good)")
+        if tot.get("ambig_rows"):
+            print(f"{tot['ambig_rows']} Games-sheet row(s) skipped as "
+                  f"permanently ambiguous — the matchup played more games "
+                  f"than the workbook predicted (DH coverage mismatch)")
         if unpainted:
             print(f"not repainted (open in Excel): {', '.join(unpainted)} — "
                   f"still counted in the totals")
+        if settle_fail:
+            print(f"!! LEDGER SETTLE FAILED for: {', '.join(settle_fail)} — "
+                  f"see the traceback(s) above; those dates' staking rows "
+                  f"remain unsettled")
         return
 
     path = args.workbook
@@ -651,7 +783,7 @@ def main():
     if not painted:
         sys.exit(f"{path} is open in Excel (it holds the file lock) — "
                  f"close it there, then run this again.")
-    _settle_ledger(date)
+    settled = _settle_ledger(date)
     print(f"graded {path}")
     print("")
     print(f"  {date}: {s['cells']:,} cells checked, {s['hit']:,} stats "
@@ -664,6 +796,13 @@ def main():
     if s["missing_rows"]:
         print(f"  {s['missing_rows']} row(s) had no final box score yet — "
               f"run  python Scrapers/scrape_gamelogs.py  and grade again")
+    if s.get("ambig_rows"):
+        print(f"  {s['ambig_rows']} Games-sheet row(s) skipped as "
+              f"permanently ambiguous — the matchup played more games than "
+              f"the workbook predicted (DH coverage mismatch)")
+    if not settled:
+        print(f"  !! LEDGER SETTLE FAILED for {date} — see the traceback "
+              f"above; this date's staking rows remain unsettled")
 
 
 if __name__ == "__main__":

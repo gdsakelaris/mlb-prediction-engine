@@ -564,15 +564,33 @@ def postseason_backfill(outdir):
     finish(kept_b, bat_frames, b_path)
 
 
-def load_existing(path, backfill):
-    if backfill or not path.exists():
-        return None, None, set()
-    df = pd.read_csv(path, encoding="utf-8-sig", low_memory=False)
-    df["Date"] = pd.to_datetime(df["Date"]).dt.date
-    have = set(pd.to_datetime(df["Date"]).map(lambda d: d.year))
-    newest = df["Date"].max()
-    start = newest - timedelta(days=REFETCH_DAYS)
-    return df[df["Date"] < start], start, have
+def load_pair(p_path, b_path, backfill):
+    """Load BOTH daily CSVs for an incremental run with one SHARED
+    watermark. The pair is written together but can diverge — a crash
+    between the two finish() writes, or validate_and_restore restoring
+    only the failing file of the pair. Trimming each file by its OWN max
+    date while fetching from the pitcher file's watermark silently and
+    permanently dropped the lagging file's trimmed-but-never-refetched
+    days, so: the refetch start is the EARLIER of the two watermarks,
+    both files are trimmed with that same start, and a season counts as
+    stored only when present in BOTH files (a season missing from either
+    is refilled). Returns (kept_p, kept_b, start, have);
+    (None, None, None, set()) means full backfill. Shared with
+    scrape_pitches_milb, whose file pair has the same failure mode."""
+    dfs = []
+    for path in (p_path, b_path):
+        if backfill or not path.exists():
+            return None, None, None, set()
+        df = pd.read_csv(path, encoding="utf-8-sig", low_memory=False)
+        df["Date"] = pd.to_datetime(df["Date"]).dt.date
+        dfs.append(df)
+    start = (min(df["Date"].max() for df in dfs)
+             - timedelta(days=REFETCH_DAYS))
+    have = set.intersection(*(
+        set(pd.to_datetime(df["Date"]).map(lambda d: d.year))
+        for df in dfs))
+    kept_p, kept_b = (df[df["Date"] < start] for df in dfs)
+    return kept_p, kept_b, start, have
 
 
 def main():
@@ -596,9 +614,9 @@ def main():
     outdir = Path(args.outdir)
     p_path, b_path = outdir / OUT_PITCHERS, outdir / OUT_BATTERS
 
-    # the pitcher file drives incrementality; both files are written together
-    kept_p, start, have = load_existing(p_path, args.backfill)
-    kept_b, _, _ = load_existing(b_path, args.backfill)
+    # one shared watermark for the pair (see load_pair): trim == fetch
+    # start for BOTH files, so a divergent batter file can't lose days
+    kept_p, kept_b, start, have = load_pair(p_path, b_path, args.backfill)
     if start is not None:
         print(f"incremental: {len(kept_p):,} pitcher-day rows kept, "
               f"refetching from {start}", flush=True)

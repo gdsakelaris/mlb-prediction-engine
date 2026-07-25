@@ -50,19 +50,32 @@ BACKUP_DIR = DATA_DIR / "backups"
 #                   would otherwise trip the 99.9% ratio (default 0 = ratio only)
 #   season_col      seasons present before must still be present (catches a
 #                   scrape that silently dropped history)
-#   fresh_days      during the unambiguous in-season months (May-September),
-#                   max(date_col) must be within this many days of today.
-#                   This is the staleness tripwire: a scraper that "succeeds"
-#                   but stops ingesting new games (frozen season list, upstream
-#                   format change, permanent fallback to stored rows) passes
-#                   every shape check — only a freshness check makes that
-#                   loud. 6 days clears the All-Star break.
+#   fresh_days      during the in-season months, max(date_col) must be within
+#                   this many days of today. This is the staleness tripwire:
+#                   a scraper that "succeeds" but stops ingesting new games
+#                   (frozen season list, upstream format change, permanent
+#                   fallback to stored rows) passes every shape check — only
+#                   a freshness check makes that loud. 6 days clears the
+#                   All-Star break.
+#   fresh_months    (first, last) calendar months the tripwire is armed;
+#                   default (4, 11) — April through the postseason (the
+#                   engine serves October slates, so the playoffs must not
+#                   be a blind spot). From October the reference date is
+#                   clamped to the newest date in mlb_games.csv, so games
+#                   thinning out between rounds / stopping after the World
+#                   Series never false-alarms a caught-up file, while a
+#                   frozen scraper still trips against the games actually
+#                   played. MiLB files use (5, 9): the minors season ends
+#                   in late September. mlb_games.csv itself uses (4, 10)
+#                   calendar-only — it IS the reference, so it cannot be
+#                   judged against itself in November.
 SPECS = {
     "mlb_games.csv": dict(
         required_cols=["GamePk", "Season", "Date", "DayNight", "AwayTeam",
                        "HomeTeam", "AwayScore", "HomeScore", "Venue", "Temp",
                        "Condition", "WindSpeed", "WindDir", "GameType"],
         key=["GamePk"], max_dup_frac=0.0, date_col="Date", fresh_days=6,
+        fresh_months=(4, 10),                   # the freshness reference file
         numeric=[("GamePk", 0.0), ("AwayScore", 0.02), ("HomeScore", 0.02)],
         min_rows=13000, shrink_tol=0.999, season_col="Season"),
     "mlb_game_batting.csv": dict(
@@ -235,7 +248,8 @@ SPECS = {
     "mlb_il_events.csv": dict(
         required_cols=["PlayerId", "Date", "Kind", "ILDays"],
         key=["PlayerId", "Date", "Kind"], max_dup_frac=0.02,
-        date_col="Date", fresh_days=10,
+        date_col="Date", fresh_days=10, fresh_months=(5, 9),
+        # (5, 9): IL announcements all but stop once postseason rosters set
         numeric=[("PlayerId", 0.0)],
         min_rows=20000, shrink_tol=0.999),
     "mlb_il.csv": dict(
@@ -317,7 +331,7 @@ SPECS = {
                        "2B", "3B", "HR", "RBI", "BB", "SO", "HBP", "SB",
                        "CS", "TB"],
         key=["GamePk", "PlayerId"], max_dup_frac=0.001, date_col="Date",
-        fresh_days=10,
+        fresh_days=10, fresh_months=(5, 9),
         numeric=[("PlayerId", 0.0), ("PA", 0.001), ("HR", 0.001)],
         min_rows=400000, shrink_tol=0.999, season_col="Season"),
     "milb_game_pitching.csv": dict(
@@ -326,7 +340,7 @@ SPECS = {
                        "GS", "GF", "IP", "BF", "NP", "Strikes", "H", "R",
                        "ER", "HR", "BB", "SO"],
         key=["GamePk", "PlayerId"], max_dup_frac=0.001, date_col="Date",
-        fresh_days=10,
+        fresh_days=10, fresh_months=(5, 9),
         numeric=[("PlayerId", 0.0), ("BF", 0.001), ("SO", 0.001)],
         min_rows=180000, shrink_tol=0.999, season_col="Season"),
 }
@@ -341,7 +355,30 @@ for _side, _floor in (("pitchers", 30000), ("batters", 60000)):
         _mlb,
         required_cols=_mlb["required_cols"] + ["Level"],
         key=["PlayerId", "Date", "Level"],
-        min_rows=_floor, fresh_days=10)
+        min_rows=_floor, fresh_days=10, fresh_months=(5, 9))
+
+
+_GAMES_NEWEST = "unset"                 # lazy per-process cache
+
+
+def _games_newest():
+    """Newest parseable Date in mlb_games.csv, or None when the file is
+    missing/unreadable. October/November freshness reference: postseason
+    games thin out between rounds and stop entirely in early November, so
+    'fresh' there means 'keeping up with the games actually played', not
+    with the calendar. Cached lazily — the first caller is always
+    validated AFTER scrape_gamelogs has run in the morning job."""
+    global _GAMES_NEWEST
+    if _GAMES_NEWEST == "unset":
+        try:
+            d = pd.to_datetime(
+                pd.read_csv(DATA_DIR / "mlb_games.csv",
+                            encoding="utf-8-sig",
+                            usecols=["Date"])["Date"], errors="coerce")
+            _GAMES_NEWEST = None if d.isna().all() else d.max()
+        except Exception:                           # noqa: BLE001
+            _GAMES_NEWEST = None
+    return _GAMES_NEWEST
 
 
 def validate_file(path, prev_path=None, spec=None):
@@ -392,17 +429,31 @@ def validate_file(path, prev_path=None, spec=None):
             problems.append(f"{path.name}: max {dc} {d.max().date()} is in "
                             f"the future")
         else:
-            # staleness tripwire: May-September there is always MLB within
-            # fresh_days (6 clears the All-Star break); a file whose newest
-            # date lags means the scraper "succeeds" without ingesting new
-            # games (frozen season list, upstream change, permanent fallback)
+            # staleness tripwire: April-September there is always MLB
+            # within fresh_days (6 clears the All-Star break), and the
+            # postseason runs through October into early November — the
+            # engine serves those slates, so the playoffs must not be a
+            # freshness blind spot. A file whose newest date lags means
+            # the scraper "succeeds" without ingesting new games (frozen
+            # season list, upstream change, permanent fallback).
             fd = spec.get("fresh_days")
-            if fd and 5 <= date.today().month <= 9 and \
-                    d.max() < pd.Timestamp(date.today() - timedelta(days=fd)):
-                problems.append(
-                    f"{path.name}: newest {dc} is {d.max().date()} — more "
-                    f"than {fd} days old mid-season; the scraper runs but "
-                    f"ingests no new games")
+            m0, m1 = spec.get("fresh_months", (4, 11))
+            if fd and m0 <= date.today().month <= m1:
+                ref = pd.Timestamp(date.today())
+                if date.today().month >= 10 and \
+                        path.name != "mlb_games.csv":
+                    # season-aware: judge against the newest PLAYED game,
+                    # so the World Series ending never false-alarms a
+                    # caught-up file (mlb_games.csv itself stays on the
+                    # calendar — it cannot be its own reference)
+                    gref = _games_newest()
+                    ref = min(ref, gref) if gref is not None else None
+                if ref is not None and \
+                        d.max() < ref - pd.Timedelta(days=fd):
+                    problems.append(
+                        f"{path.name}: newest {dc} is {d.max().date()} — "
+                        f"more than {fd} days old mid-season; the scraper "
+                        f"runs but ingests no new games")
 
     if prev_path is not None and Path(prev_path).exists():
         try:

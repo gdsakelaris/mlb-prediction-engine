@@ -32,14 +32,15 @@ ab_compare          the paired ship test: two replay-row ledgers over
 
 Usage:
     python Model/evaluate.py --grade --start 2025-06-01 --end 2025-06-03
-    python Model/evaluate.py --fit-calibrators --start 2025-05-01 \
-        --end 2025-05-15
+    python Model/evaluate.py --fit-calibrators --start 2026-06-01 \
+        --end 2026-06-30
     python Model/evaluate.py --gate --start 2026-07-08 --end 2026-07-17
     python Model/evaluate.py --ab artifacts/rows_baseline.parquet \
         artifacts/calib_rows.parquet
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -201,10 +202,17 @@ def _emit_game_rows(rows, g, f, act, pact):
             rows.append((pk, date, "per", f"ER > {x}",
                          float(pr_[f"ER > {x}"]), int(ar.ER > x),
                          pid_, pteam, phome))
-    tot = (pd.to_numeric(g.AwayScore, errors="coerce")
-           + pd.to_numeric(g.HomeScore, errors="coerce"))
-    hw = int(pd.to_numeric(g.HomeScore, errors="coerce")
-             > pd.to_numeric(g.AwayScore, errors="coerce"))
+    aw = pd.to_numeric(g.AwayScore, errors="coerce")
+    hs = pd.to_numeric(g.HomeScore, errors="coerce")
+    if pd.isna(aw) or pd.isna(hs):
+        # missing finals VOID the game-level rows (suspended game,
+        # partial schedule scrape): int(nan > x) evaluates to 0, so
+        # grading on would write home-ML and every totals row as silent
+        # y=0 losses into the calibration/A-B row store. The batter and
+        # pitcher rows above stand — they grade off their own box rows.
+        return
+    tot = aw + hs
+    hw = int(hs > aw)
     rows.append((pk, date, "ml", "home ML",
                  float(f["game"]["_home_wp"]), hw, -1, home_ab, 1))
     for x in PR.TOTAL_LINES:
@@ -214,14 +222,10 @@ def _emit_game_rows(rows, g, f, act, pact):
     for x in PR.TEAM_TOTAL_LINES:
         rows.append((pk, date, "tt", f"Away Runs > {x}",
                      float(f["game"][f"Away Runs > {x}"]),
-                     int(pd.to_numeric(g.AwayScore,
-                                       errors="coerce") > x),
-                     -1, away_ab, 0))
+                     int(aw > x), -1, away_ab, 0))
         rows.append((pk, date, "tt", f"Home Runs > {x}",
                      float(f["game"][f"Home Runs > {x}"]),
-                     int(pd.to_numeric(g.HomeScore,
-                                       errors="coerce") > x),
-                     -1, home_ab, 1))
+                     int(hs > x), -1, home_ab, 1))
 
 
 def replay_rows_batch(start, end, n_sims=4000, chunk=64, progress=True,
@@ -321,21 +325,65 @@ def grade_replay(start, end, n_sims=4000, max_games=None):
 LINE_CAL_FAMS = ("pout",)
 
 
+def _guard_fit_window(y0, y1, force):
+    """FIT-time in-sample guard: refuse to fit output calibrators on
+    seasons the trees trained on (< manifest cal_year) or on the
+    calibration year itself (the A1/A2 VectorScalers' and hazard map's
+    fit window — a Platt fit there composes on rows that already had
+    calibrators fit on them). Either way the fitted slope reflects
+    in-sample sharpness, so live serving stays miscalibrated at the
+    levels the Bets sheet and staking EV math consume. force=True
+    (--force) fits anyway, loudly."""
+    man = ART / "manifest.json"
+    if not man.exists():
+        return
+    try:
+        cy = int(json.loads(man.read_text()).get("cal_year"))
+    except (TypeError, ValueError, OSError, json.JSONDecodeError):
+        return
+    if y0 > cy:
+        return
+    msg = (f"calibrator fit window spans {y0}..{y1} but the served "
+           f"model trains on seasons < {cy} and calibrates on {cy} "
+           f"(manifest cal_year) — fit on {cy + 1}+ replay rows only")
+    if force:
+        print(f"\n*** WARNING [fit-calibrators]: {msg}; proceeding "
+              "under --force. ***\n")
+    else:
+        sys.exit(f"fit_calibrators: {msg}, or pass --force to fit "
+                 "in-sample deliberately.")
+
+
 def fit_calibrators(start, end, n_sims=4000, min_n=500,
-                    max_games=None, reuse_rows=False, batched=False):
+                    max_games=None, reuse_rows=False, batched=False,
+                    force=False):
     """One shared Platt map (logit-space logistic) per family; identity
     (absent) below min_n, on a single-class sample, or on a
     non-positive slope. Families in LINE_CAL_FAMS additionally get one
     Platt map per LINE (stored under "_lines" keyed by market string;
     the line map wins at apply time, the family map is the fallback).
     Replay rows are cached to artifacts/calib_rows.parquet so a refit
-    after a calibration-code change can skip the replay
-    (--reuse-rows)."""
+    after a calibration-code change can skip the replay (--reuse-rows).
+    Refuses to fit on the model's own training/calibration seasons
+    unless force=True (_guard_fit_window)."""
     cache = ART / "calib_rows.parquet"
     if reuse_rows and cache.exists():
         df = pd.read_parquet(cache)
         print(f"reusing {len(df):,} cached replay rows ({cache.name})")
+        cs, ce = str(df.Date.min()), str(df.Date.max())
+        if (start and cs < str(start)) or (end and ce > str(end)):
+            # the fit ALWAYS spans the whole cache on this path — a
+            # requested subrange would otherwise be swallowed silently
+            # and _meta/gate-auto would key off a window the operator
+            # never chose
+            print(f"\n*** WARNING [fit-calibrators]: --reuse-rows fits "
+                  f"on the WHOLE cached range {cs}..{ce}, not the "
+                  f"requested {start or cs}..{end or ce} — replay "
+                  "without --reuse-rows for a window-exact fit. ***\n")
+        _guard_fit_window(int(cs[:4]), int(ce[:4]), force)
     else:
+        _guard_fit_window(pd.Timestamp(start).year,
+                          pd.Timestamp(end).year, force)
         df = (replay_rows_batch(start, end, n_sims, max_games=max_games)
               if batched else
               replay_rows(start, end, n_sims, max_games))
@@ -464,6 +512,16 @@ def skill_ledger(start=None, end=None):
         c = cal.get(fam)
         if c is not None:
             mask = df["family"] == fam
+            df.loc[mask, "p_cal"] = np.clip(
+                c.predict(df.loc[mask, "p"].values), 1e-6, 1 - 1e-6)
+    # per-line maps override the family map wherever one is fitted —
+    # the serve path (predict._cal) prefers the line map for families
+    # in LINE_CAL_FAMS, so the ledger must grade the SERVED calibration
+    # (the family-only view re-showed exactly the rungs the line maps
+    # were shipped to fix). Applied to RAW p, never composed.
+    for mkt, c in (cal.get("_lines") or {}).items():
+        mask = df["market"] == mkt
+        if mask.any():
             df.loc[mask, "p_cal"] = np.clip(
                 c.predict(df.loc[mask, "p"].values), 1e-6, 1 - 1e-6)
 
@@ -742,18 +800,36 @@ def _odds_y(gb, gp, games_df, pk, pid, market, line):
     return SK.outcome_y(gb, gp, games_df, pk, pid, market, line)
 
 
+def _gate_head_adj(res, fam, line, p, hf, pid=-1):
+    """Route one calibrated gate probability through the family
+    residual head exactly as the served Bets path does — a thin
+    delegate into predict._head_adjust_one, the single source of the
+    head math (see build_bets.head_adj). The gate grades the SERVED
+    number: calibrators + heads, never the display market blend."""
+    if not res.get("heads") or res.get("hctx") is None or p is None:
+        return p
+    meta = res["meta"]
+    return PR._head_adjust_one(res["heads"], fam, res["hctx"],
+                               res.get("hdef") or {}, meta["season"],
+                               meta["away"], meta["home"], hf, line, p,
+                               thr=res.get("thr"), pid=pid)
+
+
 def _gate_fingerprint(n_sims):
     """Cache key part that invalidates on any serving-stack change.
     Model artifacts are fingerprinted DIRECTLY (not just via
     manifest.json) so standalone refits — e.g. a bare fit_sb that
     bypasses the manifest — still invalidate the cache."""
     import os
-    # "sem1": grading-semantics version — bumped when the gate's store
-    # grouping, y settlement, or row schema changes, so cached rows
-    # graded under old semantics re-sim ONCE. sem1 (2026-07-23) covers
-    # the whole batch: per-GamePk groups, pushes void in _odds_y,
-    # by_bat/by_pit role split, and the Shin diagnostic columns.
-    parts = [f"s{n_sims}", "sem1"]
+    # "sem2": grading-semantics version — bumped when the gate's store
+    # grouping, y settlement, p_model semantics, or row schema changes,
+    # so cached rows graded under old semantics re-sim ONCE.
+    # sem1 (2026-07-23) covered per-GamePk groups, pushes void in
+    # _odds_y, the by_bat/by_pit role split, and the Shin diagnostic
+    # columns. sem2 (2026-07-25): p_model is the SERVED probability
+    # (residual heads + _tail_prob sparse-tail shrink + cross-line
+    # ladder clamp) and the inline team_totals push-void fix.
+    parts = [f"s{n_sims}", "sem2"]
     for f_ in ("manifest.json", "output_calibrators.joblib",
                "residual_heads.joblib", "latent.json",
                "a1_model.joblib", "a2_model.joblib",
@@ -771,9 +847,14 @@ GATE_CACHE_COLS = ["key", "family", "Date", "y", "p_model", "p_close",
 def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
                 alpha=0.05):
     """Sample-based market-viability gate vs the captured odds store.
-    Slates are re-simmed only when the serving stack or that date's
-    captured odds changed since the last run (gate_rows_cache.parquet);
-    unchanged slates load their graded rows from the cache."""
+    p_model is the SERVED probability — family/line calibrators, the
+    _tail_prob sparse-tail shrink on player-prop ladders, the residual
+    heads, and the cross-line non-increasing clamp, exactly as the
+    Bets/staking path prices it (the display market blend is excluded
+    by contract: the gate stays market-free). Slates are re-simmed only
+    when the serving stack or that date's captured odds changed since
+    the last run (gate_rows_cache.parquet); unchanged slates load their
+    graded rows from the cache."""
     P = PR.Predictor()
     P.mkt_blend = False   # gate grades the PURE model vs the market
     _warn_calib_overlap(P.calib, start, end, "CLV gate")
@@ -810,7 +891,8 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
             rows.extend(hit[GATE_CACHE_COLS[1:]].to_dict("records"))
             print(f"  {date}: {len(hit)} rows from cache", flush=True)
             continue
-        day_list = []
+        day_pend = []      # every priced row pre-clamp (voids included)
+        ladders = {}       # ladder key -> [(line, day_pend idx)]
         # replay the slate once; map players/games to sim results. Each
         # ident keeps a LIST of (pk, ...) hits so a doubleheader's two
         # replayed games both stay addressable. Batter slots (rows 0-17)
@@ -909,6 +991,7 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
                 line = float(line_s)
             except (TypeError, ValueError):
                 line = np.nan
+            lad_key = None
             if market == "team_totals":
                 if not np.isfinite(line):
                     continue
@@ -918,13 +1001,23 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
                 pk, res, side = hit
                 p_model = PR._cal(res.get("calib"), "tt", float(
                     (res["score"][:, side] > line).mean()))
+                # served tt numbers are head-adjusted per side (see
+                # predict._apply_heads: hf is the away/home flag)
+                p_model = _gate_head_adj(res, "tt", line, p_model, side)
+                lad_key = ("tt", str(grp.Team.iloc[0]), gpk)
                 grow = games[games.GamePk == pk]
                 if grow.empty:
                     continue
                 sc_ = pd.to_numeric(
                     grow.iloc[0].HomeScore if side
                     else grow.iloc[0].AwayScore, errors="coerce")
-                y = None if pd.isna(sc_) else int(sc_ > line)
+                # push (score exactly on an integer line) is VOID, the
+                # same settlement staking.outcome_y applies — the sem1
+                # batch fixed h2h/totals/props via _odds_y but this
+                # inline branch kept grading pushes as losses (sem2
+                # re-grades the cached rows)
+                y = (None if (pd.isna(sc_) or sc_ == line)
+                     else int(sc_ > line))
             elif market in ("h2h", "totals"):
                 team = grp.Team.iloc[0]
                 hit = _resolve(by_home.get(team), gpk)
@@ -932,16 +1025,24 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
                     continue
                 pk, res = hit
                 if market == "h2h":
+                    # no head for "ml" by design (predict._apply_heads)
                     p_model = PR._cal(res.get("calib"), "ml", float(
                         (res["score"][:, 1] > res["score"][:, 0]).mean()))
                 else:
+                    if not np.isfinite(line):
+                        continue
                     p_model = PR._cal(res.get("calib"), "tot", float(
                         (res["score"].sum(axis=1) > line).mean()))
+                    p_model = _gate_head_adj(res, "tot", line,
+                                             p_model, 1)
+                    lad_key = ("tot", str(team), gpk)
                 y = _odds_y(gb, gp, games, pk, None, market, line)
             else:
                 try:
                     pid = int(float(pid_s))
                 except (TypeError, ValueError):
+                    continue
+                if not np.isfinite(line):
                     continue
                 role = (by_pit if market.startswith("pitcher")
                         else by_bat)
@@ -963,24 +1064,60 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
                     if col is None:
                         continue
                     counts = t[:, row_i, s[col]]
+                # SERVED prop probability: the same _tail_prob shrink
+                # the sheets/Bets apply (the raw empirical mean is a
+                # hard 0 on sparse tails at gate sims), then the
+                # calibrator, then the residual head
                 p_model = PR._cal(res.get("calib"), fam,
-                                  float((counts > line).mean()),
+                                  PR._tail_prob(counts, line),
                                   market=PR._line_market(market, line))
+                hf = 0 if (row_i < 9 or row_i == 18) else 1
+                p_model = _gate_head_adj(res, fam, line, p_model, hf,
+                                         pid)
+                lad_key = (market, pid, gpk)
                 y = _odds_y(gb, gp, games, pk, pid, market, line)
-            if y is None:
-                continue
-            day_list.append(dict(family=fam, Date=date, y=y,
+            idx = len(day_pend)
+            day_pend.append(dict(family=fam, Date=date, y=y,
                                  p_model=p_model, p_close=fair,
                                  p_open=fair_open, p_shin=fair_shin,
                                  one_cap=one_cap, gap_min=gap_min))
+            if lad_key is not None:
+                ladders.setdefault(lad_key, []).append((line, idx))
+        # cross-line coherence: the served ladders are clamped
+        # non-increasing in the line AFTER head adjustment
+        # (predict._apply_heads / build_bets); the clamp runs before
+        # voids drop out, so a pushed line still constrains its
+        # neighbors exactly as it did at serve
+        for lad in ladders.values():
+            lad.sort(key=lambda li: li[0])
+            lo = None
+            for _line, idx in lad:
+                pv = day_pend[idx]["p_model"]
+                if lo is not None and pv > lo:
+                    pv = lo
+                    day_pend[idx]["p_model"] = pv
+                lo = pv
+        day_list = [r for r in day_pend if r["y"] is not None]
         rows.extend(day_list)
         if day_list:
             new_frames.append(
                 pd.DataFrame(day_list).assign(key=key))
 
-    # persist: rows for the current fingerprint only (a stack change
-    # invalidates everything), atomically
-    keep = cache[cache.key.isin(seen_keys)] if len(cache) else cache
+    # persist: MERGE, never truncate — this run re-validates only its
+    # own date range, so cached rows for OTHER dates are kept when they
+    # were graded under the current fingerprint (a one-week backfill
+    # must not discard a month of graded slates). In-range keys not
+    # re-seen are stale (that date's odds changed), and rows from an
+    # old fingerprint can never match a future key, so both drop.
+    if len(cache):
+        kdate = cache.key.str.split("|", n=1).str[0]
+        s0 = str(pd.Timestamp(start).date())
+        s1 = str(pd.Timestamp(end).date())
+        outside = (kdate < s0) | (kdate > s1)
+        cur_fp = cache.key.str.contains(f"|{fp}|", regex=False)
+        keep = cache[cache.key.isin(seen_keys) | (outside & cur_fp)]
+    else:
+        keep = cache
     # empty frames are excluded before concat (their all-NA columns
     # would poison result dtypes; pandas deprecation FutureWarning)
     _frames = [f for f in [keep] + new_frames if len(f)]
@@ -1109,6 +1246,10 @@ if __name__ == "__main__":
     ap.add_argument("--reuse-rows", action="store_true",
                     help="refit from artifacts/calib_rows.parquet "
                          "instead of replaying")
+    ap.add_argument("--force", action="store_true",
+                    help="--fit-calibrators only: fit on the model's "
+                         "own training/calibration seasons anyway "
+                         "(overrides the in-sample guard, loudly)")
     ap.add_argument("--batched", action="store_true",
                     help="batched replay path (sim_batch prepare_games "
                          "+ run_batch on CUDA)")
@@ -1129,7 +1270,8 @@ if __name__ == "__main__":
     elif args.fitcal:
         fit_calibrators(args.start, args.end, n_sims=args.sims,
                         max_games=args.max_games,
-                        reuse_rows=args.reuse_rows, batched=args.batched)
+                        reuse_rows=args.reuse_rows, batched=args.batched,
+                        force=args.force)
     elif args.gate:
         market_gate(args.start, args.end, n_sims=args.sims,
                     min_n=args.min_n)

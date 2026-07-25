@@ -1,8 +1,9 @@
 """Scrape Statcast batted-ball data (every ball in play) from Baseball Savant.
 
 The HR log covers only home runs — a sample censored to each batter's best
-contact. This pulls EVERY tracked ball in play (2015 on) from the public
-statcast_search CSV endpoint (the same service behind
+contact. This pulls EVERY tracked ball in play (2015 on, regular season +
+postseason — one engine, postseason rows are ordinary evidence) from the
+public statcast_search CSV endpoint (the same service behind
 baseballsavant.mlb.com/statcast_search): exit velocity, launch angle, barrel
 classification, expected stats on contact (xBA/xwOBA), batted-ball type, and
 hit distance, one row per batted ball.
@@ -22,10 +23,12 @@ seasons are reused, and only dates after the newest stored row (minus a
 2-day refetch window for Statcast's own corrections) plus any season missing
 from the file are downloaded. Seconds in the daily job. --backfill ignores
 the cache and rescrapes all seasons (~10 minutes, ~730k rows); only needed
-when the file itself is suspect.
+when the file itself is suspect. --postseason-backfill is the one-time
+repair for seasons stored before this scraper fetched postseason rounds.
 
 Usage:
     python scrape_statcast.py [-o output.csv] [--backfill]
+                              [--postseason-backfill]
 """
 
 import argparse
@@ -80,15 +83,20 @@ CAP_ROWS = 24000       # a chunk this big was probably truncated -> split it
 SLEEP = 2.0            # politeness between requests
 REFETCH_DAYS = 2       # re-pull the newest days: Savant back-corrects data
 
+# postseason rows are ordinary evidence (one engine, no October fork) —
+# same game-type universe as scrape_pitches / the gamelogs
+GT_ALL = "R|F|D|L|W|"        # regular + the four postseason rounds
+GT_POST = "F|D|L|W|"         # postseason only (targeted backfill)
 
-def fetch_range(d0, d1, tries=3):
-    """One CSV request for batted balls in [d0, d1] (regular season only).
+
+def fetch_range(d0, d1, tries=3, gt=GT_ALL):
+    """One CSV request for batted balls in [d0, d1] (regular + postseason).
     Returns a raw Savant DataFrame; recursively splits ranges that hit the
     result cap so nothing is silently truncated."""
     params = {
         "all": "true", "type": "details", "player_type": "batter",
         "hfBBT": "fly_ball|ground_ball|line_drive|popup|",
-        "hfGT": "R|", "minors": "false",
+        "hfGT": gt, "minors": "false",
         "game_date_gt": str(d0), "game_date_lt": str(d1),
     }
     for attempt in range(tries):
@@ -109,9 +117,9 @@ def fetch_range(d0, d1, tries=3):
         print(f"    {d0}..{d1}: {len(df):,} rows (cap?) -> splitting",
               flush=True)
         time.sleep(SLEEP)
-        left = fetch_range(d0, mid)
+        left = fetch_range(d0, mid, gt=gt)
         time.sleep(SLEEP)
-        right = fetch_range(mid + timedelta(days=1), d1)
+        right = fetch_range(mid + timedelta(days=1), d1, gt=gt)
         return pd.concat([left, right], ignore_index=True)
     return df
 
@@ -145,14 +153,60 @@ def season_windows(year, start=None):
     return windows
 
 
+def postseason_backfill(out_path):
+    """One-time targeted pull of postseason batted balls (hfGT F|D|L|W)
+    for every season, merged into the output CSV (mirrors
+    scrape_pitches.postseason_backfill). The incremental daily run now
+    fetches all game types, but seasons already stored were scraped
+    regular-season only and are never re-downloaded — this fills their
+    October/November rows. Regular-season rows are untouched; safe to
+    re-run."""
+    existing = None
+    if out_path.exists():
+        existing = pd.read_csv(out_path, encoding="utf-8-sig",
+                               low_memory=False)
+        existing["Date"] = pd.to_datetime(existing["Date"]).dt.date
+    frames = []
+    for year in YEARS:
+        got = 0
+        d0 = date(year, 9, 20)
+        end = min(date(year, 11, 30), date.today())
+        while d0 <= end:
+            d1 = min(d0 + timedelta(days=CHUNK_DAYS - 1), end)
+            df = to_schema(fetch_range(d0, d1, gt=GT_POST))
+            got += len(df)
+            if len(df):
+                frames.append(df)
+            time.sleep(SLEEP)
+            d0 = d1 + timedelta(days=1)
+        print(f"{year}: {got:,} postseason batted balls", flush=True)
+    new = pd.concat(frames, ignore_index=True) if frames else \
+        pd.DataFrame(columns=list(COLUMNS))
+    if existing is not None:
+        new = pd.concat([existing, new], ignore_index=True)
+    new = (new.drop_duplicates(KEY, keep="last")
+           .sort_values(["Date", "GamePk", "AtBat", "PitchNum"]))
+    out_path.parent.mkdir(exist_ok=True)
+    with atomic_write(out_path, "w", newline="", encoding="utf-8-sig") as f:
+        new.to_csv(f, index=False)
+    print(f"wrote {len(new):,} rows -> {out_path}", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("-o", "--output", default=str(DEFAULT_OUT))
     ap.add_argument("--backfill", action="store_true",
                     help="rescrape all seasons from scratch (default run is "
                          "incremental from the newest stored date)")
+    ap.add_argument("--postseason-backfill", action="store_true",
+                    dest="post_backfill",
+                    help="one-time pull of postseason batted balls for every "
+                         "season already stored; safe to re-run")
     args = ap.parse_args()
     out_path = Path(args.output)
+    if args.post_backfill:
+        postseason_backfill(out_path)
+        return
 
     # The output CSV is the cache: stored rows are reused, so the default
     # run only refetches (a) the newest REFETCH_DAYS (Savant back-corrects

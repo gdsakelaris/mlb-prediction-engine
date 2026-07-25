@@ -6,7 +6,7 @@ Models fitted (artifacts in Model/artifacts/):
                       year. Feature list and class order ride along.
   a2_model.joblib     4-class batted-ball type given in-play, same X.
   hazard_model.joblib starter-removal hazard per batter faced (binary
-                      XGBoost + isotonic calibration).
+                      XGBoost + Platt calibration).
   sb_models.joblib    steal-of-2B attempt and success logistic models
                       (with imputation pipelines).
   latent.json         game-level latent-variance sigmas (fit by
@@ -38,7 +38,6 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.impute import SimpleImputer
-from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss
 from sklearn.pipeline import Pipeline
@@ -472,14 +471,25 @@ def fit_hazard(cal_year):
     mdl = make_clf(max_iter=250, eval_metric="logloss")
     _fit_es(mdl, Xh[tr.values], yh[tr.values])
     p_ca = mdl.predict_proba(Xh[ca.values])[:, 1]
-    iso = IsotonicRegression(out_of_bounds="clip").fit(p_ca, yh[ca.values])
-    ll = log_loss(yh[ca.values], np.clip(iso.predict(p_ca), 1e-6, 1 - 1e-6))
+    # Platt calibration (isotonic is banned project-wide: its flat tail
+    # segments emit hard 0/1 wherever a cal-year segment is pure, and
+    # the serve twins consume this grid UNCLIPPED — a 0.0 cell makes
+    # starter removal impossible in every sim, a 1.0 makes it certain).
+    # The dict key stays "iso" so hz["iso"].predict(...) in
+    # predict._hazard_grid / sim_batch._hazard_grids is untouched.
+    pc = np.clip(p_ca, 1e-6, 1 - 1e-6)
+    z = (np.log(pc) - np.log1p(-pc)).reshape(-1, 1)
+    lr = LogisticRegression(C=1e6, max_iter=1000).fit(z, yh[ca.values])
+    a, b = float(lr.intercept_[0]), float(lr.coef_[0][0])
+    cal = F.PlattCal(a, b) if b > 0 else F.PlattCal(0.0, 1.0)
+    ll = log_loss(yh[ca.values], cal.predict(p_ca))
     base = log_loss(yh[ca.values],
                     np.full(ca.sum(), yh[tr.values].mean()))
     _kv("logloss (calibrated)", f"{ll:.5f}")
+    _kv("platt (a, b)", f"({a:+.3f}, {b:.3f})")
     _kv("baseline: constant rate", f"{base:.5f}   (model gain "
         f"{base - ll:+.5f})")
-    return dict(model=mdl, iso=iso, features=HAZ_FEATS,
+    return dict(model=mdl, iso=cal, features=HAZ_FEATS,
                 cal_year=cal_year, metrics=dict(logloss=ll, base=base))
 
 
@@ -505,7 +515,12 @@ def fit_sb(cal_year):
     if "post" not in sb.columns:           # pre-rebuild sb_table
         sb["post"] = 0
     sb["post"] = sb["post"].astype(float)
-    tr = sb["Season"] <= cal_year          # small models: use through cal
+    # cal year held OUT (was `<=` "small models: use through cal"): the
+    # cal-year replay windows — A/B ledgers, calibrator fits, skill
+    # ledger, prop benchmarks — all grade the SB market, so training
+    # through the cal year made every such evaluation partially
+    # in-sample and flattered the model-vs-market SB deltas.
+    tr = sb["Season"] < cal_year
     pipe = lambda feats: Pipeline([        # noqa: E731
         ("imp", SimpleImputer(strategy="median")),
         ("sc", StandardScaler()),

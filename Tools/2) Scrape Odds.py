@@ -54,6 +54,7 @@ import datetime as dt
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -336,12 +337,38 @@ def _game_row(date, gamepk, team, market, line, over, under, book, captured):
             "CapturedAt": captured}
 
 
-def fetch(url, params):
-    r = requests.get(url, params=params, timeout=30)
-    if r.status_code != 200:
-        raise RuntimeError(f"{r.status_code} {r.text[:200]}")
-    remain = r.headers.get("x-requests-remaining")
-    return r.json(), remain
+def fetch(url, params, tries=3):
+    """GET with bounded retry (3 attempts, exponential backoff). Every
+    other scraper in the pipeline retries, and those sources can all be
+    re-scraped — this one captures the one file that CANNOT (a pregame
+    line is gone once the game starts), so a transient 5xx/timeout must
+    not cost a game's only capture. A 4xx is a permanent request problem
+    (bad market key, quota) and raises immediately — the 422 fallback in
+    main() depends on seeing it without burned retries."""
+    last = None
+    for i in range(tries):
+        if i:
+            time.sleep(2 ** i)                  # 2s, 4s between attempts
+        try:
+            r = requests.get(url, params=params, timeout=30)
+        except requests.RequestException as e:
+            last = e
+            continue
+        if r.status_code == 200:
+            remain = r.headers.get("x-requests-remaining")
+            return r.json(), remain
+        last = RuntimeError(f"{r.status_code} {r.text[:200]}")
+        if 400 <= r.status_code < 500:
+            break                               # permanent: don't retry
+    raise last
+
+
+def _two_sided(row):
+    """True when a capture carries BOTH prices (over AND under; for h2h,
+    home AND away). One-sided rows are real captures but can't be
+    de-vigged, so they must never displace a stored two-sided close."""
+    return (row.get("OverPrice") not in (None, "") and
+            row.get("UnderPrice") not in (None, ""))
 
 
 def write_store(rows, out):
@@ -352,7 +379,12 @@ def write_store(rows, out):
     so a morning run pins the open, a rerun near first pitch tightens the
     close, and the price move between them stays measurable forever.
     Rows written before the Open columns existed backfill their open from
-    the one capture they hold.
+    the one capture they hold. Two invariants protect the history: a side
+    blank at open STAYS blank (it was genuinely unposted — backfilling it
+    from the row's latest price would pass a close off as the open), and
+    a later ONE-sided capture never replaces a stored TWO-sided close
+    (books pull a side near lock; the last de-viggable price is the close
+    worth keeping).
 
     GamePk joined the key 2026-07-23 so a doubleheader's two games stop
     overwriting each other (before that, game 2's recapture destroyed
@@ -392,16 +424,31 @@ def write_store(rows, out):
                row.get("Market"), line_k, row.get("Book"),
                str(row.get("GamePk") or "").strip())
         close_ts = str(row.get("CapturedAt") or "")
-        open_ = (str(row.get("OpenCapturedAt") or close_ts),
-                 row.get("OpenOverPrice") or row.get("OverPrice"),
-                 row.get("OpenUnderPrice") or row.get("UnderPrice"))
+        if str(row.get("OpenCapturedAt") or ""):
+            # stored row with a real open on record: take the Open
+            # columns AS IS — a side blank at open stays blank
+            # (genuinely uncaptured). Backfilling from OverPrice/
+            # UnderPrice (the row's LATEST capture) would fabricate an
+            # open out of a close the first time a one-sided open turns
+            # two-sided, erasing that side's open->close move forever.
+            open_ = (str(row["OpenCapturedAt"]),
+                     row.get("OpenOverPrice"), row.get("OpenUnderPrice"))
+        else:
+            # new capture this run, or a legacy pre-Open-column row: the
+            # one capture it holds is both its open and its close
+            open_ = (close_ts, row.get("OverPrice"), row.get("UnderPrice"))
         prev = best.get(key)
         if prev is None:
             best[key] = [open_, (close_ts, row)]
             continue
         if open_[0] < prev[0][0]:
             prev[0] = open_
-        if close_ts >= prev[1][0]:
+        # newest capture wins the close — unless it is ONE-sided and
+        # would blank a stored TWO-sided close (books pull a side near
+        # lock; sharp_fair can't de-vig a half-pair, so the last
+        # two-sided price is the close the CLV grade needs)
+        if close_ts >= prev[1][0] and (_two_sided(row)
+                                       or not _two_sided(prev[1][1])):
             prev[1] = (close_ts, row)
 
     # GamePk-key transition: fold a legacy blank-pk entry into its pk'd

@@ -12,8 +12,11 @@ and logs how the top of the sort did against the box scores:
   scope              "all" rows, and "confirmed" = rows from games
                      whose BOTH lineups were confirmed at serve time
                      (away/home_lineup_src == "mlb" in the slate
-                     archive; regen slates carry actual lineups and
-                     count as confirmed)
+                     archive IN EFFECT at the serve — the newest one
+                     at/before the as_served snapshot's mtime, not the
+                     day's last archive, which post-serve rescrapes
+                     keep rewriting; regen slates carry actual lineups
+                     and count as confirmed)
 
 Appends/upserts one row per (Date, market, scope) into
 Model/artifacts/served_goal_tracker.csv (atomic write; re-runs replace
@@ -27,6 +30,7 @@ Usage:
     python "Tools/6) Goal Tracker.py" --all    # backfill every date
 """
 import argparse
+import datetime as dt
 import importlib
 import json
 import math
@@ -69,16 +73,38 @@ def newest_books():
     return {d: p for d, (k, p) in best.items()}
 
 
-def confirmed_tags(date):
+def confirmed_tags(date, book=None):
     """Game tags ('AWY@HOM') whose both lineups were confirmed at serve
-    time, from the slate archive. Regen slates (reconstructed actual
+    time, from the slate archive that was ACTUALLY served: the newest
+    archive scraped at or before the workbook's serve moment. The serve
+    moment is the pristine Predictions/as_served copy's mtime (the book
+    in Predictions/ is re-saved by every grade, so its own mtime drifts;
+    it is only the fallback). The LAST archive of the day is wrong on
+    both sides — lineup provenance keeps upgrading (or flapping) in
+    post-serve rescrapes, so a fallback-lineup serve could count as
+    confirmed and vice versa. Regen slates (reconstructed actual
     lineups) count whole-slate confirmed. None = no slate found."""
     regen = SLATE_DIR / f"slate_{date}_regen.json"
     cands = ([regen] if regen.exists()
              else sorted(SLATE_DIR.glob(f"slate_{date}_*.json")))
     if not cands:
         return None
-    slate = json.loads(cands[-1].read_text(encoding="utf-8"))
+    pick = cands[-1]
+    if book is not None and not regen.exists():
+        served = PRED_DIR / "as_served" / Path(book).name
+        ref = served if served.exists() else Path(book)
+        try:
+            stamp = dt.datetime.fromtimestamp(
+                ref.stat().st_mtime).strftime("%Y-%m-%d_%H%M%S")
+            # archive stems are slate_<date>_<HHMMSS> in scrape order —
+            # the newest one at/before the serve is what was served
+            pre = [c for c in cands
+                   if c.stem.replace("slate_", "") <= stamp]
+            if pre:
+                pick = pre[-1]
+        except OSError:
+            pass                       # unreadable mtime: keep the last
+    slate = json.loads(pick.read_text(encoding="utf-8"))
     games = slate["games"] if isinstance(slate, dict) else slate
     return {f'{g["away_team"]}@{g["home_team"]}' for g in games
             if g.get("away_lineup_src", "mlb") == "mlb"
@@ -114,9 +140,25 @@ def track_date(date, book):
     if not games:
         print(f"  - {date}: no finals yet, skipped")
         return []
-    conf = confirmed_tags(date)
+    conf = confirmed_tags(date, book)
     wb = openpyxl.load_workbook(book, read_only=True, data_only=True)
     out = []
+    # DH coverage guard input (mirrors Tools/4 grade()): how many games
+    # each matchup had today, pooled across ALL sheets — a sheet missing
+    # its game-2 rows must not understate the day for its own rows
+    day_n_wb = {}
+    for sheet in ("Batter Props", "Pitching Props"):
+        if sheet not in wb.sheetnames:
+            continue
+        it = wb[sheet].iter_rows(values_only=True)
+        hdr = [str(c) for c in next(it)]
+        idx = {c: j for j, c in enumerate(hdr)}
+        if "Game" not in idx or "G#" not in idx:
+            continue
+        for r in it:
+            tag, gnum = r[idx["Game"]], r[idx["G#"]]
+            if tag is not None and isinstance(gnum, (int, float)):
+                day_n_wb[tag] = max(day_n_wb.get(tag, 0), int(gnum))
     for sheet, per_game, day_dict in (
             ("Batter Props", bg, batters), ("Pitching Props", sg, starters)):
         if sheet not in wb.sheetnames:
@@ -136,13 +178,20 @@ def track_date(date, book):
                 if m:
                     markets[c] = ("line", (G4.LINE_STAT[m.group(1)],
                                            float(m.group(2))))
-        rowdata, nofinal = [], 0
+        raw = []
         for r in it:
             tag = r[idx["Game"]] if "Game" in idx else None
             gnum = r[idx["G#"]] if "G#" in idx else None
             gnum = int(gnum) if isinstance(gnum, (int, float)) else None
+            raw.append((tag, gnum, r))
+        # DH coverage guard: the workbook-pooled map built above —
+        # _row_stats only trusts the G#-ordinal final lookup when the
+        # finals cover every game the DAY had, not just this sheet
+        day_n = day_n_wb
+        rowdata, nofinal = [], 0
+        for tag, gnum, r in raw:
             s = G4._row_stats(per_game, day_dict, games,
-                              r[idx["ID"]], tag, gnum)
+                              r[idx["ID"]], tag, gnum, day_n.get(tag))
             if s is None:
                 nofinal += 1
                 continue
