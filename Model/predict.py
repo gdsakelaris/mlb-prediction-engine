@@ -1835,10 +1835,18 @@ def game_frame(res):
                      int(meta["season"]), bat_rows, pit_rows, grow,
                      away, home, thr=res.get("thr"))
     bn = 0
+    pure = None
     if res.get("mktfair"):
+        # pre-blend snapshot: once _blend_market runs, the pure model
+        # probabilities are gone from the workbook — the sidecar
+        # (write_pure_sidecar) is their only record, and the per-prop
+        # model-vs-market evidence series reads it
+        pure = dict(bat=[dict(r) for r in bat_rows],
+                    pit=[dict(r) for r in pit_rows], game=dict(grow))
         bn = _blend_market(res["mktfair"], spec, bat_rows, pit_rows,
                            grow, away, home)
-    return dict(bat=bat_rows, pit=pit_rows, game=grow, blend_n=bn)
+    return dict(bat=bat_rows, pit=pit_rows, game=grow, blend_n=bn,
+                pure=pure)
 
 
 GAME_COLS = (["Game", "Date", "Venue", "Winner", "Win Prob",
@@ -2210,6 +2218,51 @@ def _status_sheet(wb, degraded, date):
     wb.active = wb.sheetnames.index("!! STATUS")
 
 
+# sidecar identity columns per sheet (everything else numeric is a
+# served value worth archiving; these are join keys, not measurements)
+_PURE_ID_KEYS = {"ID", "G#", "Slot", "Career G"}
+
+
+def write_pure_sidecar(frames, xlsx_path):
+    """Archive the PURE-MODEL probabilities behind a blended workbook.
+
+    Since the 2026-07-22 market blend, display-sheet cells are 50/50
+    model/market — the pure numbers exist only in memory at serve time.
+    This dumps them (long format: sheet, Game, Team, G#, Name, ID, col,
+    p) to Predictions/pure/<workbook stem>.csv so the per-prop
+    model-vs-market benchmark keeps accumulating evidence after the
+    blend ship. A frame without a `pure` snapshot (blend off or no
+    prices captured) contributes its live rows — those ARE pure.
+    Atomic write; returns the sidecar Path."""
+    import csv
+    import tempfile
+    recs = []
+    for f in frames:
+        src = f.get("pure") or f
+        for sheet, rows in (("bat", src["bat"]), ("pit", src["pit"]),
+                            ("game", [src["game"]])):
+            for r in rows:
+                for col, v in r.items():
+                    if (isinstance(v, (int, float)) and not
+                            isinstance(v, bool) and col not in
+                            _PURE_ID_KEYS):
+                        recs.append((sheet, r.get("Game", ""),
+                                     r.get("Team", ""), r.get("G#", ""),
+                                     r.get("Name", ""), r.get("ID", ""),
+                                     col, float(v)))
+    out_dir = Path(xlsx_path).parent / "pure"
+    out_dir.mkdir(exist_ok=True)
+    dest = out_dir / f"{Path(xlsx_path).stem}.csv"
+    fd, tmp = tempfile.mkstemp(dir=out_dir, suffix=".tmp")
+    with os.fdopen(fd, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["sheet", "Game", "Team", "G#", "Name", "ID",
+                    "col", "p"])
+        w.writerows(recs)
+    os.replace(tmp, dest)
+    return dest
+
+
 def save_excel_slate(specs, out, path=None, ledger=True):
     """Aggregate sim results into the workbook (Batter Props, Pitching
     Props, Games, Bets). `out` is predict_slate()'s list."""
@@ -2344,6 +2397,16 @@ def save_excel_slate(specs, out, path=None, ledger=True):
     served = PRED_DIR / "as_served"
     served.mkdir(exist_ok=True)
     shutil.copy2(path, served / Path(path).name)
+    # pure-model sidecar: real serves only (same rule as the ledger —
+    # smoke serves must not pollute the evidence series), and never
+    # allowed to block a serve
+    if ledger:
+        try:
+            sc = write_pure_sidecar(frames, path)
+            print(f"  pure-model sidecar: {sc}", flush=True)
+        except Exception as e:              # noqa: BLE001
+            print(f"pure sidecar unavailable ({e}); serve continues",
+                  file=sys.stderr, flush=True)
     return str(path)
 
 

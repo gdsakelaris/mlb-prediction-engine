@@ -9,6 +9,7 @@ Data/*
 __pycache__/
 *.pyc
 .pytest_cache/
+.ruff_cache/
 
 # Run outputs
 .task_lock*/
