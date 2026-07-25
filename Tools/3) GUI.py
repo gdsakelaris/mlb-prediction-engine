@@ -14,6 +14,7 @@ import datetime as dt
 import io
 import queue
 import re
+import sys
 import threading
 import tkinter as tk
 import warnings
@@ -22,7 +23,6 @@ from tkinter import filedialog, messagebox, ttk
 
 import pandas as pd
 
-import sys
 # the prediction engine (predict.py and friends) lives in Model/
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Model"))
 
@@ -224,12 +224,12 @@ def load_logo(height=64):
         img = Image.open(io.BytesIO(base64.b64decode(LOGO_B64)))
         w = int(img.width * height / img.height)
         return ImageTk.PhotoImage(img.resize((w, height), Image.LANCZOS))
-    except Exception:
+    except Exception:       # noqa: BLE001 — logo is decorative, never fatal
         try:
             # Tk 8.6+ decodes base64 PNG data directly
             img = tk.PhotoImage(data=LOGO_B64)
             return img.subsample(max(1, img.height() // height))
-        except Exception:
+        except Exception:   # noqa: BLE001 — run logo-less instead
             return None
 
 
@@ -294,7 +294,7 @@ class App(tk.Tk):
             self._load_msg = "building player pools..."
             self._build_pools()
             self._load_state = ("ok", None)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — worker thread: surface via dialog
             self._load_state = ("err", str(e))
 
     def _poll_load(self):
@@ -410,14 +410,17 @@ class App(tk.Tk):
             games = self.pred.stores.raw["games"]
             newest = pd.to_datetime(games["Date"]).max()
             age = (pd.Timestamp.today().normalize() - newest.normalize()).days
-            if 5 <= dt.date.today().month <= 9 and age > 6:
+            # naive local date is deliberate project-wide: slates are
+            # named by the US-local calendar day
+            if 5 <= dt.date.today().month <= 9 and age > 6:  # noqa: DTZ011
                 problems.append(
                     f"Newest game in the data is {newest.date()} "
                     f"({age} days ago) — mid-season that means the daily "
                     f"update is not ingesting new games. Predictions will "
                     f"use stale form/rosters.")
-        except Exception:           # noqa: BLE001 — health check never blocks
-            pass
+        except Exception as e:      # noqa: BLE001 — health check never blocks
+            print(f"data-health freshness check skipped: {e}",
+                  file=sys.stderr)
         if problems:
             messagebox.showwarning("Data health", "\n\n".join(problems))
 
@@ -470,7 +473,7 @@ class App(tk.Tk):
     def _load_slate_file(self, path, silent=False):
         try:
             specs, payload = self._read_slate_specs(path)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — bad file -> dialog, not crash
             if not silent:
                 messagebox.showerror("Load failed", str(e))
             return
@@ -586,7 +589,7 @@ class App(tk.Tk):
         self.cb_away = add(0, "Away team", ttk.Combobox(top, width=6, state="readonly"))
         self.cb_home = add(1, "Home team", ttk.Combobox(top, width=6, state="readonly"))
         self.e_date = add(2, "Date (YYYY-MM-DD)", ttk.Entry(top, width=12))
-        self.e_date.insert(0, dt.date.today().isoformat())
+        self.e_date.insert(0, dt.date.today().isoformat())  # noqa: DTZ011
         # Optional — mlb.com drops the time once a game starts, so scraped
         # slates can arrive without it; sorts and slate order fall back
         # gracefully when blank. Accepts '7:10 PM' or '19:10'.
@@ -780,7 +783,8 @@ class App(tk.Tk):
         self.cb_home.set(spec.get("home_team") or "")
         self._team_changed("home")            # sets the home park default...
         self.e_date.delete(0, "end")
-        self.e_date.insert(0, spec.get("date") or dt.date.today().isoformat())
+        self.e_date.insert(
+            0, spec.get("date") or dt.date.today().isoformat())  # noqa: DTZ011
         self.e_start.delete(0, "end")
         self.e_start.insert(0, spec.get("start_et") or "")
         self.cb_venue.set(spec.get("venue") or "")   # ...the spec venue wins
@@ -834,7 +838,8 @@ class App(tk.Tk):
 
         start = self.e_start.get().strip()
         if start:
-            m = re.match(r"^(\d{1,2}):(\d{2})\s*(AM|PM)?$", start, re.I)
+            m = re.match(r"^(\d{1,2}):(\d{2})\s*(AM|PM)?$", start,
+                         re.IGNORECASE)
             if not m:
                 raise ValueError(f"start time not understood: {start!r} "
                                  f"(use 7:10 PM or 19:10)")
@@ -884,7 +889,7 @@ class App(tk.Tk):
     def _add_to_slate(self):
         try:
             spec = self._collect_spec()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — form errors -> dialog
             messagebox.showerror("Input error", str(e))
             return
         self.slate.append(spec)
@@ -924,7 +929,7 @@ class App(tk.Tk):
             return
         try:
             spec = self._collect_spec()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — form errors -> dialog
             messagebox.showerror("Input error", str(e))
             return
         old = self.slate[idx]
@@ -984,7 +989,7 @@ class App(tk.Tk):
         else:
             try:
                 specs = [self._collect_spec()]
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 — form errors -> dialog
                 messagebox.showerror("Input error", str(e))
                 return
         self.btn_predict["state"] = "disabled"
@@ -999,7 +1004,7 @@ class App(tk.Tk):
             out = self.pred.predict_slate(specs)
             xlsx = save_excel_slate(specs, out)
             self._pred_state = ("ok", (specs, out, xlsx))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — worker thread: surface via dialog
             self._pred_state = ("err", str(e))
 
     def _poll_predict(self):
@@ -1046,7 +1051,7 @@ class App(tk.Tk):
                     continue
                 out = self.pred.predict_slate(specs)
                 saved.append(save_excel_slate(specs, out))
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 — per-file fault isolation
                 failed.append(f"{path.name}: {e}")
         self._pred_state = ("ok", (saved, failed))
 
