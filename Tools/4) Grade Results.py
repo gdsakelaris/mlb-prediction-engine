@@ -76,22 +76,49 @@ PRED_DIR = Path(__file__).resolve().parent.parent / "Predictions"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "Model"))
 
 
+# how far back the ledger self-heal sweep retries missed dates (days)
+SETTLE_LOOKBACK_DAYS = 21
+
+
 def _settle_ledger(date):
-    """Settle the paper-trade ledger for one date. Returns True on
-    success. A staking crash must never hide behind a one-line note —
-    unsettled money rows are exactly the kind of silent gap the audit
-    flagged — so a failure prints the FULL traceback plus a loud marker
-    line, and the caller surfaces it again in the grade summary."""
+    """Settle the paper-trade ledger for the graded date, then self-heal:
+    any EARLIER date (up to SETTLE_LOOKBACK_DAYS back) still holding
+    open live rows — a morning whose settle crashed or never ran — is
+    settled too, so a missed day can never leave its money rows open
+    forever (the 2026-07-25 incident: one crashed 6AM settle stranded
+    478 rows until a manual rescue). Returns True on success. A staking
+    crash must never hide behind a one-line note — unsettled money rows
+    are exactly the kind of silent gap the audit flagged — so a failure
+    prints the FULL traceback plus a loud marker line, and the caller
+    exits NONZERO so the cmd task records GRADE=failed and the watchdog
+    alerts."""
+    cur = str(date)   # the date the settle call below is working on
     try:
         import staking
-        staking.settle(str(date))
+        staking.settle(cur)
+        led = staking._load()
+        if len(led):
+            open_live = (led.Status.isin(("paper", "track"))
+                         & (led.Outcome == ""))
+            floor = (pd.Timestamp(str(date))
+                     - pd.Timedelta(days=SETTLE_LOOKBACK_DAYS)
+                     ).strftime("%Y-%m-%d")
+            missed = sorted(d for d in set(led.loc[open_live, "Date"])
+                            if floor <= d < str(date))
+            for d in missed:
+                cur = d
+                print(f"  ledger: retrying missed settle for {d}",
+                      flush=True)
+                staking.settle(d)
         return True
     except Exception:                                   # noqa: BLE001
         import traceback
         traceback.print_exc()
-        print(f"  !! LEDGER SETTLE FAILED for {date} — staking ledger "
-              f"rows for this date remain unsettled (traceback above)",
-              flush=True)
+        note = ("" if cur == str(date)
+                else f" (in the self-heal sweep while grading {date})")
+        print(f"  !! LEDGER SETTLE FAILED for {cur}{note} — staking "
+              f"ledger rows for this date remain unsettled (traceback "
+              f"above)", flush=True)
         return False
 
 # the one grading color: solid green = the stat occurred
@@ -765,9 +792,11 @@ def main():
             print(f"not repainted (open in Excel): {', '.join(unpainted)} — "
                   f"still counted in the totals")
         if settle_fail:
-            print(f"!! LEDGER SETTLE FAILED for: {', '.join(settle_fail)} — "
-                  f"see the traceback(s) above; those dates' staking rows "
-                  f"remain unsettled")
+            # nonzero exit -> the 6AM cmd records GRADE=failed and the
+            # watchdog alerts; exiting 0 here buried the 2026-07-24 crash
+            sys.exit(f"!! LEDGER SETTLE FAILED for: "
+                     f"{', '.join(settle_fail)} — see the traceback(s) "
+                     f"above; those dates' staking rows remain unsettled")
         return
 
     path = args.workbook
@@ -801,8 +830,10 @@ def main():
               f"permanently ambiguous — the matchup played more games than "
               f"the workbook predicted (DH coverage mismatch)")
     if not settled:
-        print(f"  !! LEDGER SETTLE FAILED for {date} — see the traceback "
-              f"above; this date's staking rows remain unsettled")
+        # nonzero exit -> the 6AM cmd records GRADE=failed and the
+        # watchdog alerts; exiting 0 here buried the 2026-07-24 crash
+        sys.exit(f"  !! LEDGER SETTLE FAILED for {date} — see the traceback "
+                 f"above; this date's staking rows remain unsettled")
 
 
 if __name__ == "__main__":

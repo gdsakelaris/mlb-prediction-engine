@@ -360,6 +360,61 @@ def test_superseded_original_never_settles_pnl_counted_once(env):
     assert len(led2) == len(led)
 
 
+def test_reserve_after_settlement_never_double_settles(env):
+    """The other double-count: re-serving a date whose rows already
+    SETTLED. The live-only supersede scan can't see settled rows, so
+    the old append() stacked a fresh LIVE duplicate of a graded bet and
+    the next settle counted its PnL twice into the bankroll. A settled
+    §3 identity must skip outright; genuinely new bets still append."""
+    (env / "market_gate_report.csv").write_text("family,verdict\nh,PASS\n")
+    _write_data(env, games=[_game_row(777)],
+                bats=[_bat_row(777, 1, h=2), _bat_row(777, 2, h=0)])
+    SK.append(SK.enrich([_bet(pid=1, odds=120, pm=0.62, pc=0.58)],
+                        DATE, MKT_FAM))
+    SK.settle(DATE)                               # pid 1 wins, +1.2u
+    n = SK.append(SK.enrich([_bet(pid=1, odds=130, pm=0.62, pc=0.58),
+                             _bet(pid=2, odds=100, pm=0.62, pc=0.58)],
+                            DATE, MKT_FAM))
+    assert n == 1                     # pid 1 skipped, pid 2 appended
+    SK.settle(DATE)
+    led = SK._load()
+    settled = led[led.Outcome.isin(("win", "lose", "push"))]
+    assert sorted(SK._key_norm(p) for p in settled.PlayerId) == ["1", "2"]
+    one = settled[settled.PlayerId.map(SK._key_norm) == "1"]
+    assert list(one.PriceAmerican) == ["120"]     # gen 1, once
+    stake1 = float(one.stake_units.iloc[0])
+    stake2 = float(settled[settled.PlayerId.map(SK._key_norm) == "2"]
+                   .stake_units.iloc[0])
+    pnl = pd.to_numeric(led.PnL_units, errors="coerce").sum()
+    assert pnl == pytest.approx(stake1 * 1.2 - stake2)
+    assert (led.Outcome == "superseded").sum() == 0
+
+
+def test_settle_retires_live_duplicate_of_settled_identity(env):
+    """A pre-fix ledger may already hold a live duplicate of a settled
+    identity (appended before append() learned to skip them): settle()
+    must retire it as superseded, never grade it a second time."""
+    (env / "market_gate_report.csv").write_text("family,verdict\nh,PASS\n")
+    _write_data(env, games=[_game_row(777)], bats=[_bat_row(777, 1, h=2)])
+    SK.append(SK.enrich([_bet(pid=1, odds=120, pm=0.62, pc=0.58)],
+                        DATE, MKT_FAM))
+    SK.settle(DATE)
+    led = SK._load()
+    dup = led.iloc[0].copy()          # the poisoned live duplicate
+    for c in ("Outcome", "PnL_units", "SettledAt", "CloseAmerican",
+              "p_close_final", "CLV"):
+        dup[c] = ""
+    led = pd.concat([led, dup.to_frame().T], ignore_index=True)
+    SK._write(led[SK.LEDGER_COLS])
+    SK.settle(DATE)
+    led2 = SK._load()
+    assert int(led2.Outcome.isin(("win", "lose", "push")).sum()) == 1
+    assert int((led2.Outcome == "superseded").sum()) == 1
+    stake = float(led2[led2.Outcome == "win"].stake_units.iloc[0])
+    pnl = pd.to_numeric(led2.PnL_units, errors="coerce").sum()
+    assert pnl == pytest.approx(stake * 1.2)      # counted once
+
+
 # ------------------------------------------------- settlement (real CSVs)
 
 def test_settle_pitcher_rows_from_real_pitching_schema(env):
@@ -441,6 +496,28 @@ def test_dnp_rows_void_on_next_day_sweep(env):
         assert float(by[pid].PnL_units) == 0.0
 
 
+def test_relief_only_appearance_voids_starter_prop(env):
+    """A scheduled starter scratched into same-game RELIEF (GS=0): US
+    books VOID the starter prop. The old settle graded the ladder
+    against the relief line (a 2-K mop-up settled 'strikeouts o4.5' as
+    lose, disagreeing with Tools/4's own GS==1 workbook grade); it must
+    stay open same-date, then VOID on the sweep — stake returned, PnL
+    0, never a loss."""
+    SK.append(SK.enrich([_bet(market="pitcher_strikeouts", pid=9,
+                              line=4.5, side="Over", player="Arm 9",
+                              team="NYY")], DATE, MKT_FAM))
+    _write_data(env, games=[_game_row(777)],
+                pits=[_pit_row(777, 9, ip="2.0", so=2, GS=0, GF=1)])
+    SK.settle(DATE)
+    led = SK._load()
+    assert led.Outcome.iloc[0] == ""       # relief line never grades
+    SK.settle("2026-07-25")                # next-day sweep
+    led = SK._load()
+    assert led.Outcome.iloc[0] == "void"
+    assert led.Status.iloc[0] == "void"
+    assert float(led.PnL_units.iloc[0]) == 0.0
+
+
 # ------------------------------------------------------- CLV backfill
 
 def test_clv_totals_fills_via_gamepk_not_team(env):
@@ -490,6 +567,52 @@ def test_clv_ambiguous_multi_pk_group_stays_blank(env):
     fair = O.no_vig(-120, 100)[0]
     assert float(led.loc[0, "p_close_final"]) == pytest.approx(
         fair, abs=1e-6)
+
+
+def test_clv_totals_blank_store_pks_filter_by_home_club(env):
+    """Store degradation day (blank GamePks, a coded Tools/2 fallback):
+    totals candidates must still narrow to THIS game via Team == home
+    club — the old join had no game filter at all for totals, so the
+    blank-pk fallback averaged EVERY same-line game's fair into the
+    permanent p_close_final/CLV."""
+    SK.append(SK.enrich([_tot_bet(side="Over", line=8.5, odds=100)],
+                        DATE, MKT_FAM))
+    _write_data(env, games=[_game_row(777)])
+    _write_store(env, [
+        _store_row("totals", 8.5, team="NYY", over=-120, under=100,
+                   pk=""),
+        # another game's total at the same line, also pk-less — pooling
+        # it in shifts the fair far off this game's close
+        _store_row("totals", 8.5, team="LAD", over=200, under=-300,
+                   pk=""),
+    ])
+    SK.settle(DATE)
+    r = SK._load().iloc[0]
+    fair = O.no_vig(-120, 100)[0]                  # NYY game only
+    assert r.Outcome == "win"
+    assert float(r.p_close_final) == pytest.approx(fair, abs=1e-6)
+    assert float(r.CLV) == pytest.approx(fair - float(r.implied),
+                                         abs=1e-6)
+
+
+def test_clv_blank_pk_fallback_stays_blank_on_dh_day(env):
+    """Doubleheader + blank store pks: the same-club fallback rows can
+    mix (or BE) the other game's prices, so the money fields must stay
+    BLANK (§9 makes a wrong write permanent) while settlement itself
+    still grades off the row's own GamePk."""
+    SK.append(SK.enrich([_tot_bet(side="Over", line=8.5, odds=100,
+                                  gpk=777)], DATE, MKT_FAM))
+    _write_data(env, games=[_game_row(777), _game_row(888)])  # DH: same clubs
+    _write_store(env, [
+        _store_row("totals", 8.5, team="NYY", over=-120, under=100,
+                   pk=""),
+    ])
+    SK.settle(DATE)
+    r = SK._load().iloc[0]
+    assert r.Outcome == "win"                      # game 777: 9 > 8.5
+    assert r.p_close_final == ""
+    assert r.CLV == ""
+    assert r.CloseAmerican == ""
 
 
 def test_clv_away_moneyline_takes_complement_of_home_fair(env):
@@ -556,15 +679,23 @@ def test_odds_y_delegates_to_staking():
     gb = pd.DataFrame([dict(GamePk=1, PlayerId=9, PA=4, H=2, HR=0, TB=2,
                             R=0, RBI=0, BB=0, SB=0,
                             **{"2B": 0, "3B": 0})])
-    gp = pd.DataFrame([dict(GamePk=1, PlayerId=8, SO=7, OUTS=17, H=5,
-                            BB=2, ER=2)])
+    # GS mirrors the real pitching schema: pid 8 started, pid 7 is a
+    # relief-only line — both the gate and the ledger must void it
+    gp = pd.DataFrame([dict(GamePk=1, PlayerId=8, GS=1, SO=7, OUTS=17,
+                            H=5, BB=2, ER=2),
+                       dict(GamePk=1, PlayerId=7, GS=0, SO=2, OUTS=6,
+                            H=1, BB=0, ER=0)])
     for args in ((gb, gp, games, 1, None, "totals", 9.0),
                  (gb, gp, games, 1, 9, "batter_hits", 2.0),
                  (gb, gp, games, 1, 9, "batter_hits", 1.5),
                  (gb, gp, games, 1, 8, "pitcher_outs", 16.5),
                  (gb, gp, games, 1, 8, "pitcher_strikeouts", 7.0),
+                 (gb, gp, games, 1, 7, "pitcher_strikeouts", 1.5),
                  (gb, gp, games, 1, None, "h2h", None)):
         assert EV._odds_y(*args) == SK.outcome_y(*args)
+    # the relief-only line is a VOID (None) on both sides, never 1/0
+    assert SK.outcome_y(gb, gp, games, 1, 7, "pitcher_strikeouts", 1.5) \
+        is None
 
 
 def test_outcome_y_missing_scores_void_not_zero():
@@ -575,3 +706,37 @@ def test_outcome_y_missing_scores_void_not_zero():
                                "BB", "ER"])
     assert SK.outcome_y(gb, gp, games, 1, None, "h2h", None) is None
     assert SK.outcome_y(gb, gp, games, 1, None, "totals", 8.5) is None
+
+
+def test_settled_keys_matches_bet_key_row_by_row():
+    """_settled_keys is the vectorized twin of the per-row _bet_key walk
+    (append/settle dedup). Any drift between them silently reopens the
+    double-settle path, so pin exact set equality over every _bet_key
+    branch: h2h (Team dropped from the key), team-scoped markets (Team
+    kept), pk'd rows (Game/GNum blanked), pk-less rows (Game/GNum stand
+    in), float-artifact keys ('777.0' == 777), and non-settled Outcomes
+    (superseded / open) excluded."""
+    led = pd.DataFrame([
+        dict(Date=DATE, GamePk="777.0", PlayerId="601", Team="NYY",
+             Market="batter_hits", Line="1.5", Game="", GNum="",
+             Status="paper", Outcome="win"),
+        dict(Date=DATE, GamePk="778", PlayerId="", Team="BOS",
+             Market="h2h", Line="", Game="BOS@NYY", GNum="1",
+             Status="track", Outcome="lose"),
+        dict(Date=DATE, GamePk="", PlayerId="", Team="TOR",
+             Market="team_totals", Line="4.5", Game="TOR@TB", GNum="2",
+             Status="paper", Outcome="void"),
+        dict(Date=DATE, GamePk="779", PlayerId="602.0", Team="TB",
+             Market="pitcher_strikeouts", Line="5.5", Game="", GNum="",
+             Status="paper", Outcome="push"),
+        dict(Date=DATE, GamePk="780", PlayerId="603", Team="TB",
+             Market="batter_hits", Line="0.5", Game="", GNum="",
+             Status="paper", Outcome="superseded"),
+        dict(Date=DATE, GamePk="781", PlayerId="604", Team="TB",
+             Market="batter_hits", Line="0.5", Game="", GNum="",
+             Status="track", Outcome=""),
+    ]).astype(str)
+    expect = {SK._bet_key(led.loc[i])
+              for i in led.index[led.Outcome.isin(SK._SETTLED)]}
+    assert SK._settled_keys(led) == expect
+    assert len(SK._settled_keys(led)) == 4   # superseded + open excluded

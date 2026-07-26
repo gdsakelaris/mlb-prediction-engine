@@ -23,14 +23,33 @@ PY="$LOCALAPPDATA/Programs/Python/Python313/python.exe"
 [ -x "$PY" ] || PY=python
 
 REPO=$(pwd)
-GITDIR=$(git rev-parse --git-dir)
+GITDIR=$(git rev-parse --absolute-git-dir)
 PATCH=
 UNTRACKED_TMP=
 
+# restore [partial] - put saved unstaged edits (and untracked files)
+# back. "partial" marks a restore after a FAILED `git checkout -- .`:
+# the reset is per-file, not transactional, so some files are already
+# back at index content while others still hold their edits. A whole-
+# patch apply rejects that mix atomically (and --3way implies --index,
+# which rejects it too), so the apply skips every path still differing
+# from the index (never reverted, edits in place) and a reverse --check
+# must then prove every edit is present before the patch is dropped.
+# On any doubt the patch is KEPT and its path printed - never deleted.
 restore() {
+    MODE=${1-}
     if [ -n "$PATCH" ]; then
         P=$PATCH; PATCH=
-        if git apply --whitespace=nowarn "$P"; then
+        set --
+        if [ "$MODE" = partial ]; then
+            while IFS= read -r f; do
+                [ -n "$f" ] && set -- "$@" --exclude="$f"
+            done <<EOF
+$(git -c core.quotepath=false diff --name-only)
+EOF
+        fi
+        if git apply --whitespace=nowarn "$@" "$P" \
+            && { [ "$MODE" != partial ] || git apply --reverse --check --whitespace=nowarn "$P"; }; then
             rm -f "$P"
         else
             echo "pre-commit: COULD NOT re-apply your unstaged changes automatically."
@@ -55,10 +74,23 @@ restore() {
 # tracked unstaged edits -> patch, worktree -> index state
 if ! git diff --quiet; then
     PATCH="$GITDIR/pre-commit-unstaged.$$.patch"
-    if git diff --binary --no-color > "$PATCH" && git checkout -- .; then
+    if git diff --binary --no-color > "$PATCH"; then
+        # The patch is the only copy of the edits once the reset starts,
+        # and `git checkout -- .` is per-file, not transactional (a
+        # OneDrive sync lock can fail it partway with some files already
+        # reverted) - so arm the trap BEFORE touching the worktree and
+        # never delete the patch past this point.
         trap restore EXIT INT TERM
-        echo "pre-commit: unstaged changes set aside - testing the staged index"
+        if git checkout -- .; then
+            echo "pre-commit: unstaged changes set aside - testing the staged index"
+        else
+            echo "pre-commit: WARNING - worktree reset FAILED partway; re-applying your unstaged changes from '$PATCH'"
+            restore partial
+            echo "pre-commit: WARNING - could not set aside unstaged changes: testing the WORKING TREE, which differs from what is being committed"
+        fi
     else
+        # the reset never ran - nothing was reverted and the partial
+        # patch file holds nothing unique, so it is safe to drop
         rm -f "$PATCH"; PATCH=
         echo "pre-commit: WARNING - could not set aside unstaged changes: testing the WORKING TREE, which differs from what is being committed"
     fi

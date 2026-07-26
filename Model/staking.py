@@ -62,6 +62,13 @@ LEDGER_COLS = [
     "SettledAt",
 ]
 
+# terminal settlement outcomes: a row carrying one is history — never
+# superseded, never re-graded, and its §3 identity can never re-enter
+# the ledger live. 'superseded' is deliberately NOT here: it marks
+# lifecycle retirement, and treating it as settled would block a newer
+# generation of a merely re-served (never settled) bet from appending.
+_SETTLED = ("win", "lose", "push", "void")
+
 
 def _key_norm(v):
     """One key field -> canonical string: '' for blank/None/NaN, ints
@@ -100,6 +107,31 @@ def _bet_key(r):
     return (_key_norm(get("Date")), pk,
             _key_norm(get("PlayerId")), team, mkt,
             _key_norm(get("Line"))) + gm
+
+
+def _settled_keys(led):
+    """§3 identity keys of every terminally-settled row, built column-
+    wise. The per-row `_bet_key(led.loc[i])` walk constructs a Series
+    per settled row — O(all-time history) on every append and settle of
+    an append-only ledger that only ever grows — where this stays flat.
+    Must mirror _bet_key exactly (pinned by a parity test)."""
+    s = led[led.Outcome.isin(_SETTLED)]
+    if not len(s):
+        return set()
+
+    def col(c):
+        if c not in s.columns:
+            return pd.Series("", index=s.index)
+        return s[c].map(_key_norm)
+
+    mkt = col("Market")
+    pk = col("GamePk")
+    team = col("Team").where(mkt != "h2h", "")
+    gm_blank = pk == ""
+    game = col("Game").where(gm_blank, "")
+    gnum = col("GNum").where(gm_blank, "")
+    return set(zip(col("Date"), pk, col("PlayerId"), team, mkt,
+                   col("Line"), game, gnum))
 
 
 def _dec(american):
@@ -186,6 +218,12 @@ def outcome_y(gb, gp, games_df, pk, pid, market, line, team=None):
         return None if aw + hm == line else int(aw + hm > line)
     if market.startswith("pitcher"):
         r = gp[(gp.GamePk == pk) & (gp.PlayerId == pid)]
+        # starter props price the START: a GS=0 line is a relief
+        # appearance (e.g. a scratched starter re-used in the same game)
+        # that US books VOID — it must never grade the ladder. Frames
+        # without a GS column (pre-filtered starter boxes) pass through.
+        if "GS" in r.columns:
+            r = r[pd.to_numeric(r.GS, errors="coerce") == 1]
         if r.empty:
             return None
         stat = _stat_of(r.iloc[0], market)
@@ -310,10 +348,23 @@ def append(rows):
     so an EV side-flip retires the abandoned side too) first gets a
     'void' marker row (audit trail, §9), and the original is stamped
     Outcome='superseded' so settle() can never grade both generations.
-    A SETTLED row is history and is never superseded."""
+    A SETTLED row is history and is never superseded — and an incoming
+    bet whose §3 identity already settled is dropped outright: appending
+    it live would hand the next settle a fresh duplicate of a graded bet
+    and count its PnL/CLV twice into the permanent record."""
     if not rows:
         return 0
     led = _load()
+    n_dup = 0
+    if len(led):
+        done = _settled_keys(led)
+        keep = [r for r in rows if _bet_key(r) not in done]
+        n_dup = len(rows) - len(keep)
+        rows = keep
+    if not rows:
+        print(f"ledger: +0 rows ({n_dup} skipped as already settled)",
+              flush=True)
+        return 0
     new = pd.DataFrame(rows).astype(str)
     marks, sup = [], []
     if len(led):
@@ -340,8 +391,9 @@ def append(rows):
     n_paper = int((new.Status == "paper").sum())
     print(f"ledger: +{len(new)} rows ({n_paper} paper, "
           f"{len(new) - n_paper} track"
-          + (f", {len(marks)} superseded" if marks else "") + ")",
-          flush=True)
+          + (f", {len(marks)} superseded" if marks else "")
+          + (f", {n_dup} skipped as already settled" if n_dup else "")
+          + ")", flush=True)
     return len(new)
 
 
@@ -359,8 +411,12 @@ def settle(date):
     # originals (and matched game-market keys at all), old generations
     # of a re-served bet stayed live. Newest generation wins; older
     # live duplicates of the same identity retire here, once, so the
-    # historical ledger can never double-settle either.
-    seen, dup = set(), []
+    # historical ledger can never double-settle either. Seeding `seen`
+    # with the already-SETTLED identities extends the same rule to live
+    # duplicates appended before append() learned to skip them — the
+    # settled row IS the §3 bet, its duplicate must never grade.
+    seen = _settled_keys(led)
+    dup = []
     for i in reversed(led.index[live].tolist()):
         k = _bet_key(led.loc[i])
         if k in seen:
@@ -377,6 +433,9 @@ def settle(date):
     games_all = pd.read_csv(DATA / "mlb_games.csv", encoding="utf-8-sig")
     finals = games_all.dropna(subset=["AwayScore", "HomeScore"])
     games = finals[finals.Date == str(date)]
+    # the FULL day slate (finals or not): _fill_clv's doubleheader
+    # detection must see a DH sibling even before it goes final
+    slate = games_all[games_all.Date == str(date)]
     gb_all = pd.read_csv(DATA / "mlb_game_batting.csv",
                          encoding="utf-8-sig")
     gb = gb_all[gb_all.Date == str(date)]
@@ -393,7 +452,7 @@ def settle(date):
     n_set, wl = 0, {"win": 0, "lose": 0, "push": 0}
     for i in led.index[mask]:
         try:
-            out = _settle_one(led, i, games, gb, gp, store)
+            out = _settle_one(led, i, games, gb, gp, store, slate)
         except Exception as e:  # noqa: BLE001 — one bad row skips that
             # row only; the rows settled around it still write below
             print(f"ledger: settle skipped row {i} "
@@ -422,9 +481,10 @@ def settle(date):
         print("ledger: nothing to settle", flush=True)
 
 
-def _settle_one(led, i, games, gb, gp, store):
+def _settle_one(led, i, games, gb, gp, store, slate=None):
     """Settle ledger row i in place (Outcome/PnL/CLV columns). Returns
-    the outcome string when the row settled, None when it stays open."""
+    the outcome string when the row settled, None when it stays open.
+    `slate` is the day's full schedule frame for _fill_clv's DH check."""
     r = led.loc[i]
     try:
         pk = int(float(r.GamePk))
@@ -467,7 +527,7 @@ def _settle_one(led, i, games, gb, gp, store):
     stake = float(r.stake_units or 0.0)
     pnl = {"win": stake * (dec - 1.0) if dec else 0.0,
            "lose": -stake, "push": 0.0}[out]
-    _fill_clv(led, i, r, store, pk, market, side)
+    _fill_clv(led, i, r, store, pk, market, side, slate)
     led.loc[i, "Outcome"] = out
     led.loc[i, "PnL_units"] = f"{pnl:.4f}"
     led.loc[i, "SettledAt"] = pd.Timestamp.now().isoformat(
@@ -475,7 +535,23 @@ def _settle_one(led, i, games, gb, gp, store):
     return out
 
 
-def _fill_clv(led, i, r, store, pk, market, side):
+def _matchup_games(slate, r):
+    """How many games the ledger row's matchup ('AWY@HOM') had that
+    date, from the day's full schedule frame. 1 when the slate is
+    unknown or the label unparseable — a doubleheader can only be
+    PROVEN by the slate, never assumed."""
+    if slate is None or not len(slate):
+        return 1
+    parts = str(r.Game).split("@")
+    if len(parts) != 2:
+        return 1
+    away, home = parts[0].strip(), parts[1].strip()
+    n = int(((slate.AwayTeam.astype(str) == away)
+             & (slate.HomeTeam.astype(str) == home)).sum())
+    return n if n else 1
+
+
+def _fill_clv(led, i, r, store, pk, market, side, slate=None):
     """CLV vs the final captured close for THIS bet's market+side.
 
     Store keying (odds.ODDS_COLUMNS): player props by PlayerId; totals
@@ -484,7 +560,8 @@ def _fill_clv(led, i, r, store, pk, market, side):
     rows carry Team = Side = the bet's club, so the join goes through
     GamePk and the Game label ('AWY@HOM') — never r.Team equality
     against the store, which matched nothing for totals and away
-    moneylines."""
+    moneylines. `slate` (the day's full schedule) powers the
+    doubleheader check on the blank-pk fallback."""
     if not len(store):
         return
     grp = store[(store.Market == market)
@@ -495,21 +572,32 @@ def _fill_clv(led, i, r, store, pk, market, side):
                   == float(r.PlayerId)]
     else:
         grp = grp[pd.to_numeric(grp.PlayerId, errors="coerce").isna()]
-        if market == "h2h":
-            grp = grp[grp.Team.astype(str) == home]
-        elif market == "team_totals":
+        if market == "team_totals":
             grp = grp[grp.Team.astype(str) == str(r.Team)]
+        else:
+            # h2h AND totals: the store keys both under the HOME club,
+            # so Team==home is the game-identifying filter. Totals once
+            # skipped it, and on blank-pk store days (a coded Tools/2
+            # degradation) EVERY game at the line pooled into one fair.
+            grp = grp[grp.Team.astype(str) == home]
     # pk-exact on doubleheaders: without it the two games' prices merge
-    # into one bogus fair. Legacy blank-pk store rows still match; an
-    # ambiguous multi-pk group with no ledger pk stays blank — no CLV
-    # beats wrong CLV.
+    # into one bogus fair. Legacy blank-pk store rows still match, but
+    # only when the matchup provably played a SINGLE game that date —
+    # on a DH day the fallback rows can mix (or BE) the other game's
+    # prices, so the money fields stay blank instead (§9 makes a wrong
+    # write permanent). No CLV beats wrong CLV.
     if len(grp):
         spk = grp.GamePk.map(_key_norm)
-        if pk is not None:
-            exact = grp[spk == str(pk)]
-            grp = exact if len(exact) else grp[spk == ""]
-        elif spk[spk != ""].nunique() > 1:
-            grp = grp.iloc[0:0]
+        exact = grp[spk == str(pk)] if pk is not None else grp.iloc[0:0]
+        if len(exact):
+            grp = exact
+        else:
+            if pk is not None:
+                grp = grp[spk == ""]
+            elif spk[spk != ""].nunique() > 1:
+                grp = grp.iloc[0:0]
+            if len(grp) and _matchup_games(slate, r) > 1:
+                grp = grp.iloc[0:0]
     fair = O.sharp_fair(grp.to_dict("records")) if len(grp) else None
     if fair is None:
         return
@@ -531,12 +619,14 @@ def _fill_clv(led, i, r, store, pk, market, side):
 
 def _void_dnp(led, stale, finals, gb_all, gp_all):
     """Void (Status='void', Outcome='void', PnL 0) EARLIER dates'
-    player rows whose game went final without a stat line for the
-    player — the book's did-not-play rule. Without this a scratched
-    player's row stays open forever (outcome_y returns None on every
-    run). Same-date rows are deliberately exempt: a box score that
-    lags tonight's final stays open for tomorrow's settle instead of
-    voiding early."""
+    player rows whose game went final without a GRADEABLE stat line for
+    the player — the book's did-not-play rule. For pitcher props that
+    means no GS=1 line: a relief-only appearance (GS=0, the scratched
+    starter re-used in the same game) is a book VOID, never a graded
+    ladder. Without this a scratched player's row stays open forever
+    (outcome_y returns None on every run). Same-date rows are
+    deliberately exempt: a box score that lags tonight's final stays
+    open for tomorrow's settle instead of voiding early."""
     n_void = 0
     for i in led.index[stale]:
         r = led.loc[i]
@@ -553,9 +643,13 @@ def _void_dnp(led, stale, finals, gb_all, gp_all):
         if gbox.empty:
             continue                  # final in, box not scraped yet
         mine = gbox[gbox.PlayerId == pid]
+        if str(r.Market).startswith("pitcher") and "GS" in gbox.columns:
+            # only a true start keeps the row gradeable; a GS=0-only
+            # appearance falls through to void below
+            mine = mine[pd.to_numeric(mine.GS, errors="coerce") == 1]
         if len(mine):
             if str(r.Market).startswith("pitcher"):
-                continue              # pitched: settle(date) grades it
+                continue              # started: settle(date) grades it
             pa = (pd.to_numeric(mine.PA.iloc[0], errors="coerce")
                   if "PA" in mine.columns else None)
             if pa is None or pa > 0:
@@ -588,6 +682,8 @@ def _is_push(gb, gp, games, pk, pid, market, line, team=None):
                 + float(g.HomeScore.iloc[0])) == line
     src = gp if market.startswith("pitcher") else gb
     r = src[(src.GamePk == pk) & (src.PlayerId == pid)]
+    if market.startswith("pitcher") and "GS" in r.columns:
+        r = r[pd.to_numeric(r.GS, errors="coerce") == 1]  # relief != start
     if r.empty:
         return False
     if not market.startswith("pitcher") and not (r.PA.iloc[0] > 0):

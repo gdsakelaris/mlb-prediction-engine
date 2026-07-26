@@ -125,10 +125,15 @@ if "%DATA_OK%"=="0" (
 
 REM Grade the newest served workbook against last night's finals, then
 REM refresh the served top-K precision tracker (feeds the late-Aug W4.21
-REM decision). Both are display/ledger-only - no model input. Grading is
-REM idempotent, so a failure here (e.g. the workbook left open in Excel
-REM locks the file) is retried harmlessly tomorrow. Tools/6 reads the
-REM workbook + CSVs directly, so it runs even if Tools/4 failed.
+REM decision). Both are display/ledger-only - no model input. The
+REM workbook PAINT is idempotent and retried tomorrow, but the LEDGER
+REM settle is not newest-only: tomorrow's run grades tomorrow's date, so
+REM Tools/4 itself re-settles any earlier date (21-day window) still
+REM holding open ledger rows, and exits nonzero on ANY settle failure so
+REM GRADE=failed lands in cmd_status.json below and the watchdog alerts
+REM (a swallowed settle crash stranded 2026-07-24's 478 rows until a
+REM manual rescue). Tools/6 reads the workbook + CSVs directly, so it
+REM runs even if Tools/4 failed.
 set "GRADE=ok"
 "%PY%" "%ROOT%\Tools\4) Grade Results.py" >> "%LOG%" 2>&1
 if errorlevel 1 (set "FAIL=1" & set "GRADE=failed")

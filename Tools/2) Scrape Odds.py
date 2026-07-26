@@ -558,6 +558,38 @@ def _slate_date(e):
     return c.astimezone().date().isoformat() if c else None
 
 
+def capture_verdict(n_events, n_failed, n_rows):
+    """Pure verdict on a capture run: (events attempted, events whose fetch
+    failed, rows collected) -> (marker_line or None, fatal). The store is
+    the one file that cannot be re-scraped (a pregame line is gone once the
+    game starts), so a run that attempted a non-empty slate and captured
+    NOTHING is fatal: fetch() raises through a persistent outage, and
+    before this verdict main() wrote whatever survived and exited 0 — the
+    noon serve gate (errorlevel) and check_health never tripped and the
+    day's only capture was silently lost. A partial outage still keeps
+    what survived but stamps the log with the gap. Both marker substrings
+    are load-bearing: "ODDS CAPTURE FAILED" rides exit 1 through the noon
+    chain's fail alert, and check_health.ps1 greps the noon log for the
+    literal "ODDS CAPTURE DEGRADED". n_events == 0 (off-day, or a rerun
+    where every game already started) is a clean no-op, never a failure.
+    Zero rows with ZERO failed fetches is DEGRADED, not fatal: nothing
+    was lost (no book had posted a requested market — or the response
+    format drifted, which the alert surfaces either way), and a fatal
+    verdict would also kill the headless noon serve floor over a
+    lines-not-posted-yet day. Fatal requires actual fetch failures."""
+    if n_events and n_failed and (n_failed >= n_events or n_rows == 0):
+        return (f"ODDS CAPTURE FAILED: {n_failed}/{n_events} event fetches "
+                f"failed, {n_rows} rows captured", True)
+    if n_events and n_rows == 0:
+        return (f"ODDS CAPTURE DEGRADED 0/{n_events} events failed but 0 "
+                f"rows captured — no requested market posted yet, or the "
+                f"response format drifted", False)
+    if n_failed:
+        return (f"ODDS CAPTURE DEGRADED {n_failed}/{n_events} events failed "
+                f"({n_rows} rows kept from the games that survived)", False)
+    return None, False
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--date", default=dt.date.today().isoformat(),
@@ -707,6 +739,7 @@ def main():
     ev_req = prop_markets + event_game
     base_req = [m for m in prop_markets if m not in O.ALT_MARKET]
     warned_422 = False
+    n_fail = 0     # events whose fetch (incl. 422 salvage) raised
     for e in (pending if ev_req else []):
         home_abbr = full_name_to_abbrev(e.get("home_team", ""))
         away_abbr = full_name_to_abbrev(e.get("away_team", ""))
@@ -737,10 +770,12 @@ def main():
                 except Exception as ex2:
                     print(f"  {away_abbr}@{home_abbr}: odds fetch failed "
                           f"({ex2})", file=sys.stderr)
+                    n_fail += 1
                     continue
             else:
                 print(f"  {away_abbr}@{home_abbr}: odds fetch failed "
                       f"({ex})", file=sys.stderr)
+                n_fail += 1
                 continue
         pr = (parse_event_props(data, resolver, day, gpk, captured_at,
                                 prop_apis=prop_markets)
@@ -754,9 +789,24 @@ def main():
         print(f"  {away_abbr}@{home_abbr}: {len(pr)} prop + {len(gm)} "
               f"game rows (left: {remain})")
 
+    # events "attempted" = the pending slate whenever anything was fetched
+    # for it (per-event calls, or the bulk game-markets call alone) — a
+    # bulk-only run that comes back empty is just as lost as a props run.
+    n_events = len(pending) if (ev_req or bulk_game) else 0
+    marker, fatal = capture_verdict(n_events, n_fail, len(all_rows))
+    if fatal:
+        # salvage anything that did come back (append-merge, atomic) —
+        # these lines can never be re-scraped — then trip the noon gate
+        # over the lost slate instead of greening the chain
+        if all_rows:
+            write_store(all_rows, args.out)
+        print(marker)
+        sys.exit(1)
     total = write_store(all_rows, args.out)
     print(f"\nwrote {n_prop} prop + {n_game} game rows this run; "
           f"store now holds {total} rows -> {args.out}")
+    if marker:
+        print(marker)   # check_health greps the noon log for this line
 
 
 if __name__ == "__main__":

@@ -795,8 +795,12 @@ def _odds_y(gb, gp, games_df, pk, pid, market, line):
     for log-loss grading; grading it as a loss biased every
     integer-line totals row until 2026-07-23). Thin delegate: the one
     settlement truth lives in staking.outcome_y so the gate and the
-    paper-trading ledger can never grade differently."""
+    paper-trading ledger can never grade differently. Pitcher props
+    settle on GS==1 rows only (the Tools/4 convention): a relief-only
+    appearance is a book void, never a graded start."""
     import staking as SK
+    if market.startswith("pitcher"):
+        gp = gp[gp.GS == 1]
     return SK.outcome_y(gb, gp, games_df, pk, pid, market, line)
 
 
@@ -815,6 +819,18 @@ def _gate_head_adj(res, fam, line, p, hf, pid=-1):
                                thr=res.get("thr"), pid=pid)
 
 
+# gate replay-path version, part of the cache fingerprint (the mtime
+# parts can't see code changes): r1 priced each game in its OWN
+# predict_slate call, so slate_context's strictly-before-date cut
+# dropped a doubleheader's same-day game 1 while pricing game 2
+# (rest/b2b/travel HEAD_CTX + A1 matchup context the serve never
+# produced) and pitcher props settled on the unfiltered pitching frame
+# (relief-only appearances graded instead of voiding). r2 (2026-07-25):
+# whole-date replay + GS==1 pitcher settlement — the bump re-sims every
+# previously cached gate row once.
+GATE_REPLAY_VERSION = 2
+
+
 def _gate_fingerprint(n_sims):
     """Cache key part that invalidates on any serving-stack change.
     Model artifacts are fingerprinted DIRECTLY (not just via
@@ -829,7 +845,7 @@ def _gate_fingerprint(n_sims):
     # columns. sem2 (2026-07-25): p_model is the SERVED probability
     # (residual heads + _tail_prob sparse-tail shrink + cross-line
     # ladder clamp) and the inline team_totals push-void fix.
-    parts = [f"s{n_sims}", "sem2"]
+    parts = [f"s{n_sims}", "sem2", f"r{GATE_REPLAY_VERSION}"]
     for f_ in ("manifest.json", "output_calibrators.joblib",
                "residual_heads.joblib", "latent.json",
                "a1_model.joblib", "a2_model.joblib",
@@ -893,19 +909,31 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
             continue
         day_pend = []      # every priced row pre-clamp (voids included)
         ladders = {}       # ladder key -> [(line, day_pend idx)]
-        # replay the slate once; map players/games to sim results. Each
-        # ident keeps a LIST of (pk, ...) hits so a doubleheader's two
-        # replayed games both stay addressable. Batter slots (rows 0-17)
-        # and starter slots (18-19) are kept in separate maps so a
-        # two-way player's pitcher markets grade his pitching tensor
-        # slot, never his batting slot.
+        # replay the date in ONE predict_slate call, exactly as the
+        # serve prices it: F.slate_context sees every same-day spec, so
+        # a doubleheader's game 2 keeps game 1 as its same-day previous
+        # game (rest/b2b/travel HEAD_CTX + A1 context). Per-game calls
+        # dropped game 1 from game 2's context and graded prices the
+        # engine never served (GATE_REPLAY_VERSION 2). Results map back
+        # by spec game_pk — predict_slate's per-game fallback may drop
+        # a failed game. Each ident keeps a LIST of (pk, ...) hits so a
+        # doubleheader's two replayed games both stay addressable.
+        # Batter slots (rows 0-17) and starter slots (18-19) are kept
+        # in separate maps so a two-way player's pitcher markets grade
+        # his pitching tensor slot, never his batting slot.
         by_bat, by_pit, by_home, by_team = {}, {}, {}, {}
+        specs, g_by_pk = [], {}
         for _, g in day_games.iterrows():
             spec = B.build_spec(P, g, lineups, starters, umps, wx)
             if len(spec["away_lineup"]) < 9 or None in (
                     spec["away_starter"], spec["home_starter"]):
                 continue
-            res = P.predict_slate([spec], n_sims=n_sims)[0]
+            specs.append(spec)
+            g_by_pk[int(g.GamePk)] = g
+        res_list = (P.predict_slate(specs, n_sims=n_sims)
+                    if specs else [])
+        for res in res_list:
+            g = g_by_pk[int(res["spec"]["game_pk"])]
             pk_g = int(g.GamePk)
             by_home.setdefault(g.HomeTeam, []).append((pk_g, res))
             by_team.setdefault(str(g.AwayTeam), []).append((pk_g, res, 0))
@@ -915,7 +943,11 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
                     continue
                 dst = by_pit if row_i >= 18 else by_bat
                 dst.setdefault(int(pid), []).append((pk_g, res, row_i))
-        print(f"  {date}: {len(by_home)} games replayed", flush=True)
+        partial = len(res_list) < len(specs)
+        print(f"  {date}: {len(res_list)} games replayed"
+              + (f" ({len(specs) - len(res_list)} FAILED — date not "
+                 f"cached, retries next run)" if partial else ""),
+              flush=True)
 
         def _resolve(hits, gpk):
             """The replayed game an odds group grades against: exact
@@ -1099,7 +1131,11 @@ def market_gate(start, end, n_sims=4000, min_n=800, boot=500,
                 lo = pv
         day_list = [r for r in day_pend if r["y"] is not None]
         rows.extend(day_list)
-        if day_list:
+        # a partially-replayed date is used this run but never cached:
+        # the key cannot encode the dropped game, so caching would pin
+        # a transient failure's thin sample until the fingerprint next
+        # changes
+        if day_list and not partial:
             new_frames.append(
                 pd.DataFrame(day_list).assign(key=key))
 

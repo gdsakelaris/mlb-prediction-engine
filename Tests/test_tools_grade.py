@@ -7,6 +7,8 @@ and the day-sum fallback firing ONLY when the matchup has exactly one
 final. Everything runs on synthetic dicts / tmp_path; the live Data/ and
 Predictions/ are never touched.
 """
+import sys
+
 import openpyxl
 import pandas as pd
 import pytest
@@ -281,3 +283,78 @@ def test_grade_errors(tmp_path, monkeypatch):
     # a date with no box scores -> GradeError before the workbook loads
     with pytest.raises(t4.GradeError):
         t4.grade(tmp_path / "2026-01-01.xlsx")
+
+
+# ------------------------------------------------------------ _settle_ledger
+
+def _stake_env(tmp_path, monkeypatch):
+    """Hermetic staking env (same contract as test_staking.py's env
+    fixture): the ledger-flow tests must never touch the real ledger,
+    Data/ CSVs or odds store."""
+    import staking as SK
+    monkeypatch.setattr(SK, "ART", tmp_path)
+    monkeypatch.setattr(SK, "LEDGER", tmp_path / "ledger.csv")
+    monkeypatch.setattr(SK, "DATA", tmp_path)
+    monkeypatch.setattr(SK.O, "DEFAULT_STORE", tmp_path / "mlb_odds.csv")
+    return SK
+
+
+def _ledger_bet(pid, gpk):
+    return {"Game": "BOS@NYY", "G#": 1, "GamePk": gpk, "PlayerId": pid,
+            "Player": f"Bat {pid}", "Team": "BOS", "Prop": "hits o1.5",
+            "Side": "Over", "Line": 1.5, "Model %": 0.55, "Mkt %": 0.50,
+            "Best Odds": 120, "Book": "draftkings", "EV%": 0.1,
+            "_market": "batter_hits"}
+
+
+def test_settle_ledger_self_heals_missed_earlier_dates(tmp_path,
+                                                       monkeypatch):
+    """A morning whose settle crashed (or never ran) leaves its date's
+    rows open, and settle(date) only grades win/lose for ITS date —
+    _settle_ledger must therefore sweep EARLIER dates still holding
+    open live rows (21-day bound) so a missed day self-heals on the
+    next run instead of staying open forever."""
+    SK = _stake_env(tmp_path, monkeypatch)
+    ancient, missed, graded = "2026-05-01", "2026-07-20", "2026-07-22"
+    fam = {"batter_hits": "h"}
+    SK.append(SK.enrich([_ledger_bet(1, 777)], ancient, fam))
+    SK.append(SK.enrich([_ledger_bet(1, 888)], missed, fam))
+    pd.DataFrame([
+        {"GamePk": 777, "Date": ancient, "AwayTeam": "BOS",
+         "HomeTeam": "NYY", "AwayScore": 4, "HomeScore": 5},
+        {"GamePk": 888, "Date": missed, "AwayTeam": "BOS",
+         "HomeTeam": "NYY", "AwayScore": 4, "HomeScore": 5},
+    ]).to_csv(tmp_path / "mlb_games.csv", index=False)
+    pd.DataFrame([
+        {"GamePk": 777, "Date": ancient, "PlayerId": 1, "PA": 4, "H": 2},
+        {"GamePk": 888, "Date": missed, "PlayerId": 1, "PA": 4, "H": 2},
+    ]).to_csv(tmp_path / "mlb_game_batting.csv", index=False)
+    pd.DataFrame(columns=["GamePk", "Date", "PlayerId", "GS", "IP"]
+                 ).to_csv(tmp_path / "mlb_game_pitching.csv", index=False)
+    assert t4._settle_ledger(graded) is True
+    led = SK._load()
+    by_date = {r.Date: r.Outcome for _, r in led.iterrows()}
+    assert by_date[missed] == "win"       # self-healed on the D run
+    assert by_date[ancient] == ""         # outside the 21-day sweep
+
+
+def test_settle_failure_exits_nonzero(tmp_path, monkeypatch):
+    """A settle crash must surface as a NONZERO exit so the 6AM cmd
+    records GRADE=failed and the watchdog alerts — the old
+    swallow-and-exit-0 path is how 2026-07-24's rows went unsettled
+    until a manual rescue."""
+    monkeypatch.setattr(t4, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(t4, "PRED_DIR", tmp_path)
+    _write_actuals(tmp_path)
+    path = tmp_path / f"{DATE} preds.xlsx"
+    _write_workbook(path)
+    import staking
+
+    def boom(date):
+        raise RuntimeError("settle crashed")
+
+    monkeypatch.setattr(staking, "settle", boom)
+    monkeypatch.setattr(sys, "argv", ["4) Grade Results.py", str(path)])
+    with pytest.raises(SystemExit) as ex:
+        t4.main()
+    assert ex.value.code not in (0, None)

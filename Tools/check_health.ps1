@@ -1,8 +1,13 @@
 # MLB Engine health watchdog ("MLB Engine Health Check" scheduled task:
-# at logon + 08:15 + 12:45). The in-script exit codes and status JSON
-# can only report a run that HAPPENED — this watchdog is the one
-# mechanism that catches a task that never started (the 2026-07-23
-# failure mode). Alerts via MessageBox once per day PER PROBLEM KIND
+# at logon + 08:15 + 12:45, plus a 13:35 trigger so a noon run killed
+# at its PT1H limit is caught same-day). The in-script exit codes and
+# status JSON can only report a run that HAPPENED — this watchdog is
+# the one mechanism that catches a task that never started (the
+# 2026-07-23 failure mode). Every run also re-checks YESTERDAY's noon
+# log (2026-07-25: the 12:45 check was the day's last, so a noon task
+# that died after it was never surfaced), and greps the noon log for
+# "ODDS CAPTURE DEGRADED" — Tools/2's marker for a partial (exit-0)
+# capture failure that the fail= flag cannot see. Alerts via MessageBox once per day PER PROBLEM KIND
 # (an early false alarm's ack must never mute a later, different real
 # failure). FAIL-CLOSED (2026-07-25): a corrupt/unreadable status file
 # or a crashed check IS an alert, never a silent pass — so no blanket
@@ -107,10 +112,50 @@ if ((($now.Hour -gt 12) -or ($now.Hour -eq 12 -and $now.Minute -ge 30)) -and
             } elseif ($fin.Line -match "fail=1") {
                 Add-Problem "noon-fail" "Noon slate/odds capture FAILED today - see Logs\noon_$today.log."
             }
+            if (Select-String -Path $noonLog -Pattern "ODDS CAPTURE DEGRADED" -Quiet) {
+                Add-Problem "odds-degraded" "Noon odds capture was DEGRADED today (some events failed; the store holds only a partial slate) - see Logs\noon_$today.log."
+            }
         }
     } catch {
         Add-Problem "noon-check-error" "Noon health check itself failed ($($_.Exception.Message)) - inspect Logs\noon_$today.log by hand."
     }
+}
+
+# 2b) yesterday's noon log - the day's LAST scheduled check runs at
+#     12:45/13:35, so a noon run that wedged past it (task-lock wait
+#     up to 30 min + PT1H kill) or failed while the box slept died
+#     unseen until now. Every run re-checks yesterday; a problem kind
+#     already surfaced (= acked) by yesterday's own checks is not
+#     re-alerted.
+$yest = $now.AddDays(-1).ToString("yyyy-MM-dd")
+function Test-AckedYesterday([string]$kind) {
+    return (Test-Path (Join-Path $logs ".health_ack_${yest}_$kind"))
+}
+try {
+    $yLog = Join-Path $logs "noon_$yest.log"
+    if (-not (Test-Path $yLog)) {
+        if (-not (Test-AckedYesterday "noon-missing")) {
+            Add-Problem "noon-missing-yesterday" "Noon slate/odds capture NEVER RAN yesterday ($yest) - that day's opening odds are gone. Check the 'MLB Engine Noon Slate' task."
+        }
+    } else {
+        $yFin = Select-String -Path $yLog -Pattern "Noon slate run finished" | Select-Object -Last 1
+        if ($null -eq $yFin) {
+            if (-not (Test-AckedYesterday "noon-crashed")) {
+                Add-Problem "noon-crashed-yesterday" "Yesterday's noon slate run ($yest) STARTED but never finished (killed after the day's last check?) - see Logs\noon_$yest.log."
+            }
+        } elseif ($yFin.Line -match "fail=1") {
+            if (-not (Test-AckedYesterday "noon-fail")) {
+                Add-Problem "noon-fail-yesterday" "Yesterday's noon slate/odds capture ($yest) FAILED after the day's last check - see Logs\noon_$yest.log."
+            }
+        }
+        if (Select-String -Path $yLog -Pattern "ODDS CAPTURE DEGRADED" -Quiet) {
+            if (-not (Test-AckedYesterday "odds-degraded")) {
+                Add-Problem "odds-degraded-yesterday" "Yesterday's odds capture ($yest) was DEGRADED (some events failed) - see Logs\noon_$yest.log."
+            }
+        }
+    }
+} catch {
+    Add-Problem "noon-yesterday-check-error" "Yesterday-noon health check itself failed ($($_.Exception.Message)) - inspect Logs\noon_$yest.log by hand."
 }
 
 # 3) both tasks still registered and enabled

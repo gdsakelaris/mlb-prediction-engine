@@ -1,9 +1,12 @@
 """Characterization tests for Model/evaluate.py helpers on synthetic
 ledgers (no artifacts, no replays): logloss/brier, _odds_y settlement
-(pushes void), ab_compare verdicts, fit_calibrators recovery/identity
-fallbacks, goal_metrics, reliability_bands, plus the artifact-free
-calibration plumbing (_cal, PlattCal, _tail_prob)."""
+(pushes void, relief-only pitcher rows void), ab_compare verdicts,
+fit_calibrators recovery/identity fallbacks, goal_metrics,
+reliability_bands, the artifact-free calibration plumbing (_cal,
+PlattCal, _tail_prob), and the market_gate doubleheader replay contract
+(one predict_slate call per date, faked Predictor — no sims)."""
 import math
+import types
 
 import joblib
 import numpy as np
@@ -12,6 +15,7 @@ import pandas as pd
 import evaluate as EV
 import features as F
 import predict as PR
+import sim
 
 
 # ------------------------------------------------------- logloss / brier
@@ -40,8 +44,13 @@ def _frames():
         {"GamePk": 2, "AwayScore": 7, "HomeScore": 3},
         {"GamePk": 3, "AwayScore": np.nan, "HomeScore": np.nan},
     ])
-    gp = pd.DataFrame([{"GamePk": 1, "PlayerId": 10, "SO": 7,
-                        "OUTS": 18, "H": 5, "BB": 2, "ER": 3}])
+    gp = pd.DataFrame([
+        {"GamePk": 1, "PlayerId": 10, "GS": 1, "SO": 7,
+         "OUTS": 18, "H": 5, "BB": 2, "ER": 3},
+        # relief-only appearance (GS=0): a book void for starter props
+        {"GamePk": 1, "PlayerId": 11, "GS": 0, "SO": 3,
+         "OUTS": 6, "H": 1, "BB": 0, "ER": 0},
+    ])
     gb = pd.DataFrame([
         {"GamePk": 1, "PlayerId": 20, "PA": 4, "H": 2, "2B": 1,
          "3B": 0, "HR": 0, "TB": 3, "R": 1, "RBI": 2, "BB": 0, "SB": 0},
@@ -72,6 +81,18 @@ def test_odds_y_pitcher_markets():
     assert f(gb, gp, games, 1, 10, "pitcher_outs", 17.5) == 1
     assert f(gb, gp, games, 1, 10, "pitcher_earned_runs", 3.0) is None
     assert f(gb, gp, games, 1, 99, "pitcher_strikeouts", 6.5) is None
+
+
+def test_odds_y_pitcher_relief_only_voids():
+    # GS==1 settlement (the Tools/4 convention): a relief-only
+    # appearance is a book void, never a graded start — SO=3 over a
+    # 2.5 line must NOT settle as a win
+    gb, gp, games = _frames()
+    f = EV._odds_y
+    assert f(gb, gp, games, 1, 11, "pitcher_strikeouts", 2.5) is None
+    assert f(gb, gp, games, 1, 11, "pitcher_outs", 4.5) is None
+    # the true start in the same game still settles alongside it
+    assert f(gb, gp, games, 1, 10, "pitcher_strikeouts", 6.5) == 1
 
 
 def test_odds_y_batter_markets():
@@ -249,3 +270,106 @@ def test_tail_prob_smooth_nonzero_tail():
     assert 0 < beyond < 0.01                        # parametric, not hard 0
     assert PR._tail_prob(counts, 0.5) > beyond      # decreasing in thr
     assert PR._tail_prob(np.zeros(500), 0.5) == 0.0
+
+
+# ------------------------------- market_gate doubleheader replay contract
+
+def test_gate_fingerprint_carries_replay_version(tmp_path, monkeypatch):
+    # r2 = whole-date replay + GS==1 settlement; the token must sit in
+    # the cache key so rows graded under r1 (per-game DH context,
+    # relief rows settled) can never be served from cache again
+    monkeypatch.setattr(EV, "ART", tmp_path)
+    assert EV.GATE_REPLAY_VERSION >= 2
+    fp = EV._gate_fingerprint(4000)
+    assert f"|r{EV.GATE_REPLAY_VERSION}|" in fp
+
+
+def _dh_counts(pk):
+    """Deterministic per-game hit columns: 30/40 sims for game 101,
+    10/40 for game 102 — distinct p_model per DH game."""
+    h = {101: 30, 102: 10}[pk]
+    return np.concatenate([np.ones(h), np.zeros(40 - h)])
+
+
+def test_market_gate_dh_date_one_slate_call(tmp_path, monkeypatch):
+    """The gate must price ALL of a date's specs in ONE predict_slate
+    call — the serve's slate-level context, where DH game 2 sees game 1
+    as its same-day previous game — and map each result back to its own
+    GamePk. Per-game calls (the r1 replay) graded context the engine
+    never served. Also pins the per-date cache round trip under the
+    r-token key."""
+    date = "2025-06-10"
+    games = pd.DataFrame([
+        {"GamePk": 101, "Date": pd.Timestamp(date), "AwayTeam": "NYY",
+         "HomeTeam": "BOS", "AwayScore": 2, "HomeScore": 5},
+        {"GamePk": 102, "Date": pd.Timestamp(date), "AwayTeam": "NYY",
+         "HomeTeam": "BOS", "AwayScore": 7, "HomeScore": 3},
+    ])
+    calls = []
+
+    class FakeP:
+        def __init__(self):
+            self.calib = {}
+            self.mkt_blend = True
+            self.stores = types.SimpleNamespace(raw={"games": games})
+
+        def predict_slate(self, specs, n_sims=None):
+            calls.append([sp["game_pk"] for sp in specs])
+            out = []
+            for sp in specs:
+                t = np.zeros((40, 20, len(sim.STATS)))
+                t[:, 0, sim.SIDX["H"]] = _dh_counts(sp["game_pk"])
+                out.append({"spec": sp, "calib": self.calib,
+                            "meta": {"players": [500] + [-1] * 19},
+                            "tensor": t})
+            return out
+
+    def fake_spec(P, g, lineups, starters, umps, wx):
+        return dict(date=date, game_pk=int(g.GamePk),
+                    away_lineup=[(500 + i, i + 1) for i in range(9)],
+                    away_starter=600, home_starter=601)
+
+    # batter 500 plays both DH games: 2 hits in game 101, 0 in game 102
+    gb = pd.DataFrame([
+        {"GamePk": 101, "PlayerId": 500, "PA": 4, "H": 2, "2B": 0,
+         "3B": 0, "HR": 0, "TB": 2, "R": 0, "RBI": 0, "BB": 0, "SB": 0},
+        {"GamePk": 102, "PlayerId": 500, "PA": 4, "H": 0, "2B": 0,
+         "3B": 0, "HR": 0, "TB": 0, "R": 0, "RBI": 0, "BB": 0, "SB": 0},
+    ])
+    gp = pd.DataFrame(columns=["GamePk", "PlayerId", "GS", "SO",
+                               "OUTS", "H", "BB", "ER"])
+    odds = pd.DataFrame([dict(
+        Date=date, GamePk=pk, Team="NYY", PlayerId=500,
+        PlayerName="DH Batter", Market="batter_hits", Line=0.5,
+        OverPrice=-110, UnderPrice=-110, Book="pinnacle",
+        CapturedAt=f"{date}T16:00:00", OpenOverPrice=-105,
+        OpenUnderPrice=-115, OpenCapturedAt=f"{date}T12:00:00")
+        for pk in (101, 102)])
+    store = tmp_path / "odds.csv"
+    odds.to_csv(store, index=False)
+
+    monkeypatch.setattr(EV, "ART", tmp_path)
+    monkeypatch.setattr(EV, "_load_actuals", lambda: (gb, gp))
+    monkeypatch.setattr(EV.O, "DEFAULT_STORE", store)
+    monkeypatch.setattr(EV.PR, "Predictor", FakeP)
+    monkeypatch.setattr(EV.B, "_spec_frames",
+                        lambda P: (None, None, None, None))
+    monkeypatch.setattr(EV.B, "build_spec", fake_spec)
+
+    df, _ = EV.market_gate(date, date, n_sims=40, min_n=1, boot=5)
+    assert calls == [[101, 102]]         # ONE call carrying both specs
+    assert len(df) == 2
+    # each priced row graded against its OWN game's tensor: y separates
+    # the DH games (2 hits -> 1, 0 hits -> 0)
+    by_y = df.set_index("y").p_model
+    assert math.isclose(by_y[1], PR._tail_prob(_dh_counts(101), 0.5),
+                        rel_tol=1e-12)
+    assert math.isclose(by_y[0], PR._tail_prob(_dh_counts(102), 0.5),
+                        rel_tol=1e-12)
+    cache = pd.read_parquet(tmp_path / "gate_rows_cache.parquet")
+    assert cache.key.str.contains(f"|r{EV.GATE_REPLAY_VERSION}|",
+                                  regex=False).all()
+    # unchanged stack + odds: the second run serves from cache, no re-sim
+    df2, _ = EV.market_gate(date, date, n_sims=40, min_n=1, boot=5)
+    assert calls == [[101, 102]]
+    assert sorted(df2.p_model) == sorted(df.p_model)

@@ -467,6 +467,24 @@ def schedule_game_pks(date):
     return out
 
 
+def scheduled_game_count(date):
+    """How many MLB games StatsAPI schedules for `date` (postponed/
+    cancelled excluded, same filter as schedule_game_pks). The cross-check
+    behind slate_floor_verdict: mlb.com returning zero matchup boxes is
+    also the standard silent selector-break mode, and only the schedule
+    can tell that apart from a real off-day."""
+    r = requests.get("https://statsapi.mlb.com/api/v1/schedule",
+                     params={"sportId": 1, "date": date},
+                     headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    return sum(
+        1
+        for day in r.json().get("dates", [])
+        for g in day.get("games", [])
+        if not ((g.get("status") or {}).get("detailedState", "")
+                .startswith(("Postponed", "Cancelled"))))
+
+
 # ------------------------------------------------------------- fantasypros
 
 def scrape_fantasypros():
@@ -662,10 +680,50 @@ def lineup_report(games, sources, lineup_src):
     return lines
 
 
+def slate_floor_verdict(n_scraped, n_scheduled):
+    """Pure games-count floor: (games scraped from mlb.com, games on the
+    StatsAPI schedule — None when that fetch itself failed) -> (ok_to_write,
+    message). A zero-game scrape is either a real off-day or a silent
+    selector break (the lineups CSS class matching nothing), and only the
+    schedule can tell them apart: ok_to_write=False means DO NOT overwrite
+    todays_games.json and exit 1 — an unconditional empty write nukes the
+    good slate, predict.py --serve "skips" an empty slate with exit 0, and
+    the whole noon chain stays green forever. A short-but-nonzero scrape
+    writes as today with a non-fatal SLATE SHORT log line."""
+    if n_scraped == 0:
+        if n_scheduled is None:
+            return False, ("mlb.com returned 0 games and the StatsAPI "
+                           "schedule check failed — cannot tell an off-day "
+                           "from a selector break; refusing to overwrite "
+                           "todays_games.json")
+        if n_scheduled > 0:
+            return False, (f"mlb.com returned 0 games but StatsAPI "
+                           f"schedules {n_scheduled} MLB games today — "
+                           f"layout change? refusing to overwrite "
+                           f"todays_games.json")
+        return True, None                       # genuine off-day
+    if n_scheduled is not None and n_scraped < n_scheduled:
+        return True, (f"SLATE SHORT {n_scraped}/{n_scheduled} games vs "
+                      f"StatsAPI schedule")
+    return True, None
+
+
 def main():
     print("scraping mlb.com/starting-lineups ...")
     games = scrape_mlb()
     print(f"  {len(games)} games")
+    if not games:
+        # 0 scraped: cross-check the schedule before this run can replace
+        # the good slate with {"games": []} and green the chain over it
+        try:
+            n_sched = scheduled_game_count(dt.date.today().isoformat())
+        except Exception as e:                      # noqa: BLE001
+            print(f"  StatsAPI schedule check failed ({e})", file=sys.stderr)
+            n_sched = None
+        ok, msg = slate_floor_verdict(0, n_sched)
+        if not ok:
+            print(msg, file=sys.stderr)
+            sys.exit(1)
     try:
         print("scraping fantasypros (wind, temp fallback, lineup fallback) ...")
         fp = scrape_fantasypros()
@@ -852,6 +910,12 @@ def main():
                             else None)
         n_pk = sum(1 for g in games if g["game_pk"] is not None)
         print(f"  gamePk stamped for {n_pk}/{len(games)} games")
+        # nonzero-but-short slates write as today; the schedule fetched
+        # above doubles as the count (a failed fetch -> pks {} -> no check)
+        _, short = slate_floor_verdict(
+            len(games), sum(len(v) for v in pks.values()) if pks else None)
+        if short:
+            print(f"  {short}")
 
     payload = {"scraped_at": dt.datetime.now().isoformat(timespec="seconds"),
                "date": games[0]["date"] if games else None,

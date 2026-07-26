@@ -276,6 +276,9 @@ class Predictor:
         # identity — raw probabilities served with zero signal; the
         # self.degraded list now feeds a stderr warning, a red
         # '!! STATUS' workbook sheet, and headless exit code 3.
+        # Process-lifetime ARTIFACT health only — per-serve game
+        # failures live in predict_slate's per-call scope so one bad
+        # serve can't taint a later clean one on the same Predictor.
         self.degraded = []
         cal_path = ART / "output_calibrators.joblib"
         if cal_path.exists():
@@ -1331,12 +1334,18 @@ class Predictor:
                       f"fallback at {N_SIMS:,} sims", flush=True)
                 n_sims = min(n_sims, N_SIMS)
         idxs = list(range(len(specs)))
+        # per-CALL failure scope: self.degraded is process-lifetime
+        # artifact health (missing calibrators) and must not collect
+        # per-serve game failures — a failed afternoon serve would
+        # otherwise stamp a false FAILED banner on the clean evening
+        # re-serve's workbook and its as_served archive
+        deg_call = []
         if out is None:
             # per-game fault isolation: one malformed spec (bad team
             # abbrev, corrupted venue) must not abort the other N-1
             # games' serve — skip it, keep the original index for
             # seeds/hctx, and surface the failure on the status sheet
-            # (self.degraded also drives headless exit code 3)
+            # (this call's degraded list also drives headless exit 3)
             out, idxs = [], []
             for gi, spec in enumerate(specs):
                 tick(f"game {gi + 1}/{len(specs)}: preparing...")
@@ -1355,7 +1364,7 @@ class Predictor:
                            f"({type(e).__name__}: {e}) — slate served "
                            f"WITHOUT it")
                     print(f"ERROR: {msg}", file=sys.stderr, flush=True)
-                    self.degraded.append(msg)
+                    deg_call.append(msg)
                     continue
                 res["meta"] = meta
                 out.append(res)
@@ -1379,7 +1388,7 @@ class Predictor:
             spec = specs[gi]
             res["spec"] = spec
             res["calib"] = self.calib
-            res["degraded"] = list(self.degraded)
+            res["degraded"] = self.degraded + deg_call
             if mf is not None:
                 res["mktfair"] = mf
             if hctx is not None:
@@ -2710,6 +2719,10 @@ def main():
               f"all DISABLED for this run", flush=True)
     P = None  # models load once, first slate that has games
     served = 0
+    # union of each served slate's degraded list (artifact health +
+    # THAT slate's game failures) — P.degraded alone is artifact-only
+    # and would miss per-slate game failures for exit 3
+    served_deg = []
     for jpath in args.json:
         payload = json.loads(Path(jpath).read_text(encoding="utf-8"))
         games = payload.get("games") or []
@@ -2727,6 +2740,9 @@ def main():
             P = Predictor(progress=lambda m: print(m, flush=True))
         out = P.predict_slate(specs, n_sims=args.sims,
                               progress=lambda m: print(m, flush=True))
+        for d in ((out[0].get("degraded") or []) if out else []):
+            if d not in served_deg:
+                served_deg.append(d)
         # ledger/sidecar/archive only on full-standard serves: smoke
         # tests must never write permanent evidence rows
         path = save_excel_slate(specs, out, ledger=real_serve)
@@ -2740,11 +2756,11 @@ def main():
         served += 1
     if len(args.json) > 1:
         print(f"batch complete: {served}/{len(args.json)} slates served")
-    if P is not None and P.degraded:
+    if served_deg:
         # exit 3 = served-but-DEGRADED (raw probabilities in play) —
         # distinct from a crash's exit 1 so a wrapper can tell "no
         # workbook" from "workbook you should not bet"
-        print(f"WARNING: served degraded -> {'; '.join(P.degraded)}",
+        print(f"WARNING: served degraded -> {'; '.join(served_deg)}",
               file=sys.stderr, flush=True)
         sys.exit(3)
 
