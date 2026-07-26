@@ -75,9 +75,19 @@ def fair_map(sub, open_side=False):
     return out
 
 
-dates = sorted(set(odds["Date"]) & {
+# Dates whose captured prices are NOT pregame market truth and must
+# never enter the model-vs-market evidence. 2026-07-12: the day's only
+# capture ran 14:39 local against an all-day-game slate — the stored
+# prices are in-play (53% of two-sided batter_hits Overs plus-money vs
+# ~12% on neighboring dates; two-sided universe 693 -> 322), carrying
+# partial-outcome information the pregame market never offered.
+# Tools/2 now skips commenced games at capture time, so the class
+# cannot recur; this list quarantines the legacy damage.
+IN_PLAY_DATES = {"2026-07-12"}
+
+dates = sorted((set(odds["Date"]) - IN_PLAY_DATES) & {
     p.name[:10] for p in (ROOT / "Predictions").glob("2026-*.xlsx")})
-print("dates:", dates)
+print("dates:", dates, f"(quarantined in-play: {sorted(IN_PLAY_DATES)})")
 
 rows_out = []
 for date in dates:

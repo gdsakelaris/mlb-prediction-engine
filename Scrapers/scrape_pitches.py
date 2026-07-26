@@ -89,7 +89,9 @@ import numpy as np
 import pandas as pd
 import requests
 
-from seasons import YEARS, atomic_write
+from scrape_statcast import (find_stub_dates, record_stub_state,
+                             require_source_columns)
+from seasons import CURRENT_SEASON, YEARS, atomic_write
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "Data"
 RAW_DIR = DATA_DIR / "raw_pitches"
@@ -124,10 +126,27 @@ CAP_ROWS = 24000
 SLEEP = 2.0
 REFETCH_DAYS = 2
 FADE_MIN_FB = 8                  # fastballs needed for a per-start velo slope
+# suspended-game completeness re-check (find_stub_dates, shared with
+# scrape_statcast): a final game with fewer stored pitches than this is
+# a partial ingest — the completion carries the original game_date,
+# already behind the incremental watermark
+STUB_FLOOR_PITCHES = 150
 
 
 GT_ALL = "R|F|D|L|W|"        # regular + the four postseason rounds
 GT_POST = "F|D|L|W|"         # postseason only (targeted backfill)
+
+# every Savant source column aggregate() reads; a missing one on a
+# non-empty payload is upstream schema drift and fails closed
+# (require_source_columns; SAVANT_SCHEMA_LAX=1 degrades to a warning)
+REQUIRED_SRC = (
+    "game_pk", "game_date", "at_bat_number", "pitch_number",
+    "pitcher", "batter", "description", "zone", "pitch_type",
+    "release_speed", "balls", "strikes", "release_pos_x", "release_pos_z",
+    "plate_x", "plate_z", "sz_top", "sz_bot", "pfx_x", "pfx_z",
+    "on_1b", "on_2b", "on_3b", "effective_speed",
+    "estimated_woba_using_speedangle",
+)
 
 
 def fetch_range(d0, d1, tries=3, gt=GT_ALL):
@@ -167,10 +186,14 @@ def aggregate(raw):
     """One Savant chunk -> (pitcher day rows, batter day rows)."""
     if raw.empty:
         return None, None
+    require_source_columns(raw, REQUIRED_SRC, "scrape_pitches.aggregate")
     # canonical in-game pitch order (game, at-bat, pitch) so the
     # sequencing pairs and the per-start velo-fade index are well-defined;
     # mergesort keeps ties stable. Games never span a chunk (one day each).
     raw = raw.copy()
+    for c in REQUIRED_SRC:
+        if c not in raw.columns:
+            raw[c] = pd.NA        # SAVANT_SCHEMA_LAX=1 runs only
     raw["_gpk"] = pd.to_numeric(raw["game_pk"], errors="coerce")
     raw["_abn"] = pd.to_numeric(raw["at_bat_number"], errors="coerce")
     raw["_pnum"] = pd.to_numeric(raw["pitch_number"], errors="coerce")
@@ -664,6 +687,42 @@ def main():
                 write_raw(year, raw_chunks)
             raw_chunks.clear()
         print(f"{year}: {got:,} pitches", flush=True)
+
+    # suspended-game completeness re-check (find_stub_dates, shared with
+    # scrape_statcast; incremental runs only). The daily CSVs are
+    # player-day grain, so per-game pitch counts come from the current
+    # season's raw archive, which the loop above just extended.
+    # Refetching a flagged date is idempotent: the re-aggregated
+    # player-day rows land last and win the (PlayerId, Date) dedupe in
+    # finish(), and append_raw replaces archived rows per game_pk.
+    arch_path = RAW_DIR / f"pitches_{CURRENT_SEASON}.parquet"
+    if start is not None and arch_path.exists():
+        arch = pd.read_parquet(arch_path, columns=["game_date", "game_pk"])
+        ev = pd.DataFrame({
+            "Date": pd.to_datetime(arch["game_date"]).dt.date,
+            "GamePk": arch["game_pk"]})
+        for d in find_stub_dates(ev, floor=STUB_FLOOR_PITCHES,
+                                 until=start, scope="pitches"):
+            print(f"    completeness: refetching {d} (final game below "
+                  f"{STUB_FLOOR_PITCHES} stored pitches, or resumed "
+                  f"per schedule)", flush=True)
+            raw = fetch_range(d, d)
+            time.sleep(SLEEP)
+            if raw.empty:
+                continue
+            append_raw(d.year, [raw])
+            pit, bat = aggregate(raw)
+            if pit is not None:
+                pit_frames.append(pit)
+                bat_frames.append(bat)
+        # memo the post-merge archive counts so unchanged short finals
+        # settle instead of refetching daily for the whole window
+        arch2 = pd.read_parquet(arch_path,
+                                columns=["game_date", "game_pk"])
+        record_stub_state(pd.DataFrame({
+            "Date": pd.to_datetime(arch2["game_date"]).dt.date,
+            "GamePk": arch2["game_pk"]}),
+            floor=STUB_FLOOR_PITCHES, scope="pitches")
 
     def finish(kept, frames, path, key=("PlayerId", "Date")):
         new = pd.concat(frames, ignore_index=True) if frames else None

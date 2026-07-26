@@ -23,7 +23,10 @@ Default run is incremental — fetched are: games missing from the output
 CSV, stored rows with null Humidity/Pressure (an endpoint gap must not be
 cached forever), and games still inside the archive-lag window, whose
 stored values are forecast-model output and are refreshed daily until the
-archive's observations cover them. Seconds in the daily job, right after
+archive's observations cover them. Games whose venue has no coordinates
+anywhere get null rows too (same convention as an endpoint gap: the hole
+stays visible and is retried daily) plus a WARNING naming the venue — the
+fix is adding it to EXTRA_VENUES. Seconds in the daily job, right after
 scrape_gamelogs adds yesterday's finals. --backfill refetches everything
 (~5-10 minutes).
 
@@ -74,6 +77,7 @@ EXTRA_VENUES = {
     "Fort Bragg Field": (35.1270, -79.0180),
     "Bristol Motor Speedway": (36.5157, -82.2570),
     "Rickwood Field": (33.5021, -86.8296),
+    "Field of Dreams": (42.4958, -91.0545),
     "TD Ameritrade Park": (41.2665, -95.9245),
     # Williamsport Little League Classic park (Bowman Field), renamed twice
     "BB&T Ballpark": (41.2404, -77.0480),
@@ -157,6 +161,18 @@ def rows_for_games(games, hours):
     return out
 
 
+def null_weather_rows(games):
+    """Rows with null weather for games whose venue has no coordinates —
+    the same convention as an endpoint gap, so the hole is visible in the
+    CSV and re-selected by the null-row repair pass every run instead of
+    being silently dropped forever (adding the venue to EXTRA_VENUES then
+    fills it: value-bearing rows outrank null rows in the dedup)."""
+    return [{"GamePk": g.GamePk, "Date": f"{g.Date:%Y-%m-%d}",
+             "Venue": g.Venue, "Humidity": None, "Pressure": None,
+             "Precip": None}
+            for g in games.itertuples()]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("-o", "--output", default=str(DEFAULT_OUT))
@@ -189,15 +205,19 @@ def main():
     print(f"{len(games):,} games need weather", flush=True)
 
     coords = venue_coords()
-    unmatched = games[~games["Venue"].isin(coords)]
-    if len(unmatched):
-        print("WARNING: no coordinates for these venues (rows skipped):")
-        for v, n in unmatched["Venue"].value_counts().items():
+    rows = []
+    matched = games["Venue"].isin(coords)      # NaN Venue -> False too
+    if (~matched).any():
+        unmatched = games[~matched]
+        print("WARNING: no coordinates for these venues — writing null "
+              "rows (visible in the CSV, retried daily); add each venue "
+              "to EXTRA_VENUES in scrape_weather.py to fill them:")
+        for v, n in unmatched["Venue"].value_counts(dropna=False).items():
             print(f"    {v}: {n} game(s)")
-        games = games[games["Venue"].isin(coords)]
+        rows.extend(null_weather_rows(unmatched))
+        games = games[matched]
 
     cutoff = date.today() - timedelta(days=ARCHIVE_LAG_DAYS)
-    rows = []
     for venue, vg in games.groupby("Venue"):
         lat, lon = coords[venue]
         old = vg[vg["Date"].dt.date < cutoff]

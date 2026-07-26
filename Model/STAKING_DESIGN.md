@@ -55,6 +55,17 @@ A candidate becomes a paper bet iff **all** of:
 Never both sides of the same market. One bet per (player, market, line) per
 game, best available captured price.
 
+> **2026-07-26 amendment (§3.5-§3.6), adopted before any family ever held a
+> gate PASS — no live experiment was altered:** a stake additionally
+> requires (5) implied probability of the offered price ≥ **0.20** (no
+> stakes past ~+400: at longshot prices a small absolute model error is a
+> huge relative one, so EV screens pass on tail miscalibration alone — the
+> shadow ledger's +1000-class totals bucket demonstrated exactly this), and
+> (6) the quote posted by ≥ **2 books** (a single stale quote is
+> line-shopping winner's curse, not a market). Rows failing either band are
+> recorded as `track` with `stake_capped_by` = `longshot-band` /
+> `single-book`, so tail evidence keeps accruing without money on it.
+
 ## 4. Probability shrinkage
 
 Raw `p_model` is not staked. The staked probability shrinks toward the

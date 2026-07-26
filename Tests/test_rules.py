@@ -56,8 +56,8 @@ def _end_half_state(n, inning, half, score, bat_ptr0=3):
     return prep, st
 
 
-def _call_end_half(prep, st, season, mask=None):
-    rules = S.rules_for(season)
+def _call_end_half(prep, st, season, mask=None, postseason=False):
+    rules = S.rules_for(season, postseason=postseason)
     mask = np.ones(len(st["inning"]), dtype=bool) if mask is None \
         else mask
     S._end_half(mask, st["inning"], st["half"], st["outs"], st["bases"],
@@ -89,6 +89,60 @@ def test_no_ghost_runner_before_2020():
     _call_end_half(prep, st, season=2019)
     assert (st["inning"] == 10).all()
     assert (st["bases"] == -1).all()
+
+
+def test_rules_for_postseason_traditional():
+    # the automatic runner and the 7-inning DH are regular-season only:
+    # postseason=True must kill both in EVERY season they exist
+    for season in (2020, 2021, 2024, 2026):
+        assert S.rules_for(season)["ghost_runner"]
+        r = S.rules_for(season, postseason=True)
+        assert not r["ghost_runner"]
+        assert r["regulation"] == 9
+    assert not S.rules_for(2019, postseason=True)["ghost_runner"]
+    assert S.rules_for(2021, is_dh_game=True)["regulation"] == 7
+    assert S.rules_for(2021, is_dh_game=True,
+                       postseason=True)["regulation"] == 9
+
+
+def test_no_ghost_runner_in_postseason_extras():
+    # same tied bottom-9 state as the 2024 placement test, but October:
+    # top 10 must open with empty bases (season-only gating placed one)
+    prep, st = _end_half_state(2, inning=9, half=1,
+                               score=[[4, 4], [2, 2]])
+    _call_end_half(prep, st, season=2024, postseason=True)
+    assert (st["inning"] == 10).all() and (st["half"] == 0).all()
+    assert not st["done"].any()
+    assert (st["bases"] == -1).all()
+    assert (st["resp"] == -1).all()
+
+
+def test_batch_rules_postseason_vector():
+    # run_batch's per-game postseason list must reach the rule vectors
+    import sim_batch as SB
+    prep = synth.make_prep()
+    bp = SB.BatchPrep([prep, prep], [2024, 2024], [False, False],
+                      [False, True], np)
+    assert bp.ghost.tolist() == [True, False]
+
+
+def test_postseason_extras_play_traditional():
+    # walk-only offense + always-caught steals: every inning is
+    # walk/CS x3 and the game rides 0-0 to the cap (see
+    # test_steals_caught_only). In 2024 the ghost runner would occupy
+    # 2B in extras, blocking the steal outs — walks then score without
+    # end. postseason=True must reproduce the pre-2020 traditional ride.
+    walks = synth.class_vec(BB=1.0)
+    prep = synth.make_prep(away_vec=walks, home_vec=walks, sb_att=1.0,
+                           sb_suc=0.0)
+    res = S.run(prep, n_sims=100, seed=28, season=2024,
+                postseason=True)
+    t, sc = res["tensor"], res["score"]
+    assert res["leftover"] == 0
+    assert (sc.sum(axis=1) == 1).all()           # cap coin-flip only
+    assert (t[..., S.SIDX["SB"]] == 0).all()
+    cs = t[..., S.SIDX["CS"]].sum(1)
+    assert (cs == 2 * 3 * S.MAX_INNINGS).all()   # no free runner ever
 
 
 def test_game_end_conditions():

@@ -809,10 +809,22 @@ def main():
         date, s, _, painted = grade(path)
     except GradeError as e:
         sys.exit(str(e))
-    if not painted:
-        sys.exit(f"{path} is open in Excel (it holds the file lock) — "
-                 f"close it there, then run this again.")
+    # the CSV ledger settle needs only Data/ + the odds store — never
+    # gate it on Excel's lock over the .xlsx (the 6AM no-args run used
+    # to exit here BEFORE settling, delaying every PnL/CLV settlement a
+    # full day whenever the workbook was left open overnight; --all
+    # already settled regardless)
     settled = _settle_ledger(date)
+    if not painted:
+        if not settled:
+            print(f"  !! LEDGER SETTLE FAILED for {date} — see the "
+                  f"traceback above", flush=True)
+        sys.exit(f"{path} is open in Excel (it holds the file lock) — "
+                 f"close it there, then run this again."
+                 + (f" (The staking ledger for {date} was still "
+                    f"settled.)" if settled
+                    else f" (LEDGER SETTLE ALSO FAILED for {date} — "
+                    f"see the traceback above.)"))
     print(f"graded {path}")
     print("")
     print(f"  {date}: {s['cells']:,} cells checked, {s['hit']:,} stats "

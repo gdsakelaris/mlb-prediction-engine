@@ -197,7 +197,7 @@ def spec_postseason(spec):
     the schedule scrape catches up are the only miss)."""
     gt = str(spec.get("game_type") or "")
     if gt:
-        return float(gt in ("F", "D", "L", "W"))
+        return float(gt in sim.POSTSEASON_TYPES)
     try:
         return float(pd.Timestamp(spec["date"]).month >= 10)
     except (KeyError, ValueError):
@@ -302,18 +302,41 @@ class Predictor:
             print(f"WARNING: {d}", file=sys.stderr, flush=True)
         # residual heads (heads.py --train): per-family shallow-GBM
         # logit corrections applied on top of the Platt output. Only
-        # heads that kept trees load; to serve Platt-only, move
-        # residual_heads.joblib aside.
+        # Heads load only with POSITIVE held-out gain. The documented
+        # "no residual structure => early-stops to zero trees => head
+        # is the identity" safety cannot fire: LightGBM early stopping
+        # never returns best_iteration=0 (minimum one tree), so every
+        # trained family keeps trees and the gain SIGN is the actual
+        # evidence. Gain rides in the artifact (heads.py stamps it);
+        # older artifacts without it fall back to heads_report.csv.
+        # To serve Platt-only, move residual_heads.joblib aside.
         self.heads = {}
         hp = ART / "residual_heads.joblib"
         if hp.exists():
             import lightgbm as lgb
+            rep_gain = {}
+            rp = ART / "heads_report.csv"
+            if rp.exists():
+                try:
+                    _r = pd.read_csv(rp)
+                    rep_gain = dict(zip(_r.family, _r.gain))
+                except Exception:               # noqa: BLE001
+                    pass
+            harmful = []
             for fam, h in joblib.load(hp).items():
+                gain = h.get("gain", rep_gain.get(fam))
+                if gain is not None and float(gain) <= 0:
+                    harmful.append(fam)
+                    continue
                 if h.get("best_iter", 0) > 0:
                     self.heads[fam] = dict(
                         bst=lgb.Booster(model_str=h["booster_str"]),
                         features=h["features"],
                         best_iter=int(h["best_iter"]))
+            if harmful:
+                print("note: residual heads with non-positive held-out "
+                      f"gain not loaded: {', '.join(sorted(harmful))}",
+                      file=sys.stderr, flush=True)
         else:
             print("note: residual heads not loaded (Platt-only serve)",
                   file=sys.stderr, flush=True)
@@ -1293,6 +1316,7 @@ class Predictor:
 
     def predict_slate(self, specs, n_sims=None, progress=None):
         tick = progress or (lambda m: None)
+        serve_day = dt.date.today().isoformat()   # launch day, not save day
         # historical replays have no per-date roster archive: bullpen
         # membership, catcher/fielder identities and primary positions
         # all come from TODAY's mlb_rosters.csv snapshot (IL spans +
@@ -1356,7 +1380,9 @@ class Predictor:
                                   seed=int(pd.Timestamp(spec["date"])
                                            .toordinal()) * 100 + gi,
                                   season=meta["season"],
-                                  is_dh_game=bool(spec.get("is_dh")))
+                                  is_dh_game=bool(spec.get("is_dh")),
+                                  postseason=bool(
+                                      spec_postseason(spec)))
                 except Exception as e:      # noqa: BLE001
                     label = (f'{spec.get("away_team", "?")}@'
                              f'{spec.get("home_team", "?")}')
@@ -1389,6 +1415,11 @@ class Predictor:
             res["spec"] = spec
             res["calib"] = self.calib
             res["degraded"] = self.degraded + deg_call
+            # the day this serve LAUNCHED: save_excel_slate's replay
+            # guard compares against this, not save-time today, so a
+            # real late-night serve finishing after midnight is never
+            # reclassified as a historical replay
+            res["serve_day"] = serve_day
             if mf is not None:
                 res["mktfair"] = mf
             if hctx is not None:
@@ -1413,13 +1444,14 @@ class Predictor:
         seed0 = int(pd.Timestamp(specs[0]["date"]).toordinal()) * 100
         seasons = [m["season"] for _, m in pm]
         is_dh = [bool(sp.get("is_dh")) for sp in specs]
+        post = [bool(spec_postseason(sp)) for sp in specs]
         parts = []
         for ci in range(k):
             tick(f"simulating {len(specs)} games: chunk {ci + 1}/{k} "
                  f"({s:,} sims)...")
             parts.append(sim_batch.run_batch(
                 [p for p, _ in pm], n_sims=s, seed=seed0 + ci,
-                seasons=seasons, is_dh=is_dh))
+                seasons=seasons, is_dh=is_dh, postseason=post))
         out = []
         for gi, (_, meta) in enumerate(pm):
             chunks = [pt[gi] for pt in parts]
@@ -2181,6 +2213,11 @@ def build_bets(out, date):
         bits = list(note_bits)
         if books == 1:
             bits.append("1 book")
+        if dec_best > 5.0:
+            # implied < 20%: at longshot prices a small absolute model
+            # error is a huge relative one, so the EV column is the
+            # least trustworthy exactly where it looks most impressive
+            bits.append("longshot")
         rows.append({
             "Game": game, "G#": gnum, "Player": player, "Team": team,
             "Prop": prop, "Side": side, "Line": line, "Model %": p_model,
@@ -2473,11 +2510,30 @@ def save_excel_slate(specs, out, path=None, ledger=True):
           flush=True)
     date = str(specs[0]["date"]) if specs else dt.date.today().isoformat()
     PRED_DIR.mkdir(exist_ok=True)
+    # Historical-replay guard: a serve of a PAST date is research, not
+    # evidence. Recording it would append hindsight bets to the ledger
+    # (the date's odds and outcomes are already final), and its
+    # collision-bumped <date>_2.xlsx would silently BECOME the served
+    # record — Tools/4 and Tools/6 both treat highest-suffix-per-date
+    # as "what was served last". Replays keep the full workbook but
+    # live in Predictions/replays/ (invisible to the graders), with
+    # the ledger, as_served archive and pure sidecar all off.
+    ref_day = next((r.get("serve_day") for r in out
+                    if r.get("serve_day")), None) \
+        or dt.date.today().isoformat()
+    replay = bool(specs) and date < ref_day
+    if replay and ledger:
+        print(f"HISTORICAL REPLAY: {date} is a past date — workbook "
+              f"goes to Predictions/replays/; ledger, as_served and "
+              f"pure sidecar are NOT recorded", flush=True)
+        ledger = False
     if path is None:
-        path = PRED_DIR / f"{date}.xlsx"
+        base = (PRED_DIR / "replays") if replay else PRED_DIR
+        base.mkdir(exist_ok=True)
+        path = base / f"{date}.xlsx"
         k = 2
         while Path(path).exists():
-            path = PRED_DIR / f"{date}_{k}.xlsx"
+            path = base / f"{date}_{k}.xlsx"
             k += 1
 
     bet_rows = build_bets(out, date)

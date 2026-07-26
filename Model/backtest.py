@@ -126,9 +126,11 @@ def sim_sample(P, sample, latent, n_sims=1000):
             preps[pk] = P.prepare_game(spec, n_sims=n_sims)
         prep, meta = preps[pk]
         prep.latent = latent
+        gt = str(getattr(g, "GameType", "") or "")
         res = sim.run(prep, n_sims=n_sims, seed=pk % 99991,
                       season=int(g.Season),
-                      is_dh_game=pk in _dh_pks(P))
+                      is_dh_game=pk in _dh_pks(P),
+                      postseason=gt in sim.POSTSEASON_TYPES)
         t, s = res["tensor"], sim.SIDX
         tot = res["score"].sum(axis=1)
         rows.append(dict(

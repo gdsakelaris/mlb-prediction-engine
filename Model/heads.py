@@ -198,8 +198,12 @@ def train(min_rows=3000, holdout=0.25, seed=7):
         ll_head = _ll(va["y"].values, p_head)
         max_adj = (float(np.max(np.abs(p_head - va["p_cal"].values)))
                    if best > 0 else 0.0)
+        # gain rides in the artifact: the serve loads only gain>0
+        # heads (early stopping can never return 0 trees, so the gain
+        # sign — not best_iter — is the no-residual-structure signal)
         heads[fam] = dict(booster_str=bst.model_to_string(),
                           features=list(Xt.columns), best_iter=best,
+                          gain=float(ll_platt - ll_head),
                           trained_through=str(sub.Date.max()))
         report.append(dict(
             family=fam, n=len(sub), n_holdout=len(va), best_iter=best,

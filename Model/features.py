@@ -66,6 +66,7 @@ import argparse
 import json
 import os
 import shutil
+import time
 import warnings
 from collections import deque
 from datetime import date
@@ -96,7 +97,17 @@ def write_artifact(path, write_fn, backup=True):
         shutil.copy2(path, bdir / path.name)
     tmp = path.with_name(path.name + ".tmp")
     write_fn(tmp)
-    os.replace(tmp, path)
+    # OneDrive briefly locks files it is syncing; without a retry one
+    # PermissionError mid-retrain kills train.py between artifacts and
+    # leaves a torn a1-new/a2-old set serving with no warning
+    for i in range(6):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if i == 5:
+                raise
+            time.sleep(0.5 * (i + 1))
 
 DECAY_HL = 90.0          # days; skill half-life for decayed panels
 VELO_HL_FAST = 30.0      # short-window velo (in-season trend vs baseline)
@@ -140,6 +151,51 @@ PITCH_CLASS = {          # arsenal codes -> fast / breaking / offspeed
     "SL": "brk", "ST": "brk", "CU": "brk", "KC": "brk", "SV": "brk",
     "KN": "brk", "CS": "brk", "SC": "brk",
     "CH": "off", "FS": "off", "FO": "off", "EP": "off"}
+
+# Sponsor renames of CURRENT parks (same physical site). Shared by park
+# geometry and the travel/timezone context inputs — before the share,
+# _ctx_inputs skipped the alias pass and silently zeroed travel for
+# every renamed-park row.
+VENUE_ALIASES = {"Miller Park": "American Family Field",
+                 "AT&T Park": "Oracle Park",
+                 "Safeco Field": "T-Mobile Park",
+                 "SunTrust Park": "Truist Park",
+                 "Angel Stadium of Anaheim": "Angel Stadium",
+                 "U.S. Cellular Field": "Rate Field",
+                 "Guaranteed Rate Field": "Rate Field",
+                 "Minute Maid Park": "Daikin Park",
+                 "Marlins Park": "loanDepot Park",
+                 "Oriole Park": "Oriole Park at Camden Yards"}
+
+# Departed parks and special-event sites appearing in mlb_games.csv but
+# not mlb_ballparks.csv (which holds only the 30 current parks). Rows
+# at these venues silently zeroed travel_km/tz_shift for every team
+# LEAVING them — 681 Coliseum games alone — and the mechanism re-arms
+# at every future special-site game. Approximate centroids are plenty
+# for a travel-fatigue feature. Covers every venue observed 2015-2026.
+HISTORICAL_VENUE_COORDS = {
+    "Oakland Coliseum": (37.7516, -122.2005),
+    "O.co Coliseum": (37.7516, -122.2005),
+    "Globe Life Park in Arlington": (32.7512, -97.0832),
+    "Turner Field": (33.7350, -84.3894),
+    "George M. Steinbrenner Field": (27.9803, -82.5064),
+    "Sahlen Field": (42.8804, -78.8738),
+    "TD Ballpark": (28.0034, -82.7873),
+    "Estadio de Beisbol Monterrey": (25.6790, -100.2438),
+    "Estadio Alfredo Harp Helu": (19.4042, -99.0907),
+    "Las Vegas Ballpark": (36.1550, -115.3390),
+    "London Stadium": (51.5386, -0.0166),
+    "Tokyo Dome": (35.7056, 139.7519),
+    "Gocheok Sky Dome": (37.4982, 126.8672),
+    "Hiram Bithorn Stadium": (18.4274, -66.0740),
+    "Fort Bragg Field": (35.1401, -78.9994),
+    "Bristol Motor Speedway": (36.5158, -82.2570),
+    "Rickwood Field": (33.4941, -86.8355),
+    "TD Ameritrade Park": (41.2627, -95.9422),
+    # Williamsport Little League Classic park under its three names
+    "BB&T Ballpark": (41.2419, -76.9861),
+    "Muncy Bank Ballpark": (41.2419, -76.9861),
+    "Journey Bank Ballpark": (41.2419, -76.9861)}
 
 # wind direction -> (field it blows toward/from, out=+1/in=-1); both the
 # boxscore casing ("Out To CF") and the live-slate casing ("Out To Cf")
@@ -339,6 +395,15 @@ def build_pa_table():
     pa["score_diff"] = pa["bat_sc"] - _num(pa["fld_score"])
     pa["home_bat"] = (pa["inning_topbot"].astype(str).str.lower()
                       == "bot").astype("int8")
+    # Statcast retroactively recodes Oakland as 'ATH' for ALL seasons;
+    # the warehouse (mlb_games, OAA, catcher, pitching CSVs) says 'OAK'
+    # through 2024. Unnormalized, every A's-fielding merge missed —
+    # defense stamped league-average 0.0 across ~58k PAs — and the
+    # hazard table handed A's home starters the OPPONENT's pen workload
+    # (fld_team=='ATH' never equalled HomeTeam=='OAK').
+    ath = pa["Season"] <= 2024
+    for c in ("home_team", "away_team"):
+        pa.loc[ath & (pa[c] == "ATH"), c] = "OAK"
     pa["bat_team"] = np.where(pa["home_bat"] == 1, pa["home_team"],
                               pa["away_team"])
     pa["fld_team"] = np.where(pa["home_bat"] == 1, pa["away_team"],
@@ -838,6 +903,19 @@ def build_hrpt_tables():
         cls = PITCH_CLASS.get(str(r["PitchType"]))
         if cls:
             disp2cls[str(r["Pitch"])] = cls
+    # mlb_homeruns.csv uses different display labels than the arsenal
+    # file; unmatched labels were silently dropped from the mix/quality
+    # panels — 1,240 of 34,101 HRs, including EVERY splitter HR, so a
+    # splitter-heavy HR hitter's class edge was understated exactly in
+    # the matchup this feature exists to catch. Classes mirror
+    # PITCH_CLASS (KN is 'brk' there, so Knuckle Ball follows it).
+    for syn, cls in (("Splitter", "off"), ("Forkball", "off"),
+                     ("Eephus", "off"), ("Knuckle Ball", "brk"),
+                     ("Knuckle Curve", "brk"), ("Slow Curve", "brk"),
+                     ("Fastball", "fast"),
+                     ("Four-Seam Fastball", "fast"),
+                     ("2-Seam Fastball", "fast")):
+        disp2cls.setdefault(syn, cls)
     hr = read_csv("mlb_homeruns.csv",
                   usecols=["BatterId", "Date", "Pitch", "Exit Velo",
                            "Distance", "Ballpark"])
@@ -983,17 +1061,9 @@ def build_park_geometry(pa):
     bp = bp.drop(columns=["Roof"])
     # historical names of CURRENT parks (sponsor renames — same physical
     # geometry). Departed parks (Oakland Coliseum, Turner Field, Globe
-    # Life PARK, alternate sites) stay NaN deliberately.
-    aliases = {"Miller Park": "American Family Field",
-               "AT&T Park": "Oracle Park",
-               "Safeco Field": "T-Mobile Park",
-               "SunTrust Park": "Truist Park",
-               "Angel Stadium of Anaheim": "Angel Stadium",
-               "U.S. Cellular Field": "Rate Field",
-               "Guaranteed Rate Field": "Rate Field",
-               "Minute Maid Park": "Daikin Park",
-               "Marlins Park": "loanDepot Park",
-               "Oriole Park": "Oriole Park at Camden Yards"}
+    # Life PARK, alternate sites) stay NaN deliberately — geometry
+    # (pull/porch fits) is park-specific in a way travel coords aren't.
+    aliases = VENUE_ALIASES
     amap = pd.DataFrame({"Venue": list(aliases),
                          "src": list(aliases.values())})
     extra = amap.merge(bp.rename(columns={"Venue": "src"}), on="src")
@@ -1101,6 +1171,13 @@ def build_defense_tables():
     uer["Year"] = _num(uer["Season"]) + 1        # serve year = prior + 1
     out = out.merge(uer[["Year", "Team", "def_uer"]],
                     on=["Year", "Team"], how="left")
+    # franchise recode at the serve-year boundary: the Year-2025 row is
+    # built from 2024 data labeled 'OAK', but the 2025+ serving code
+    # (and Statcast, retroactively for all seasons) is 'ATH' — without
+    # this relabel the A's serve-year defense merge missed and fillna
+    # stamped league-average 0.0
+    out.loc[(out["Year"] >= 2025) & (out["Team"] == "OAK"),
+            "Team"] = "ATH"
     out.to_parquet(STORES / "defense_team.parquet", index=False)
     catp = read_csv("mlb_catchers.csv")
     catp["Year"] = _num(catp["Year"]) + 1
@@ -3340,6 +3417,16 @@ def _ctx_inputs():
             coords[r["Ballpark"]] = (float(r["Lat"]), float(r["Lon"]))
         except (TypeError, ValueError):
             pass
+    # renamed parks share the current site's coordinates; departed and
+    # special-event venues get their own. _context_rows silently zeroes
+    # travel/tz when either endpoint is missing, so every gap here was
+    # a fatigue feature quietly stuck at 0 (SF's first series after
+    # AT&T Park's rename, every team leaving the Coliseum, Mexico City)
+    for old, new in VENUE_ALIASES.items():
+        if new in coords:
+            coords.setdefault(old, coords[new])
+    for v, ll in HISTORICAL_VENUE_COORDS.items():
+        coords.setdefault(v, ll)
     return coords, _team_game_maps()
 
 

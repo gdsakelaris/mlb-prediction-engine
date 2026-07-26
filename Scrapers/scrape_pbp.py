@@ -37,7 +37,12 @@ APPENDED batch-by-batch through an atomic copy-append-replace
 (seasons.atomic_append: a kill can only lose the whole in-flight batch,
 never leave a torn or half-written game the resume cache would skip), so
 an interrupted backfill resumes where it stopped. --backfill starts the
-file over.
+file over. A final at least 3 days old whose playByPlay parses to zero
+rows on 3 total attempts lands in the negative cache shared with
+scrape_linescores (Data/.empty_finals.json, own scope — see
+scrape_linescores.EmptyFinalsCache) and is skipped with a per-run count
+instead of being refetched forever inside "0 fetch failures"; the entry
+drops the moment the game returns data (e.g. --backfill), self-healing.
 
 Usage:
     python scrape_pbp.py [-o output.csv] [--backfill] [--limit N]
@@ -56,6 +61,8 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+from scrape_linescores import (EMPTY_CACHE, EMPTY_MIN_AGE_DAYS,
+                               EmptyFinalsCache, game_age_days)
 from seasons import atomic_append, trim_torn_tail
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "Data"
@@ -199,9 +206,16 @@ def main():
             errors="coerce").dropna().astype("int64"))
 
     todo = games[~games["GamePk"].isin(have)]
+    cache = EmptyFinalsCache("pbp", EMPTY_CACHE)
+    n_skip = 0
+    if not args.backfill:                    # --backfill retries them all
+        skip = todo["GamePk"].map(cache.known_empty).astype(bool)
+        n_skip = int(skip.sum())
+        todo = todo[~skip]
     if args.limit:
         todo = todo.head(args.limit)
     print(f"{len(games):,} games in universe; {len(have):,} cached; "
+          f"{n_skip:,} known-empty finals skipped; "
           f"{len(todo):,} to fetch", flush=True)
     if todo.empty:
         print("nothing to fetch", flush=True)
@@ -221,11 +235,17 @@ def main():
         for fut in concurrent.futures.as_completed(futures):
             g = futures[fut]
             try:
-                batch.extend(fut.result())
+                got = fut.result()
             except Exception as e:                   # noqa: BLE001
                 n_fail += 1
                 print(f"  WARNING: {g.GamePk} failed ({e}); skipping "
                       f"(retried next run)", flush=True)
+            else:
+                if got:
+                    cache.record_data(g.GamePk)
+                    batch.extend(got)
+                elif game_age_days(g.Date) >= EMPTY_MIN_AGE_DAYS:
+                    cache.record_empty(g.GamePk)
             n_done += 1
             if len(batch) >= BATCH_GAMES * 100 or \
                     (batch and n_done == len(futures)):
@@ -239,6 +259,7 @@ def main():
     if batch:
         append_rows(out_path, batch, header_due)
         n_rows += len(batch)
+    cache.save()
 
     print(f"appended {n_rows:,} rows from {n_done - n_fail:,} games "
           f"-> {out_path} ({n_fail:,} fetch failures this run)", flush=True)

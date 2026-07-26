@@ -460,8 +460,14 @@ def schedule_game_pks(date):
             away = ab.get(g["teams"]["away"]["team"]["id"])
             home = ab.get(g["teams"]["home"]["team"]["id"])
             if away and home and g.get("gamePk"):
+                # gameType rides along (3rd slot; consumers index [0]/[1]
+                # so the widening is safe): the sim's postseason rules
+                # (traditional extras — no ghost runner) key off the
+                # spec's game_type, and without the stamp an October
+                # slate falls back to a month heuristic
                 out.setdefault((away, home), []).append(
-                    (int(g["gamePk"]), g.get("gameDate") or ""))
+                    (int(g["gamePk"]), g.get("gameDate") or "",
+                     str(g.get("gameType") or "")))
     for v in out.values():
         v.sort(key=lambda x: x[1])
     return out
@@ -908,6 +914,10 @@ def main():
             g["game_pk"] = (cand[occ][0]
                             if len(cand) == pair_n[key] and occ < len(cand)
                             else None)
+            # every game of one matchup on one date shares a gameType,
+            # so the stamp survives even the ordinal-mismatch case that
+            # blanks the pk
+            g["game_type"] = cand[0][2] if cand else None
         n_pk = sum(1 for g in games if g["game_pk"] is not None)
         print(f"  gamePk stamped for {n_pk}/{len(games)} games")
         # nonzero-but-short slates write as today; the schedule fetched

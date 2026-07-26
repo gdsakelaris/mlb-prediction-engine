@@ -78,6 +78,41 @@ def test_prepare_games_matches_prepare_game(ctx):
         a, b = getattr(prep, attr), getattr(bprep, attr)
         assert a.shape == b.shape, attr
         assert np.allclose(a, b, atol=1e-5, equal_nan=True), attr
+    # twin-computed layout/identity fields: _resolve_game re-implements
+    # prepare_game's row layout by hand and NONE of these are encoded
+    # in the arrays above — a drifted twin (switch-hitter default,
+    # catcher slot, tilt z, pen membership) passed the 5-field check
+    # while the GUI and batched noon serves disagreed on platoon/
+    # participation/SB for the same slate
+    for attr in ("starters", "bench_rows", "bat_side", "pit_throws",
+                 "slot_is_c", "run_z", "dp_z", "arm_eff", "stretch_z",
+                 "relief_exit", "pre_wp"):
+        a = np.asarray(getattr(prep, attr), dtype=float)
+        b = np.asarray(getattr(bprep, attr), dtype=float)
+        assert a.shape == b.shape, attr
+        assert np.allclose(a, b, atol=1e-6, equal_nan=True), attr
+    for attr in ("pen_hi", "pen_lo"):
+        assert np.array_equal(np.asarray(getattr(prep, attr)),
+                              np.asarray(getattr(bprep, attr))), attr
+    assert abs(float(prep.pre_pk) - float(bprep.pre_pk)) < 1e-9
+    sa, sb_ = prep.sb_state, bprep.sb_state
+    assert (sa is None) == (sb_ is None), "sb_state presence"
+    if sa is not None:
+        assert np.allclose(np.asarray(sa, dtype=float),
+                           np.asarray(sb_, dtype=float), atol=1e-6)
+    ta, tb = prep.stretch, bprep.stretch
+    assert (ta is None) == (tb is None), "stretch presence"
+    if ta is not None:
+        assert set(ta) == set(tb), "stretch keys"
+        for k in ta:
+            assert abs(float(ta[k]) - float(tb[k])) < 1e-9, \
+                f"stretch[{k}]"
+    # pen_order is per-sim randomized; the arm MEMBERSHIP per team is
+    # the deterministic part both paths must agree on
+    po_a, po_b = np.asarray(prep.pen_order), np.asarray(bprep.pen_order)
+    for team in (0, 1):
+        assert (set(po_a[:, team].ravel().tolist())
+                == set(po_b[:, team].ravel().tolist())), f"pen t{team}"
 
 
 def test_golden_engines_agree_on_real_prep(ctx):

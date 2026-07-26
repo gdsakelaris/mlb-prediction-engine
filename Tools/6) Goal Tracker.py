@@ -74,8 +74,12 @@ def newest_books():
 
 
 def confirmed_tags(date, book=None):
-    """Game tags ('AWY@HOM') whose both lineups were confirmed at serve
-    time, from the slate archive that was ACTUALLY served: the newest
+    """('AWY@HOM', game#) pairs whose both lineups were confirmed at
+    serve time — game# so a doubleheader with one confirmed and one
+    projected game never marks the sibling confirmed (matchup-level
+    tags scoped the typical posted-game-1/projected-game-2 DH's game-2
+    rows into the canonical confirmed judgment series) — from the
+    slate archive that was ACTUALLY served: the newest
     archive scraped at or before the workbook's serve moment. The serve
     moment is the pristine Predictions/as_served copy's mtime (the book
     in Predictions/ is re-saved by every grade, so its own mtime drifts;
@@ -106,7 +110,9 @@ def confirmed_tags(date, book=None):
             pass                       # unreadable mtime: keep the last
     slate = json.loads(pick.read_text(encoding="utf-8"))
     games = slate["games"] if isinstance(slate, dict) else slate
-    return {f'{g["away_team"]}@{g["home_team"]}' for g in games
+    return {(f'{g["away_team"]}@{g["home_team"]}',
+             2 if g.get("dh_game2") else 1)
+            for g in games
             if g.get("away_lineup_src", "mlb") == "mlb"
             and g.get("home_lineup_src", "mlb") == "mlb"}
 
@@ -195,14 +201,15 @@ def track_date(date, book):
             if s is None:
                 nofinal += 1
                 continue
-            rowdata.append((tag, r, s))
+            rowdata.append((tag, gnum, r, s))
         for mkt, (kind, spec) in markets.items():
             j = idx[mkt]
             for scope in ("all", "confirmed"):
                 rows, tags = [], set()
-                for tag, r, s in rowdata:
-                    if scope == "confirmed" and (conf is None
-                                                 or tag not in conf):
+                for tag, gnum, r, s in rowdata:
+                    if scope == "confirmed" and (
+                            conf is None
+                            or (tag, gnum or 1) not in conf):
                         continue
                     p = r[j]
                     if not isinstance(p, float):
@@ -210,7 +217,7 @@ def track_date(date, book):
                     y = (int(bool(spec(s))) if kind == "event"
                          else int(float(s[spec[0]]) > spec[1]))
                     rows.append((p, y))
-                    tags.add(tag)
+                    tags.add((tag, gnum or 1))
                 if not rows:
                     continue
                 rec = _metrics(rows)

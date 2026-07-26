@@ -32,8 +32,10 @@ CLI:
 """
 
 import argparse
+import contextlib
 import os
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -52,6 +54,16 @@ EDGE_FLOOR = 0.03       # §3.3, matches the gate's edge-bucket dead zone
 LAMBDA = 0.25           # quarter-Kelly
 PER_BET_CAP = 0.01      # min(f, 1% of bankroll)
 START_BANKROLL = 100.0  # units; bankroll = START + cumsum(settled PnL)
+# §3.5-§3.6 stake band (amended 2026-07-26, BEFORE any family ever
+# passed the gate, so no live experiment was touched): a +1000-class
+# price can clear every EV screen on tail miscalibration alone — at
+# implied 9%, a 3pt absolute model error is a 30%+ relative one — and
+# quarter-Kelly's (dec-1) divisor caps the damage but not the noise in
+# the evidence record. Stakes additionally require the implied
+# probability floor and a two-book quote; track rows still record
+# EVERYTHING above MIN_EV so the tail evidence keeps accruing.
+STAKE_MIN_IMPLIED = 0.20   # no stakes past ~+400
+STAKE_MIN_BOOKS = 2        # a single stale quote is not a market
 
 LEDGER_COLS = [
     "Date", "Game", "GNum", "GamePk", "PlayerId", "PlayerName", "Team",
@@ -289,6 +301,10 @@ def enrich(bet_rows, date, mkt_fam):
             status, capped, stake = "track", f"edge<{EDGE_FLOOR}", 0.0
         elif ev <= 0:
             status, capped, stake = "track", "EV<=0", 0.0
+        elif implied < STAKE_MIN_IMPLIED:
+            status, capped, stake = "track", "longshot-band", 0.0
+        elif int(float(r.get("Books") or 0)) < STAKE_MIN_BOOKS:
+            status, capped, stake = "track", "single-book", 0.0
         elif f_kelly > PER_BET_CAP:
             status, capped = "paper", "per-bet-1%"
             stake = PER_BET_CAP * bank
@@ -339,7 +355,76 @@ def _write(df):
     LEDGER.parent.mkdir(exist_ok=True)
     tmp = LEDGER.with_name(LEDGER.name + ".tmp")
     df.to_csv(tmp, index=False, encoding="utf-8-sig")
-    os.replace(tmp, LEDGER)
+    # OneDrive re-uploads (and briefly locks) the ledger after every
+    # write; without a retry a PermissionError here silently drops the
+    # whole batch (the serve catches the exception and continues) —
+    # same transient the scrapers' _replace_retry absorbs
+    for i in range(6):
+        try:
+            os.replace(tmp, LEDGER)
+            return
+        except PermissionError:
+            if i == 5:
+                raise
+            time.sleep(0.5 * (i + 1))
+
+
+@contextlib.contextmanager
+def _ledger_lock():
+    """Inter-process mutex over the ledger's load->modify->write
+    critical section. append() (noon/evening serves) and settle()
+    (morning grade, incl. the self-heal sweep) are full-file
+    read-modify-write cycles from different processes that genuinely
+    overlap on catch-up mornings — unlocked, whichever writes last
+    silently erases the other's rows from the append-only record.
+    O_EXCL lockfile with bounded wait; a lock older than 10 minutes is
+    from a killed process and is broken."""
+    lock = LEDGER.with_name(LEDGER.name + ".lock")
+    LEDGER.parent.mkdir(exist_ok=True)
+    deadline = time.monotonic() + 120.0
+    fd = None
+    while fd is None:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+        except FileExistsError:
+            try:
+                if time.time() - lock.stat().st_mtime > 600:
+                    lock.unlink()   # stale: holder died >10 min ago
+                    continue
+            except OSError:
+                pass                # raced another breaker/releaser
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"ledger lock {lock} held >120s — another append/"
+                    f"settle is running (or crashed <10 min ago)")
+            time.sleep(1.0)
+    try:
+        yield
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        # the release must not silently leak the lockfile: OneDrive can
+        # briefly hold the just-created .lock (same transient _write
+        # retries), and a leaked lock stalls the next append/settle for
+        # the full 120s deadline and drops its batch — retry, then WARN
+        # with the path so the operator can delete it by hand
+        for i in range(6):
+            try:
+                lock.unlink()
+                break
+            except FileNotFoundError:
+                break
+            except OSError:
+                if i == 5:
+                    print(f"WARNING: could not remove ledger lock "
+                          f"{lock} — next append/settle may stall "
+                          f"120s; delete it by hand if it persists",
+                          file=sys.stderr, flush=True)
+                else:
+                    time.sleep(0.5 * (i + 1))
 
 
 def append(rows):
@@ -354,6 +439,11 @@ def append(rows):
     and count its PnL/CLV twice into the permanent record."""
     if not rows:
         return 0
+    with _ledger_lock():
+        return _append_locked(rows)
+
+
+def _append_locked(rows):
     led = _load()
     n_dup = 0
     if len(led):
@@ -402,7 +492,43 @@ def settle(date):
     box scores and the final captured close, then void earlier dates'
     did-not-play stragglers. Idempotent; a bad row is skipped (logged)
     and can never abort the batch — everything that settled still
-    writes. Unresolvable same-date rows stay open for the next run."""
+    writes. Unresolvable same-date rows stay open for the next run.
+    The ledger critical section (fresh load -> settle -> write) runs
+    under _ledger_lock; the ~110MB of box-score/odds inputs load
+    OUTSIDE it so a concurrent serve's append never waits on disk."""
+    pre = _load()
+    if not len(pre):
+        return
+    if not (pre.Status.isin(("paper", "track"))
+            & (pre.Outcome == "")).any():
+        return
+    games_all = pd.read_csv(DATA / "mlb_games.csv", encoding="utf-8-sig")
+    finals = games_all.dropna(subset=["AwayScore", "HomeScore"])
+    games = finals[finals.Date == str(date)]
+    # the FULL day slate (finals or not): _fill_clv's doubleheader
+    # detection must see a DH sibling even before it goes final
+    slate = games_all[games_all.Date == str(date)]
+    gb_all = pd.read_csv(DATA / "mlb_game_batting.csv",
+                         encoding="utf-8-sig")
+    gb = gb_all[gb_all.Date == str(date)]
+    gp_all = _with_outs(pd.read_csv(DATA / "mlb_game_pitching.csv",
+                                    encoding="utf-8-sig"))
+    gp = gp_all[gp_all.Date == str(date)]
+    try:
+        store = pd.read_csv(O.DEFAULT_STORE, encoding="utf-8-sig",
+                            low_memory=False)
+        store = store[store.Date == str(date)]
+    except OSError:
+        store = pd.DataFrame(columns=O.ODDS_COLUMNS)
+    with _ledger_lock():
+        return _settle_locked(date, games, finals, slate, gb, gb_all,
+                              gp, gp_all, store)
+
+
+def _settle_locked(date, games, finals, slate, gb, gb_all, gp, gp_all,
+                   store):
+    # fresh load under the lock: the pre-check copy is stale if a
+    # serve appended while the box-score inputs were loading
     led = _load()
     if not len(led):
         return
@@ -430,24 +556,6 @@ def settle(date):
     stale = live & (led.Date < str(date))
     if not (mask.any() or stale.any() or dup):
         return
-    games_all = pd.read_csv(DATA / "mlb_games.csv", encoding="utf-8-sig")
-    finals = games_all.dropna(subset=["AwayScore", "HomeScore"])
-    games = finals[finals.Date == str(date)]
-    # the FULL day slate (finals or not): _fill_clv's doubleheader
-    # detection must see a DH sibling even before it goes final
-    slate = games_all[games_all.Date == str(date)]
-    gb_all = pd.read_csv(DATA / "mlb_game_batting.csv",
-                         encoding="utf-8-sig")
-    gb = gb_all[gb_all.Date == str(date)]
-    gp_all = _with_outs(pd.read_csv(DATA / "mlb_game_pitching.csv",
-                                    encoding="utf-8-sig"))
-    gp = gp_all[gp_all.Date == str(date)]
-    try:
-        store = pd.read_csv(O.DEFAULT_STORE, encoding="utf-8-sig",
-                            low_memory=False)
-        store = store[store.Date == str(date)]
-    except OSError:
-        store = pd.DataFrame(columns=O.ODDS_COLUMNS)
 
     n_set, wl = 0, {"win": 0, "lose": 0, "push": 0}
     for i in led.index[mask]:

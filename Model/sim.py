@@ -26,7 +26,8 @@ Outputs a per-sim player-stat tensor plus game scores, first-5-inning
 and first-inning runs — every market is a counting query over these.
 
 Rules are per-season (replay needs old rules): ghost runner 2020+,
-7-inning doubleheaders 2020-21.
+7-inning doubleheaders 2020-21 — neither ever applied in the
+postseason, so both are postseason-conditioned.
 """
 
 from pathlib import Path
@@ -141,10 +142,19 @@ PLATOON_WIN = 3          # pen entry: a same-hand arm within the first
                          # managers don't reach past the top of the pen)
 
 
-def rules_for(season, is_dh_game=False):
+# statsapi gameType codes for postseason rounds (spec_postseason and
+# backtest replay share this single definition)
+POSTSEASON_TYPES = ("F", "D", "L", "W")
+
+
+def rules_for(season, is_dh_game=False, postseason=False):
+    # the 2020+ automatic runner and the 2020-21 7-inning doubleheader
+    # were regular-season rules only — October extras have always played
+    # traditional, full-length baseball
     return dict(
-        ghost_runner=season >= 2020,
-        regulation=7 if (is_dh_game and season in (2020, 2021)) else 9,
+        ghost_runner=season >= 2020 and not postseason,
+        regulation=7 if (is_dh_game and season in (2020, 2021)
+                         and not postseason) else 9,
     )
 
 
@@ -194,9 +204,10 @@ def bat_axis(rows):
 
 
 # MIRROR[engine_loop]: twin in Model/sim_batch.py run_batch — change BOTH or parity drifts
-def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False):
+def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False,
+        postseason=False):
     rng = np.random.default_rng(seed)
-    rules = rules_for(season, is_dh_game)
+    rules = rules_for(season, is_dh_game, postseason)
     REG = rules["regulation"]
     S = n_sims
 

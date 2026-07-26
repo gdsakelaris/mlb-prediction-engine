@@ -118,9 +118,11 @@ def make_bank():
 def make_prep(away_vec=None, home_vec=None, hazard=0.0, relief_exit=0.0,
               sb_att=0.0, sb_suc=0.75, pre_pk=0.0, pre_wp=0.0,
               pen_empty=False, pit_throws=None, bat_side=None,
-              latent=None, n_sims_pen=1):
+              latent=None, n_sims_pen=1, full=False):
     """Symmetric-by-default synthetic GamePrep. away_vec/home_vec are
-    8-class vectors applied to that team's batter axes (incl. bench)."""
+    8-class vectors applied to that team's batter axes (incl. bench).
+    full=True activates every twin-implemented subsystem the zero
+    defaults silence (see _activate_full)."""
     away_vec = class_vec() if away_vec is None else away_vec
     home_vec = class_vec() if home_vec is None else home_vec
 
@@ -139,7 +141,7 @@ def make_prep(away_vec=None, home_vec=None, hazard=0.0, relief_exit=0.0,
     else:
         pen_hi = pen_lo = pen_rows
 
-    return S.GamePrep(
+    prep = S.GamePrep(
         n_players=NP_,
         starters=[18, 19],
         bench_rows=[36, 37],
@@ -175,6 +177,43 @@ def make_prep(away_vec=None, home_vec=None, hazard=0.0, relief_exit=0.0,
         stretch=None,
         stretch_z=np.zeros(NP_, dtype=np.float32),
     )
+    return _activate_full(prep) if full else prep
+
+
+def _activate_full(prep):
+    """Turn ON every twin-implemented subsystem the zero defaults
+    silence: pattern tilts (run/dp/arm), stretch base-state K/BB
+    conditioning, participation pulls, live SB state, catcher slots,
+    and the leverage-pen hi/lo split. The quiet/busy preps zero all of
+    these, so the parity suite was structurally blind to regressions in
+    exactly the twin engine code (the B11 class). Values are
+    deterministic (fixed rng) — a parity failure on a full prep is
+    engine drift, never fixture noise. Shapes mirror
+    predict.prepare_game exactly: part_haz dense [6,4,3,2,2,2] rate
+    table, stretch dict of scalar logit offsets, sb_state [4]."""
+    rng = np.random.default_rng(7)
+    n = prep.n_players
+    prep.run_z = rng.normal(0.0, 0.8, n).astype(np.float32)
+    prep.dp_z = rng.normal(0.0, 0.8, n).astype(np.float32)
+    prep.arm_eff = np.array([0.6, -0.4], dtype=np.float32)
+    prep.stretch_z = rng.normal(0.0, 0.7, n).astype(np.float32)
+    prep.stretch = dict(dk_on=0.08, dk_off=-0.03, db_on=0.06,
+                        db_off=-0.02, b1k=0.05)
+    prep.sb_state = np.array([0.35, -0.25, 0.30, 0.9], dtype=np.float32)
+    slot_c = np.zeros(18, dtype=np.int8)
+    slot_c[[4, 13]] = 1                     # one catcher per lineup
+    prep.slot_is_c = slot_c
+    dense = np.full((6, 4, 3, 2, 2, 2), 0.012)
+    for kk in range(6):                     # pull risk rises with K
+        dense[kk] *= 1.0 + 0.5 * kk
+    prep.part_haz = dense
+    prep.pen_lo = prep.pen_hi[:, ::-1].copy()   # low-lev order differs
+    side = np.tile(np.array([0, 1, 2], dtype=np.int8), 6)
+    prep.bat_side = side                    # L/R/S mix -> platoon paths
+    pt = np.ones(n, dtype=np.int8)
+    pt[::2] = 0
+    prep.pit_throws = pt
+    return prep
 
 
 def ledger_checks(res, reg=9):

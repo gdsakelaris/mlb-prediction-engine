@@ -33,6 +33,8 @@ Usage:
 
 import argparse
 import io
+import json
+import os
 import sys
 import time
 from datetime import date, timedelta
@@ -83,6 +85,25 @@ CAP_ROWS = 24000       # a chunk this big was probably truncated -> split it
 SLEEP = 2.0            # politeness between requests
 REFETCH_DAYS = 2       # re-pull the newest days: Savant back-corrects data
 
+# suspended-game completeness re-check (find_stub_dates, shared with
+# scrape_pitches): Savant stamps EVERY pitch of a suspended game with the
+# ORIGINAL game_date, so a completion played more than REFETCH_DAYS after
+# the suspension sits behind the incremental watermark and is never
+# fetched without a targeted re-check.
+GAMES_CSV = DATA_DIR / "mlb_games.csv"   # finals only (scrape_gamelogs)
+STUB_WINDOW_DAYS = 30  # re-check horizon: cross-series resumptions can
+#                        land weeks after the original date; the memo
+#                        below makes the wide window cost one refetch
+#                        per short final, not one per day
+STUB_FLOOR_BIP = 25    # final game with fewer stored BIP = partial ingest
+# memo of already-refetched low-count dates (per scraper scope): a
+# flagged date whose per-game counts are UNCHANGED since its last
+# successful refetch is settled — a rain-shortened 5-inning final sits
+# below the floor legitimately and must not trigger a full-day Savant
+# pull every run for the whole window. Written ONLY after a successful
+# refetch+merge (record_stub_state), so a crashed refetch retries.
+STUB_MEMO = DATA_DIR / ".stub_checked.json"
+
 # postseason rows are ordinary evidence (one engine, no October fork) —
 # same game-type universe as scrape_pitches / the gamelogs
 GT_ALL = "R|F|D|L|W|"        # regular + the four postseason rounds
@@ -124,10 +145,37 @@ def fetch_range(d0, d1, tries=3, gt=GT_ALL):
     return df
 
 
+def require_source_columns(raw, cols, context):
+    """Fail CLOSED on upstream schema drift: a non-empty Savant payload
+    missing a mapped source column means an upstream rename/drop, and
+    silently filling with NA would poison the store for months before
+    validate_data's cumulative NaN tripwires fire. Raising marks the
+    scraper FAILED in the 6AM job and the watchdog alerts.
+    SAVANT_SCHEMA_LAX=1 degrades to a loud stderr warning (missing
+    values become NA) for deliberate operator runs. Shared with
+    scrape_pitches."""
+    missing = [c for c in cols if c not in raw.columns]
+    if not missing:
+        return
+    msg = (f"{context}: Savant payload is missing mapped source "
+           f"column(s) {missing} — upstream schema drift? Set "
+           f"SAVANT_SCHEMA_LAX=1 to run anyway (missing values "
+           f"become NA).")
+    if os.environ.get("SAVANT_SCHEMA_LAX") == "1":
+        print(f"WARNING: {msg}", file=sys.stderr, flush=True)
+        return
+    raise RuntimeError(msg)
+
+
 def to_schema(raw):
-    """Savant frame -> our column schema (empty frame if no rows)."""
+    """Savant frame -> our column schema (empty frame if no rows).
+    Fails closed when a mapped source column is missing (schema drift);
+    SAVANT_SCHEMA_LAX=1 degrades to a warning + NA fill."""
     if raw.empty:
         return pd.DataFrame(columns=list(COLUMNS))
+    require_source_columns(raw,
+                           [s for s in COLUMNS.values() if s is not None],
+                           "scrape_statcast.to_schema")
     out = pd.DataFrame()
     for col, src in COLUMNS.items():
         if src is None:
@@ -137,6 +185,167 @@ def to_schema(raw):
     out["Date"] = d.dt.date
     out["Season"] = d.dt.year
     return out[list(COLUMNS)]
+
+
+def _stub_counts(events, games_path, window_days, until):
+    """Shared prep for find_stub_dates/record_stub_state: (finals frame
+    clipped to the window, per-(Date, GamePk) stored-row counts, lo).
+    finals is None when there is nothing to check."""
+    games_path = Path(games_path) if games_path is not None else GAMES_CSV
+    if not games_path.exists():
+        return None, None, None
+    finals = pd.read_csv(games_path, usecols=["GamePk", "Date"],
+                         encoding="utf-8-sig")
+    finals["Date"] = pd.to_datetime(finals["Date"]).dt.date
+    finals["GamePk"] = pd.to_numeric(finals["GamePk"], errors="coerce")
+    finals = finals.dropna().astype({"GamePk": "int64"})
+    lo = date.today() - timedelta(days=window_days)
+    hi = until if until is not None else date.today() + timedelta(days=1)
+    finals = finals[(finals["Date"] >= lo) & (finals["Date"] < hi)]
+    if finals.empty:
+        return None, None, lo
+    ev = pd.DataFrame({
+        "Date": events["Date"],
+        "GamePk": pd.to_numeric(events["GamePk"], errors="coerce")})
+    ev = ev.dropna().astype({"GamePk": "int64"})
+    ev = ev[ev["Date"] >= lo]
+    counts = ev.groupby(["Date", "GamePk"]).size() if len(ev) else None
+    return finals, counts, lo
+
+
+def _date_counts(counts, finals, d):
+    """{str(GamePk): stored rows} for date d's FINAL games (0-filled) —
+    the memo signature find_stub_dates compares against."""
+    pks = finals.loc[finals["Date"] == d, "GamePk"]
+    if counts is None:
+        return {str(int(pk)): 0 for pk in pks}
+    return {str(int(pk)): int(counts.get((d, int(pk)), 0)) for pk in pks}
+
+
+def _load_stub_memo(memo_path=None):
+    p = Path(memo_path) if memo_path is not None else STUB_MEMO
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+_RESUMED_CACHE = {}
+
+
+def _resumed_finals(lo, hi):
+    """ORIGINAL dates of suspended games whose completion is now FINAL,
+    from one keyless StatsAPI schedule call. The count floor cannot see
+    a late suspension (a 7th-inning stub holds ~220 pitches, well above
+    the floor), and Savant stamps the completion's pitches with the
+    original date — so those dates must be flagged by schedule status,
+    not by counts. Failure degrades to count-floor-only, loudly."""
+    key = (lo, hi)
+    if key in _RESUMED_CACHE:
+        return _RESUMED_CACHE[key]
+    dates = set()
+    try:
+        r = requests.get(
+            "https://statsapi.mlb.com/api/v1/schedule",
+            params={"sportId": 1, "startDate": lo.isoformat(),
+                    "endDate": hi.isoformat()},
+            timeout=30)
+        r.raise_for_status()
+        for day in r.json().get("dates", []):
+            for g in day.get("games", []):
+                if (g.get("status") or {}).get("codedGameState") != "F":
+                    continue
+                # the completion record carries resumedFrom (points at
+                # the original date); the original-date record carries
+                # resumeDate — either way the ORIGINAL date is the one
+                # whose Savant rows are incomplete
+                rf = str(g.get("resumedFrom") or "")
+                if rf:
+                    try:
+                        dates.add(date.fromisoformat(rf[:10]))
+                    except ValueError:
+                        pass
+                elif g.get("resumeDate") or g.get("resumeGameDate"):
+                    try:
+                        dates.add(date.fromisoformat(
+                            str(day.get("date"))[:10]))
+                    except ValueError:
+                        pass
+    except Exception as ex:                          # noqa: BLE001
+        print(f"  resumed-game probe failed ({ex}); count-floor check "
+              f"only this run", file=sys.stderr)
+    _RESUMED_CACHE[key] = dates
+    return dates
+
+
+def find_stub_dates(events, floor, until=None, games_path=None,
+                    window_days=STUB_WINDOW_DAYS, scope="bip",
+                    memo_path=None, probe=None):
+    """Dates in the last `window_days` days whose stored rows undercount
+    a FINAL game (suspended-game signature: the completion's pitches
+    carry the ORIGINAL game_date, already behind the watermark) — plus
+    dates the StatsAPI schedule marks as resumed-and-completed, which a
+    count floor alone cannot see. Dates whose per-game counts are
+    unchanged since their last successful refetch (memo, see
+    record_stub_state) are settled and skipped, so a legitimately short
+    rain-shortened final costs ONE refetch, not one per day.
+
+    events: frame with Date (datetime.date) + GamePk columns, one row
+    per stored pitch/batted ball. until: the incremental watermark
+    start — dates at/after it were just fully refetched. probe: tests
+    inject a set of resumed dates; None = live schedule probe, run only
+    with the production games file (tests pass games_path). Returns
+    sorted stub dates ([] when clean). Shared with scrape_pitches."""
+    finals, counts, lo = _stub_counts(events, games_path, window_days,
+                                      until)
+    if finals is None:
+        return []
+    got = counts.reindex(
+        pd.MultiIndex.from_frame(finals[["Date", "GamePk"]]),
+        fill_value=0).to_numpy() if counts is not None else \
+        pd.Series(0, index=range(len(finals))).to_numpy()
+    low = set(finals.loc[got < floor, "Date"])
+    if probe is None:
+        probe = (_resumed_finals(lo, date.today())
+                 if games_path is None else set())
+    low |= {d for d in probe if (finals["Date"] == d).any()}
+    if not low:
+        return []
+    memo = _load_stub_memo(memo_path).get(scope, {})
+    return sorted(d for d in low
+                  if memo.get(str(d)) != _date_counts(counts, finals, d))
+
+
+def record_stub_state(events, floor, scope, games_path=None,
+                      window_days=STUB_WINDOW_DAYS, memo_path=None,
+                      probe=None):
+    """Write the memo AFTER a successful refetch+merge: per-game counts
+    of every still-low or resumed-flagged date in the window. Tomorrow's
+    find_stub_dates skips dates whose counts did not change; a crashed
+    run never reaches this call, so its dates retry. Replacing the
+    scope's dict wholesale prunes dates that aged out or healed."""
+    finals, counts, lo = _stub_counts(events, games_path, window_days,
+                                      until=None)
+    memo = _load_stub_memo(memo_path)
+    if finals is None:
+        memo[scope] = {}
+    else:
+        got = counts.reindex(
+            pd.MultiIndex.from_frame(finals[["Date", "GamePk"]]),
+            fill_value=0).to_numpy() if counts is not None else \
+            pd.Series(0, index=range(len(finals))).to_numpy()
+        low = set(finals.loc[got < floor, "Date"])
+        if probe is None:
+            probe = (_resumed_finals(lo, date.today())
+                     if games_path is None else set())
+        low |= {d for d in probe if (finals["Date"] == d).any()}
+        memo[scope] = {str(d): _date_counts(counts, finals, d)
+                       for d in low}
+    p = Path(memo_path) if memo_path is not None else STUB_MEMO
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(memo, indent=1, sort_keys=True),
+                   encoding="utf-8")
+    os.replace(tmp, p)
 
 
 def season_windows(year, start=None):
@@ -252,6 +461,22 @@ def main():
     new = new.drop_duplicates(KEY, keep="last")
     if len(new) < n0:
         print(f"dropped {n0 - len(new):,} duplicate rows on {KEY}", flush=True)
+    # suspended-game completeness re-check (incremental runs only — a
+    # backfill refetches every date anyway): refetching a flagged date
+    # is idempotent because the KEY dedupe keeps the refetched rows
+    if start is not None:
+        for d in find_stub_dates(new, floor=STUB_FLOOR_BIP, until=start,
+                                 scope="bip"):
+            print(f"    completeness: refetching {d} (final game below "
+                  f"{STUB_FLOOR_BIP} stored batted balls, or resumed "
+                  f"per schedule)", flush=True)
+            df = to_schema(fetch_range(d, d))
+            if len(df):
+                new = pd.concat([new, df], ignore_index=True)
+            time.sleep(SLEEP)
+        new = new.drop_duplicates(KEY, keep="last")
+        # memo the post-merge counts so unchanged short finals settle
+        record_stub_state(new, floor=STUB_FLOOR_BIP, scope="bip")
     new = new.sort_values(["Date", "GamePk", "AtBat", "PitchNum"])
     out_path.parent.mkdir(exist_ok=True)
     with atomic_write(out_path, "w", newline="", encoding="utf-8-sig") as f:

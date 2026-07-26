@@ -266,6 +266,8 @@ def replay_rows_batch(start, end, n_sims=4000, chunk=64, progress=True,
             seed=1000 + state["chunk"],
             seasons=[m["season"] for _, m in pm],
             is_dh=[bool(s.get("is_dh")) for s in pend_specs],
+            postseason=[bool(PR.spec_postseason(s))
+                        for s in pend_specs],
             backend=backend)
         for res, (_, meta), spec, g in zip(res_list, pm, pend_specs,
                                            pend_games):

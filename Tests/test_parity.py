@@ -170,6 +170,51 @@ def test_batch_gpu_matches_classic():
     _run_parity("gpu")
 
 
+# full-feature latent: nonzero offense/pitcher sigmas too — LAT keeps
+# them 0 (matching the current production latent.json), which left the
+# per-team latent lanes untested; backtest.py grids nonzero values, so
+# the next refit could activate untested twin code
+LAT_FULL = dict(mu_env=0.05, sigma_env=0.06, sigma_offense=0.10,
+                sigma_pitcher=0.12, sigma_hr=0.15, sigma_k=0.2)
+
+
+def _run_parity_full(backend):
+    """Parity with every twin-implemented subsystem ACTIVE (tilts,
+    stretch, participation pulls, sb_state, catcher slots, leverage-pen
+    split — synth._activate_full). The quiet/busy preps zero all of
+    these, so this is the lane that actually guards the twin code the
+    B11 class regressed."""
+    import sim_batch as SB
+    n = 20000
+    preps = [synth.make_prep(sb_att=0.008, sb_suc=0.74,
+                             latent=dict(LAT_FULL), full=True),
+             synth.make_prep(hazard=0.04, relief_exit=0.3,
+                             sb_att=0.012, sb_suc=0.72, pre_pk=0.002,
+                             pre_wp=0.004, latent=dict(LAT_FULL),
+                             full=True)]
+    batch = SB.run_batch(preps, n_sims=n, seed=301,
+                         seasons=[2024, 2024], is_dh=[False, False],
+                         backend=backend)
+    for i, prep in enumerate(preps):
+        classic = S.run(prep, n_sims=n, seed=402 + i, season=2024)
+        synth.ledger_checks(classic)
+        synth.ledger_checks(batch[i])
+        _assert_close(_measure(classic), _measure(batch[i]),
+                      f"full{i}[{backend}]")
+        _assert_battery_close(_market_battery(classic),
+                              _market_battery(batch[i]),
+                              f"full{i}[{backend}]")
+
+
+def test_batch_cpu_matches_classic_full_features():
+    _run_parity_full("cpu")
+
+
+def test_batch_gpu_matches_classic_full_features():
+    pytest.importorskip("cupy")
+    _run_parity_full("gpu")
+
+
 def test_batch_latent_is_per_game():
     """B11 FIXED 2026-07-20: BatchPrep stacks per-game latent params, so
     a mixed-latent batch applies each game's own latent (was: game 0's

@@ -81,7 +81,7 @@ def dense_patterns(pat):
 class BatchPrep:
     """Stacked per-game arrays + rule vectors for one batch."""
 
-    def __init__(self, preps, seasons, is_dh, xp):
+    def __init__(self, preps, seasons, is_dh, postseason, xp):
         G = len(preps)
         self.G = G
         f32 = xp.float32
@@ -174,7 +174,8 @@ class BatchPrep:
             for k in ("mu_env", "sigma_env", "sigma_hr",
                       "sigma_pitcher", "sigma_offense", "sigma_k")}
         self.n_players = preps[0].n_players
-        rules = [S_.rules_for(s, d) for s, d in zip(seasons, is_dh)]
+        rules = [S_.rules_for(s, d, p)
+                 for s, d, p in zip(seasons, is_dh, postseason)]
         self.reg = xp.asarray(
             np.array([r["regulation"] for r in rules]), dtype=np.int8)
         self.ghost = xp.asarray(
@@ -191,7 +192,7 @@ def _sample_dense(xp, cum_rows, u):
 
 # MIRROR[engine_loop]: twin in Model/sim.py run — change BOTH or parity drifts
 def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
-              backend="gpu"):
+              postseason=None, backend="gpu"):
     """Simulate G games x n_sims each; returns a list of per-game dicts
     shaped exactly like sim.run's output."""
     if backend == "gpu":
@@ -207,7 +208,9 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
     G = len(preps)
     seasons = seasons if seasons is not None else [2026] * G
     is_dh = is_dh if is_dh is not None else [False] * G
-    bp = BatchPrep(preps, seasons, is_dh, xp)
+    postseason = (postseason if postseason is not None
+                  else [False] * G)
+    bp = BatchPrep(preps, seasons, is_dh, postseason, xp)
     rng = (xp.random.default_rng(seed) if xp is not np
            else np.random.default_rng(seed))
     S = n_sims

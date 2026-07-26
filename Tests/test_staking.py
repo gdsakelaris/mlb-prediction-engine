@@ -119,7 +119,7 @@ def _bet(market="batter_hits", pid=123, side="Over", line=1.5,
             "Player": player, "Team": team, "Prop": "hits o1.5",
             "Side": side, "Line": line, "Model %": pm, "Mkt %": pc,
             "Best Odds": odds, "Book": "draftkings", "EV%": 0.1,
-            "_market": market}
+            "Books": 3, "_market": market}
 
 
 def _tot_bet(side="Over", line=8.5, odds=100, pm=0.60, pc=0.55, gpk=777,
@@ -127,7 +127,8 @@ def _tot_bet(side="Over", line=8.5, odds=100, pm=0.60, pc=0.55, gpk=777,
     return {"Game": game, "G#": 1, "GamePk": gpk, "PlayerId": None,
             "Player": "", "Team": "", "Prop": "total runs", "Side": side,
             "Line": line, "Model %": pm, "Mkt %": pc, "Best Odds": odds,
-            "Book": "pinnacle", "EV%": 0.1, "_market": "totals"}
+            "Book": "pinnacle", "EV%": 0.1, "Books": 3,
+            "_market": "totals"}
 
 
 def _ml_bet(team="NYY", odds=110, pm=0.58, pc=0.55, gpk=777,
@@ -135,7 +136,8 @@ def _ml_bet(team="NYY", odds=110, pm=0.58, pc=0.55, gpk=777,
     return {"Game": game, "G#": 1, "GamePk": gpk, "PlayerId": None,
             "Player": "", "Team": team, "Prop": "moneyline", "Side": team,
             "Line": "", "Model %": pm, "Mkt %": pc, "Best Odds": odds,
-            "Book": "pinnacle", "EV%": 0.1, "_market": "h2h"}
+            "Book": "pinnacle", "EV%": 0.1, "Books": 3,
+            "_market": "h2h"}
 
 
 # ------------------------------------------------- real-schema tripwire
@@ -203,6 +205,27 @@ def test_enrich_pass_family_stakes_with_per_bet_cap(env):
     assert h["stake_capped_by"] == "per-bet-1%"
     assert h["stake_units"] == pytest.approx(0.01 * SK.START_BANKROLL)
     assert by_mkt["pitcher_strikeouts"]["Status"] == "track"
+
+
+def test_enrich_stake_band_longshot_and_single_book(env):
+    """§3.5-§3.6 (2026-07-26 amendment): a stake additionally requires
+    implied probability >= 0.20 and a two-book quote. A +1000-class
+    price clears every EV screen on tail miscalibration alone, and a
+    single stale quote is line-shopping winner's curse, not a market —
+    both still RECORD as track rows so tail evidence accrues."""
+    (env / "market_gate_report.csv").write_text(
+        "family,verdict\nh,PASS\n")
+    long = _bet(odds=1000, pm=0.15, pc=0.12)   # edge .044, EV +.49
+    single = _bet(pid=124, pm=0.55, pc=0.50)   # in-band, one book
+    single["Books"] = 1
+    rows = SK.enrich([long, single], DATE, MKT_FAM)
+    by = {r["PlayerId"]: r for r in rows}
+    assert by[123]["Status"] == "track"
+    assert by[123]["stake_capped_by"] == "longshot-band"
+    assert float(by[123]["stake_units"]) == 0.0
+    assert by[124]["Status"] == "track"
+    assert by[124]["stake_capped_by"] == "single-book"
+    assert float(by[124]["stake_units"]) == 0.0
 
 
 def test_enrich_stakes_mark_to_market_bankroll(env):

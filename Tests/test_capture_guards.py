@@ -50,6 +50,20 @@ def test_capture_verdict_total_failure_even_with_bulk_rows():
     assert fatal and "ODDS CAPTURE FAILED" in marker
 
 
+def test_capture_verdict_bulk_failure_degrades_with_marker():
+    # the bulk featured call is the ONLY source of h2h/totals rows; its
+    # failure used to set slate=[] without touching any counter, so a
+    # clean per-event run greened the chain over a day with no game lines
+    marker, fatal = T2.capture_verdict(15, 0, 1200, bulk_failed=True)
+    assert not fatal
+    assert "ODDS CAPTURE DEGRADED" in marker and "h2h/totals" in marker
+
+
+def test_capture_verdict_total_failure_outranks_bulk_flag():
+    marker, fatal = T2.capture_verdict(15, 15, 0, bulk_failed=True)
+    assert fatal and "ODDS CAPTURE FAILED" in marker
+
+
 def test_capture_verdict_partial_failure_exact_degraded_marker():
     marker, fatal = T2.capture_verdict(15, 4, 1200)
     assert not fatal

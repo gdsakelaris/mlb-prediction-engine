@@ -997,6 +997,15 @@ class App(tk.Tk):
         self._loaded_idx = None
 
     def _predict_clicked(self):
+        # one in-flight job at a time: predict and batch used to share
+        # one result slot with different payload shapes, so overlapping
+        # clicks left two poll chains alive and whichever read the
+        # other's payload died on unpacking (stderr-only under pythonw)
+        if getattr(self, "_busy", False):
+            messagebox.showinfo(
+                "Busy", "A predict/batch job is already running — wait "
+                "for the status bar before starting another.")
+            return
         if self.slate:
             specs = list(self.slate)
         else:
@@ -1005,6 +1014,7 @@ class App(tk.Tk):
             except Exception as e:  # noqa: BLE001 — form errors -> dialog
                 messagebox.showerror("Input error", str(e))
                 return
+        self._busy = True
         self.btn_predict["state"] = "disabled"
         self.status.set(f"Predicting {len(specs)} game(s)...")
         self._pred_state = None
@@ -1025,6 +1035,7 @@ class App(tk.Tk):
             self.after(200, self._poll_predict)
             return
         state, payload = self._pred_state
+        self._busy = False
         self.btn_predict["state"] = "normal"
         if state == "ok":
             _specs, _out, xlsx = payload
@@ -1045,8 +1056,16 @@ class App(tk.Tk):
                 "Models are still loading — try again once the status "
                 "bar says Ready.")
             return
+        if getattr(self, "_busy", False):
+            messagebox.showinfo(
+                "Busy", "A predict/batch job is already running — wait "
+                "for the status bar before starting another.")
+            return
+        self._busy = True
         self.btn_predict["state"] = "disabled"
-        self._pred_state = None
+        self._batch_state = None    # own slot — the predict poller
+        # expects a 3-tuple payload, the batch poller a 2-tuple; a
+        # shared slot let each crash on the other's shape
         self._batch_msg = f"Batch: starting {len(paths)} slates..."
         self._jobs.put(lambda: self._batch_run(paths))
         self.after(200, self._poll_batch)
@@ -1066,14 +1085,15 @@ class App(tk.Tk):
                 saved.append(save_excel_slate(specs, out))
             except Exception as e:  # noqa: BLE001 — per-file fault isolation
                 failed.append(f"{path.name}: {e}")
-        self._pred_state = ("ok", (saved, failed))
+        self._batch_state = ("ok", (saved, failed))
 
     def _poll_batch(self):
-        if self._pred_state is None:
+        if self._batch_state is None:
             self.status.set(self._batch_msg)
             self.after(200, self._poll_batch)
             return
-        _state, (saved, failed) = self._pred_state
+        _state, (saved, failed) = self._batch_state
+        self._busy = False
         self.btn_predict["state"] = "normal"
         tail = f", {len(failed)} failed" if failed else ""
         self.status.set(f"Batch done: {len(saved)} workbook(s) saved"

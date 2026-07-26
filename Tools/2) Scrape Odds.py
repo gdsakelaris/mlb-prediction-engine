@@ -446,9 +446,19 @@ def write_store(rows, out):
         # newest capture wins the close — unless it is ONE-sided and
         # would blank a stored TWO-sided close (books pull a side near
         # lock; sharp_fair can't de-vig a half-pair, so the last
-        # two-sided price is the close the CLV grade needs)
-        if close_ts >= prev[1][0] and (_two_sided(row)
-                                       or not _two_sided(prev[1][1])):
+        # two-sided price is the close the CLV grade needs). STRICTLY
+        # newer only: an equal timestamp is the SAME run (a featured
+        # market and its alternate posting the same line arrive as one
+        # key twice with one shared CapturedAt) — letting it take the
+        # close while the first occurrence held the open fabricated
+        # open->close 'movement' between two simultaneous quotes
+        if close_ts > prev[1][0] and (_two_sided(row)
+                                      or not _two_sided(prev[1][1])):
+            prev[1] = (close_ts, row)
+        elif close_ts == prev[1][0] and _two_sided(row) \
+                and not _two_sided(prev[1][1]):
+            # same capture moment may still upgrade a one-sided quote
+            # to the two-sided twin — a better quote, not movement
             prev[1] = (close_ts, row)
 
     # GamePk-key transition: fold a legacy blank-pk entry into its pk'd
@@ -491,7 +501,17 @@ def write_store(rows, out):
             merged["OpenOverPrice"] = "" if open_[1] is None else open_[1]
             merged["OpenUnderPrice"] = "" if open_[2] is None else open_[2]
             w.writerow(merged)
-    os.replace(tmp, out)
+    # OneDrive briefly locks the store while syncing it; this is the
+    # one file that can never be re-scraped, so the swap retries the
+    # transient instead of losing the day's quota-spent capture
+    for i in range(6):
+        try:
+            os.replace(tmp, out)
+            break
+        except PermissionError:
+            if i == 5:
+                raise
+            time.sleep(0.5 * (i + 1))
     return len(best)
 
 
@@ -558,7 +578,7 @@ def _slate_date(e):
     return c.astimezone().date().isoformat() if c else None
 
 
-def capture_verdict(n_events, n_failed, n_rows):
+def capture_verdict(n_events, n_failed, n_rows, bulk_failed=False):
     """Pure verdict on a capture run: (events attempted, events whose fetch
     failed, rows collected) -> (marker_line or None, fatal). The store is
     the one file that cannot be re-scraped (a pregame line is gone once the
@@ -580,6 +600,14 @@ def capture_verdict(n_events, n_failed, n_rows):
     if n_events and n_failed and (n_failed >= n_events or n_rows == 0):
         return (f"ODDS CAPTURE FAILED: {n_failed}/{n_events} event fetches "
                 f"failed, {n_rows} rows captured", True)
+    if n_events and bulk_failed:
+        # the bulk featured call is the ONLY source of h2h/totals rows;
+        # its failure previously set slate=[] without touching any
+        # counter, so a clean per-event run greened the chain over a
+        # day with no game lines at all
+        return (f"ODDS CAPTURE DEGRADED game-markets bulk fetch failed "
+                f"- the day's h2h/totals lines are lost "
+                f"({n_rows} prop/event rows kept)", False)
     if n_events and n_rows == 0:
         return (f"ODDS CAPTURE DEGRADED 0/{n_events} events failed but 0 "
                 f"rows captured — no requested market posted yet, or the "
@@ -708,6 +736,7 @@ def main():
 
     idx = build_name_index()
     all_rows, n_prop, n_game = [], 0, 0
+    bulk_failed = False
 
     # Game markets (totals/h2h) are 'featured' markets on the bulk endpoint:
     # ONE call returns the whole slate for markets x regions credits (not per
@@ -721,7 +750,7 @@ def main():
                  "markets": ",".join(bulk_game), "oddsFormat": "american"})
         except Exception as ex:
             print(f"  game markets fetch failed ({ex})", file=sys.stderr)
-            slate = []
+            slate, bulk_failed = [], True
         for ev in slate:
             if ev.get("id") not in pend_ids:
                 continue
@@ -793,7 +822,8 @@ def main():
     # for it (per-event calls, or the bulk game-markets call alone) — a
     # bulk-only run that comes back empty is just as lost as a props run.
     n_events = len(pending) if (ev_req or bulk_game) else 0
-    marker, fatal = capture_verdict(n_events, n_fail, len(all_rows))
+    marker, fatal = capture_verdict(n_events, n_fail, len(all_rows),
+                                    bulk_failed=bulk_failed)
     if fatal:
         # salvage anything that did come back (append-merge, atomic) —
         # these lines can never be re-scraped — then trip the noon gate

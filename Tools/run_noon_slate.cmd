@@ -48,6 +48,10 @@ REM starved.
 set "LOCKDIR=%ROOT%\.task_lock"
 set "LOCKOWNED="
 set "LOCKTOKEN="
+REM no setlocal here, so a bailout's NOLOCK=1 leaks into the calling
+REM console session — without this reset a manual same-window rerun
+REM that acquires the lock cleanly would still skip the serve
+set "NOLOCK="
 set /a LOCKTRIES=0
 :acquire
 mkdir "%LOCKDIR%" 2>nul && goto :locked
@@ -62,7 +66,12 @@ goto :acquire
 :lockwait
 set /a LOCKTRIES+=1
 if %LOCKTRIES% geq 30 (
-    echo Task lock still held after 30 min - proceeding without it %date% %time% >> "%LOG%"
+    REM the odds capture must never be starved - but the SERVE must not
+    REM run beside the morning scrape/retrain (mixed warehouse snapshot
+    REM served as real evidence; artifact writes colliding with the
+    REM serve's reads), so the bailout captures slate+odds only
+    echo Task lock still held after 30 min - proceeding without it, serve disabled %date% %time% >> "%LOG%"
+    set "NOLOCK=1"
     goto :run
 )
 if %LOCKTRIES% equ 1 echo Waiting for task lock %date% %time% >> "%LOG%"
@@ -85,6 +94,10 @@ REM step above means todays_games.json or the odds store may be stale -
 REM never serve that), and only when not opted out via NOON_SERVE=0
 if defined FAIL (
     echo Noon serve skipped: slate/odds capture failed >> "%LOG%"
+    goto :served
+)
+if defined NOLOCK (
+    echo Noon serve skipped: task lock never freed - the morning job may still be scraping/retraining >> "%LOG%"
     goto :served
 )
 if /i "%NOON_SERVE%"=="0" (
