@@ -105,8 +105,35 @@ rows_w5ens_reject.parquet = rejected blend rows.)
   Tools/6: compare served top-K on post-07-22 slates vs the pre-blend series at the late-Aug
   review. Weight/haircut re-tune (per-family w once the odds archive supports it) rides the
   calibration-refresh cadence.
-
-## Blocked (future unblock dates)
+- [x] **W5.2 batter-flank wave SHIPPED 2026-07-27** (PA-count audit -> slot-aware participation
+  hazard + bag-sigma shrink instrument + calibrator/heads refresh). (a) PA AUDIT (63 slates,
+  15,048 starter-games, scratchpad pa_audit.py): the slot-blind hazard over-fed bottom-order
+  starters their 4th PA (+6.7/+7.4/+9.0 pts P(4+PA) slots 7/8/9, slots 1-4 clean) — so
+  top-of-sort batter overconfidence is NOT PA-driven (top picks are slots 1-5), but cumulative
+  props of bottom-order bats were inflated. FIX: participation.parquet gained a 9-way zero-based
+  slot axis (features build_participation; EB toward (k,slot) marginal; predict densify
+  [6,4,3,2,2,2,9]; both sims index it, 6-dim legacy accepted). Re-audit: slot-gradient range
+  [-1.6,+9.0] -> [+0.8,+5.0] pts, slots 8/9 +2.9/+2.1, P(5+PA) clean everywhere. RESIDUAL: a
+  uniform ~+2pt P(4+PA) excess across ALL slots (sim generates ~0.3 extra team-PA/game of
+  lineup turnover) — touches the totals-calibrated run env, deliberately not chased; candidate
+  for the late-Aug session. (b) W5.2 SHRINK: full plumbing shipped INERT — per-batter bag-member
+  sigma at both prep choke points (_class_vecs(sigma=True), _agg_bat_sigma vs opposing starter),
+  logit shrink in game_frame pre-calibration (display cols only, Bets untouched), SHRINK gate +
+  SHRINK_LAM/SHRINK_ANCHOR constants, sigma recording in replay (collect_sigma). SWEEP VERDICT
+  (rows_sigma_base/sig.parquet, 292 dev + 39 holdout slates, prereg objective d_t3+d_t10 weak
+  set): lambda stays 0 — bias-vs-sigma gradient real but tiny (+0.2->+0.5pt/quintile; 3-seed
+  bag sigma only 0.01-0.04 logit), dev gains noise, holdout tie [-0.38,+0.44] t10. Re-arm only
+  with a diversity-bagged member (data/feature subsampling). want_sigma auto-off at lambda=0.
+  (c) REFRESH: fresh 4k-sim GPU replay 2025-03-18..2026-07-26 (1.77M rows, 331 slates, 30 min)
+  -> calib_rows (old snapshotted calib_rows_pre_w52) -> --fit-calibrators --reuse-rows --force
+  (full-window precedent, 21 fams, tb slope 0.975 cooling) -> heads --train (b3/pha inactive).
+  (d) A/B rows_prew5 vs new (298 shared slates): ALL +0.00039 [+0.00024,+0.00053] B BETTER;
+  7 fams significant after BH — b1/hrr/h/bk/rbi/r/tb, ALL BATTER — the targeted flank; WATCH
+  ml -0.00137 and pha -0.00081 (A better; retrain-drift vs hazard attribution unknown).
+  (e) Fix-4 scope RESOLVED: in-season batter-vs-pitch-class already shipped in W4.15
+  (panel_bat_pitchmet x arsenal usage = mx_class_whiff/dmg/ts/ride); xBA-grain T3 rebuild
+  stays a late-Aug research item. Suite 236->242 fast + slow 3 green (Tests/test_shrink.py);
+  rows_prew52.parquet = frozen baseline for the next A/B. Tools/5 board regenerated 07-27.
 
 - [ ] **B2. Forecast-error weather sampling** — sample temp/wind per sim from the historical
   forecast-error distribution. Blocked: `forecast_error.json` has n=46, `sufficient: false`

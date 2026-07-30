@@ -1,5 +1,6 @@
 @echo off
-REM Noon safety-net job (Task Scheduler 12:00 PM, safe to run by hand):
+REM Noon safety-net job (Task Scheduler 11:00 AM since 2026-07-26 - ahead
+REM of the earliest ET-morning first pitch, 11:10 CT; safe to run by hand):
 REM   1. Tools/1) Get Todays Games.py   slate scrape -> todays_games.json
 REM                                     + Data/slates archive
 REM   2. Tools/2) Scrape Odds.py        odds capture (pins the opening

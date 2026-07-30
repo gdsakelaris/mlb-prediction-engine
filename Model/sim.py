@@ -549,7 +549,13 @@ def run(prep, n_sims=20000, seed=1, season=2026, is_dh_game=False,
                 same = ((side == pit_throws[cur_pit[sims, ft[li]]])
                         & (side != 2)).astype(np.int8)
                 isc = slot_is_c[s18]
-                rate = part[k, inn_b, margin_b, lead, same, isc]
+                if part.ndim == 7:
+                    # slot-aware hazard: trailing axis IS the zero-based
+                    # due slot (features stores slotb = slot - 1)
+                    rate = part[k, inn_b, margin_b, lead, same, isc,
+                                slot[li].astype(np.int64)]
+                else:
+                    rate = part[k, inn_b, margin_b, lead, same, isc]
                 gone = rng.random(sims.size) < rate
                 if gone.any():
                     active[sims[gone], s18[gone]] = False

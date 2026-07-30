@@ -229,16 +229,21 @@ def _emit_game_rows(rows, g, f, act, pact):
 
 
 def replay_rows_batch(start, end, n_sims=4000, chunk=64, progress=True,
-                      backend="gpu", max_games=None):
+                      backend="gpu", max_games=None, collect_sigma=None):
     """replay_rows on the batched pipeline: sim_batch.prepare_games
     amortizes the pandas/model overhead across each chunk, run_batch
     runs the chunk as one device batch. Same rows, ~10x the
-    throughput."""
+    throughput. collect_sigma: optional list — when given, one tuple
+    (GamePk, PlayerId, sig_hit, sig_xbh, sig_bb, sig_k) per graded
+    batter row is appended (the W5.2 bag-disagreement sigma), for the
+    offline lambda sweep."""
     import sim_batch
     P = PR.Predictor()
     P.calib = {}     # RAW rows by contract — see replay_rows
     P.heads = None
     P.mkt_blend = False
+    if collect_sigma is not None:
+        P.want_sigma = True
     games = P.stores.raw["games"]
     span = games[(games.Date >= pd.Timestamp(start))
                  & (games.Date <= pd.Timestamp(end))]
@@ -282,6 +287,12 @@ def replay_rows_batch(start, end, n_sims=4000, chunk=64, progress=True,
             pact = (pact.set_index("PlayerId") if pact is not None
                     else empty_p)
             _emit_game_rows(rows, g, f, act, pact)
+            if collect_sigma is not None and f.get("bat_sig"):
+                for br, sgv in zip(f["bat"], f["bat_sig"]):
+                    if sgv is not None and br["ID"] in act.index:
+                        collect_sigma.append(
+                            (int(g.GamePk), int(br["ID"]),
+                             *map(float, sgv)))
             state["done"] += 1
             if progress and state["done"] % 100 == 0:
                 print(f"  replayed {state['done']} games...",

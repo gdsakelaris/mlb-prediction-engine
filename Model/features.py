@@ -2350,19 +2350,30 @@ def build_participation(pa):
                      == risk["p_throws"].astype(str))
                     & ~risk["st_id"].isin(switch_ids)).astype(int)
     risk["isc"] = (risk["st_pos"].astype(str) == "C").astype(int)
+    # full 9-way lineup slot (stored zero-based, matching the sim's due
+    # slot): the 2026-07-27 PA audit measured the slot-blind hazard
+    # over-feeding bottom-order starters their 4th PA by +4..+9 pts
+    # (slots 6-9) while slots 1-4 sat clean — teams pinch-hit for weak
+    # bottom bats far more than inning/margin cells alone express. A
+    # 2-slot bucket pass left the within-bucket gradient on the table
+    # (slot 7 vs 6, 5 vs 4), so the axis is per-slot; 854k risk rows /
+    # (6*4*3*2*2*2*9 = 2592) cells + the (k, slot) EB marginal carry it.
+    risk["slotb"] = (risk["slot"] - 1).astype(int)
 
-    cells = ["k", "inn_b", "margin_b", "lead", "same", "isc"]
+    cells = ["k", "slotb", "inn_b", "margin_b", "lead", "same", "isc"]
     grp = risk.groupby(cells).agg(n=("event", "size"),
                                   ev=("event", "sum")).reset_index()
-    km = risk.groupby("k")["event"].mean()
+    km = risk.groupby(["k", "slotb"])["event"].mean()
     K_SHRINK = 300
-    grp["rate"] = ((grp["ev"] + K_SHRINK * grp["k"].map(km))
+    marg = pd.MultiIndex.from_arrays(
+        [grp["k"], grp["slotb"]]).map(km)
+    grp["rate"] = ((grp["ev"] + K_SHRINK * marg)
                    / (grp["n"] + K_SHRINK))
     grp.to_parquet(STORES / "participation.parquet", index=False)
     print(f"participation: {len(risk):,} risk rows, "
           f"{int(risk.event.sum()):,} substitutions "
-          f"({risk.event.mean():.3%}/slot-PA); per-k marginal "
-          f"{ {int(k): round(v, 4) for k, v in km.items()} }", flush=True)
+          f"({risk.event.mean():.3%}/slot-PA); k x slotb marginal "
+          f"rows {len(km)}", flush=True)
 
 
 def build_forecast_error():

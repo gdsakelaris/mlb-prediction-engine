@@ -643,7 +643,13 @@ def run_batch(preps, n_sims=4000, seed=1, seasons=None, is_dh=None,
                     gidx[sims], cur_pit[sims, ft[li]].astype(xp.int32)])
                     & (side != 2)).astype(xp.int32)
                 isc = bp.slot_is_c[gidx[sims], s18].astype(xp.int32)
-                rate = bp.part[k, inn_b, margin_b, lead, same, isc]
+                if bp.part.ndim == 7:
+                    # slot-aware hazard — trailing axis is the zero-
+                    # based due slot, twin of sim.py
+                    rate = bp.part[k, inn_b, margin_b, lead, same,
+                                   isc, slot[li].astype(xp.int32)]
+                else:
+                    rate = bp.part[k, inn_b, margin_b, lead, same, isc]
                 gone = rng.random(int(sims.size),
                                   dtype=xp.float32) < rate
                 if bool(gone.any()):
@@ -1070,9 +1076,15 @@ def _matchup_frame(P, resolved):
 def _fill_avec(P, resolved, rdf, n_sims):
     """One assemble + one predict per model for the whole chunk, then
     scatter back into per-game avec/a2vec (a2vec is class-conditional
-    under the contact tree)."""
+    under the contact tree). With P.want_sigma the W5.2 per-batter bag
+    sigma is aggregated per game and stashed on rv["meta"] — twin of
+    the prepare_game path, same aggregation helper."""
     X, _ = F.assemble_features(rdf, P.fstores)
-    p1, p2 = P._class_vecs(X)
+    if getattr(P, "want_sigma", False):
+        p1, p2, sg = P._class_vecs(X, sigma=True)
+    else:
+        p1, p2 = P._class_vecs(X)
+        sg = None
     per_game = 18 * 20 * 3
     out = []
     for gi, rv in enumerate(resolved):
@@ -1085,6 +1097,10 @@ def _fill_avec(P, resolved, rdf, n_sims):
         for j, prow in enumerate(rv["pit_rows"]):
             avec[prow] = b1[j]
             a2vec[prow] = b2[j]
+        if sg is not None:
+            rv["meta"]["bat_sigma"] = PR._agg_bat_sigma(
+                sg[gi * per_game:(gi + 1) * per_game].reshape(
+                    18, 20, 3, 4))
         out.append((avec, a2vec))
     return out
 

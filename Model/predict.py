@@ -83,6 +83,29 @@ PEN_CHOICE = os.environ.get("PEN_CHOICE", "1") != "0"
 MKT_BLEND = os.environ.get("MKT_BLEND", "1") != "0"
 MKT_BLEND_W = 0.5
 
+# W5.2 uncertainty shrink: the top of a 280-row slate sort is won
+# disproportionately by the row with the largest positive estimation
+# error (winner's curse), and the served tracker shows exactly that —
+# batter power markets 5-9 pts hot at top-10 while pitcher families sit
+# fine. Per-batter disagreement across the A1 bag members (seed spread
+# in logit space) is a free uncertainty estimate: batter binaries are
+# shrunk toward their market's replay-row base rate with weight
+# w = 1/(1 + SHRINK_LAM * sigma^2) BEFORE output calibration, so the
+# shrink is part of the pure model (replay rows, goal board and the
+# calibrator fit all see it). Display-sheet batter columns only — the
+# Bets sheet p_model is untouched until a batter family PASSes the
+# gate. SHRINK=0 serves unshrunk for paired A/B. SHRINK_LAM and the
+# anchors come from the lambda sweep on sigma-annotated replay rows.
+# 2026-07-27 SWEEP VERDICT: lambda stays 0.0 — the 3-seed bag is too
+# concordant (sigma 0.01-0.04 logit) to fund a ranking shrink; the
+# bias-vs-sigma gradient is real but only +0.2->+0.5pt/quintile, dev
+# gains noise-level, holdout tie (+0.03pt t10, CI [-0.38,+0.44]).
+# Re-arm by baking a swept lambda + anchors ONLY after the bag gains
+# real diversity (data/feature subsampling, not just seeds).
+SHRINK = os.environ.get("SHRINK", "1") != "0"
+SHRINK_LAM = 0.0
+SHRINK_ANCHOR = {}
+
 K_LINES = [3.5, 4.5, 5.5, 6.5, 7.5, 8.5]
 OUT_LINES = [14.5, 15.5, 16.5, 17.5, 18.5]
 PHA_LINES = [3.5, 4.5, 5.5, 6.5]
@@ -261,14 +284,32 @@ class Predictor:
         part_path = F.STORES / "participation.parquet"
         if part_path.exists():
             pt = pd.read_parquet(part_path)
-            km = pt.groupby("k").agg(ev=("ev", "sum"), n=("n", "sum"))
-            km = (km.ev / km.n.clip(lower=1)).to_dict()
-            dense = np.zeros((6, 4, 3, 2, 2, 2))
-            for kk in range(1, 7):
-                dense[kk - 1, ...] = km.get(kk, 0.0)
-            for r in pt.itertuples(index=False):
-                dense[int(r.k) - 1, int(r.inn_b), int(r.margin_b),
-                      int(r.lead), int(r.same), int(r.isc)] = r.rate
+            if "slotb" in pt.columns:
+                # slot-aware hazard (2026-07-27 PA audit): trailing
+                # zero-based lineup-slot axis, empty cells backfilled
+                # with the (k, slot) marginal
+                n_slot = int(pt.slotb.max()) + 1
+                km = pt.groupby(["k", "slotb"]).agg(
+                    ev=("ev", "sum"), n=("n", "sum"))
+                km = (km.ev / km.n.clip(lower=1)).to_dict()
+                dense = np.zeros((6, 4, 3, 2, 2, 2, n_slot))
+                for kk in range(1, 7):
+                    for sb in range(n_slot):
+                        dense[kk - 1, ..., sb] = km.get((kk, sb), 0.0)
+                for r in pt.itertuples(index=False):
+                    dense[int(r.k) - 1, int(r.inn_b), int(r.margin_b),
+                          int(r.lead), int(r.same), int(r.isc),
+                          int(r.slotb)] = r.rate
+            else:
+                km = pt.groupby("k").agg(ev=("ev", "sum"),
+                                         n=("n", "sum"))
+                km = (km.ev / km.n.clip(lower=1)).to_dict()
+                dense = np.zeros((6, 4, 3, 2, 2, 2))
+                for kk in range(1, 7):
+                    dense[kk - 1, ...] = km.get(kk, 0.0)
+                for r in pt.itertuples(index=False):
+                    dense[int(r.k) - 1, int(r.inn_b), int(r.margin_b),
+                          int(r.lead), int(r.same), int(r.isc)] = r.rate
             self.part_haz = dense
         # cross-line-coherent output calibrators (one shared monotone
         # map per market FAMILY; fit by evaluate.py --fit-calibrators).
@@ -280,6 +321,14 @@ class Predictor:
         # failures live in predict_slate's per-call scope so one bad
         # serve can't taint a later clean one on the same Predictor.
         self.degraded = []
+        # W5.2: compute per-batter bag-disagreement sigma at prep time
+        # (game_frame shrink + replay sigma recording read it off meta).
+        # Only when a swept lambda is live — at the identity lambda the
+        # extra per-member A1 predicts would buy nothing (the 2026-07-27
+        # sweep measured the 3-seed bag too concordant to fund a
+        # ranking shrink: bias +0.2->+0.5pt across sigma quintiles,
+        # holdout tie). Replays opt in via collect_sigma regardless.
+        self.want_sigma = SHRINK and SHRINK_LAM > 0
         cal_path = ART / "output_calibrators.joblib"
         if cal_path.exists():
             self.calib = joblib.load(cal_path)
@@ -611,11 +660,15 @@ class Predictor:
         return out[:MAX_PEN]
 
     # MIRROR[prep_matchup]: twin in Model/sim_batch.py _matchup_frame — change BOTH or parity drifts
-    def _class_vecs(self, X):
+    def _class_vecs(self, X, sigma=False):
         """A1/A2 probabilities for assembled matchup rows. Returns
         (p8 [n,8], a2arr): a2arr is [n,4] P(bb | in-play) under the
         flat artifact or [n,8,4] P(bb | outcome class) under the
-        hierarchical contact tree."""
+        hierarchical contact tree. With sigma=True a third array
+        [n,4] is returned: per-row std over the A1 bag members of the
+        logit of (hit, xbh, bb, k) group probabilities — the W5.2
+        uncertainty signal (zeros when the artifact is a bare
+        single-seed estimator)."""
         X2 = X.reindex(columns=self.a2["features"]).astype(np.float32)
         p2 = self.a2["scaler"].transform(
             self.a2["model"].predict_proba(X2))
@@ -623,7 +676,12 @@ class Predictor:
         if self.a1.get("kind") != "tree":
             p8 = self.a1["scaler"].transform(
                 self.a1["model"].predict_proba(X1))
-            return p8, p2
+            if not sigma:
+                return p8, p2
+            mem = getattr(self.a1["model"], "members", None)
+            p8s = [self.a1["scaler"].transform(m.predict_proba(X1))
+                   for m in (mem or [])]
+            return p8, p2, _member_sigma(p8s, len(X1))
         t1, t3 = self.a1["t1"], self.a1["t3"]
         p1 = t1["scaler"].transform(t1["model"].predict_proba(X1))
         Xn = X1.to_numpy()
@@ -634,10 +692,24 @@ class Predictor:
                 d[:, bi - 1] = 1.0
             return np.column_stack([Xn, d])
 
+        t3mats = [t3mat(bi) for bi in range(4)]
         p3 = np.stack(
-            [t3["scaler"].transform(t3["model"].predict_proba(t3mat(bi)))
-             for bi in range(4)], axis=1)
-        return F.tree_compose(p1, p2, p3)
+            [t3["scaler"].transform(t3["model"].predict_proba(m))
+             for m in t3mats], axis=1)
+        p8, a2c = F.tree_compose(p1, p2, p3)
+        if not sigma:
+            return p8, a2c
+        m1 = getattr(t1["model"], "members", None)
+        m3 = getattr(t3["model"], "members", None)
+        p8s = []
+        if m1 and m3:
+            for e1, e3 in zip(m1, m3):
+                p1_i = t1["scaler"].transform(e1.predict_proba(X1))
+                p3_i = np.stack(
+                    [t3["scaler"].transform(e3.predict_proba(m))
+                     for m in t3mats], axis=1)
+                p8s.append(F.tree_compose(p1_i, p2, p3_i)[0])
+        return p8, a2c, _member_sigma(p8s, len(X1))
 
     _POS_SLOT = {"First Base": 3, "Second Base": 4, "Third Base": 5,
                  "Shortstop": 6, "Left Field": 7, "Center Field": 8,
@@ -898,7 +970,13 @@ class Predictor:
                     ))
         rdf = pd.DataFrame(rows)
         X, _ = F.assemble_features(rdf, self.fstores)
-        p1, p2 = self._class_vecs(X)
+        if getattr(self, "want_sigma", False):
+            p1, p2, sg = self._class_vecs(X, sigma=True)
+            bat_sigma = _agg_bat_sigma(
+                sg.reshape(len(pit_rows), 20, 3, 4))
+        else:
+            p1, p2 = self._class_vecs(X)
+            bat_sigma = None
         avec = np.full((n_players, 20, 3, 8), np.nan)
         a2vec = np.full((n_players, 20, 3) + p2.shape[1:], np.nan)
         i = 0
@@ -969,6 +1047,8 @@ class Predictor:
                     career_g=[self._career_g.get(p, 0) for p in players],
                     career_gp=[self._career_gp.get(p, 0)
                                for p in players])
+        if bat_sigma is not None:
+            meta["bat_sigma"] = bat_sigma
         return prep, meta
 
     def _rest(self, ppid, date):
@@ -1496,6 +1576,60 @@ COL_FAM = {"HR": "hr", "Hit": "h", "2+ Hits": "h", "Single": "b1",
            "2+ K": "bk", "3+ K": "bk"}
 PIT_FAM = {"K > ": "pk", "Outs > ": "pout", "Hits > ": "pha",
            "BB > ": "pbb", "ER > ": "per"}
+# W5.2: batter col -> sigma group column in meta["bat_sigma"] [20,4]
+# (hit, xbh, bb, k). Run/RBI/H+R+RBI ride the hit group — they are
+# hit-quality-driven with teammate context the sigma cannot see. SB is
+# deliberately absent (speed-driven; the market owns it outright).
+SIG_HIT, SIG_XBH, SIG_BB, SIG_K = 0, 1, 2, 3
+SIG_GROUP = {"Hit": SIG_HIT, "2+ Hits": SIG_HIT, "Single": SIG_HIT,
+             "Double": SIG_XBH, "Triple": SIG_XBH, "HR": SIG_XBH,
+             "2+ TB": SIG_XBH, "3+ TB": SIG_XBH, "4+ TB": SIG_XBH,
+             "Run": SIG_HIT, "2+ Runs": SIG_HIT, "RBI": SIG_HIT,
+             "2+ RBI": SIG_HIT, "H+R+RBI 2+": SIG_HIT,
+             "H+R+RBI 3+": SIG_HIT, "H+R+RBI 4+": SIG_HIT,
+             "BB": SIG_BB, "K": SIG_K, "2+ K": SIG_K, "3+ K": SIG_K}
+
+
+def _member_sigma(p8s, n):
+    """Per-row logit-space std over bag-member 8-class vectors for the
+    four sigma groups (hit=1B+2B+3B+HR, xbh=2B+3B+HR, bb, k). CLASSES
+    order is [K, BB, HBP, 1B, 2B, 3B, HR, IPO]. Fewer than two members
+    (bare single-seed artifact) -> zeros: no disagreement signal."""
+    if len(p8s) < 2:
+        return np.zeros((n, 4), dtype=np.float32)
+    stack = np.stack(p8s)                       # [m, n, 8]
+    grp = np.stack([stack[:, :, 3:7].sum(axis=2),
+                    stack[:, :, 4:7].sum(axis=2),
+                    stack[:, :, 1], stack[:, :, 0]], axis=2)
+    grp = np.clip(grp, 1e-6, 1 - 1e-6)
+    z = np.log(grp) - np.log1p(-grp)
+    return z.std(axis=0).astype(np.float32)     # [n, 4]
+
+
+def _agg_bat_sigma(sgb):
+    """[18 pit_rows, 20 batters, 3 tto, 4] row sigmas -> [20, 4] per
+    batter, averaged over TTO against the OPPOSING STARTER only
+    (pit_rows position 0 = away starter row 18, position 1 = home
+    starter row 19): the starter dominates the real matchup mix and
+    the padded -1 pen slots would pollute a full-grid mean."""
+    out = np.zeros((20, 4), dtype=np.float32)
+    away_b = list(range(9)) + [18]      # away lineup + away bench
+    home_b = list(range(9, 18)) + [19]
+    out[away_b] = sgb[1, away_b].mean(axis=1)   # face home starter
+    out[home_b] = sgb[0, home_b].mean(axis=1)   # face away starter
+    return out
+
+
+def _shrink_p(p, sig, anchor):
+    """W5.2: shrink one probability toward its market anchor in logit
+    space with weight w = 1/(1 + SHRINK_LAM * sigma^2). Same w within a
+    ladder family (shared sigma group) + ordered anchors preserve rung
+    monotonicity."""
+    p = min(max(float(p), 1e-6), 1 - 1e-6)
+    z = np.log(p) - np.log1p(-p)
+    za = np.log(anchor) - np.log1p(-anchor)
+    w = 1.0 / (1.0 + SHRINK_LAM * float(sig) * float(sig))
+    return float(1.0 / (1.0 + np.exp(-(za + w * (z - za)))))
 MKT_FAM = {"batter_hits": "h", "batter_home_runs": "hr",
            "batter_total_bases": "tb", "batter_runs_scored": "r",
            "batter_rbis": "rbi", "batter_walks": "bb",
@@ -1883,6 +2017,8 @@ def game_frame(res):
     gnum = 2 if spec.get("dh_game2") else 1
 
     bat_rows = []
+    bat_sig = []
+    bsig_all = meta.get("bat_sigma")
     for brow in range(18):
         pid = meta["players"][brow]
         if pid < 0:
@@ -1928,9 +2064,18 @@ def game_frame(res):
             "xBB": round(float(sub[:, s["BB"]].mean()), 2),
             "BB": float((sub[:, s["BB"]] >= 1).mean()),
         }
+        # W5.2 shrink BEFORE calibration (monotone per-family maps keep
+        # the shrunk ranking; calibrators are fit on shrunk rows)
+        if SHRINK and SHRINK_LAM > 0 and bsig_all is not None:
+            for c, gi in SIG_GROUP.items():
+                a = SHRINK_ANCHOR.get(c)
+                if a is not None:
+                    row[c] = _shrink_p(row[c], bsig_all[brow, gi], a)
         for c, fam in COL_FAM.items():
             row[c] = _cal(calib, fam, row[c])
         bat_rows.append(row)
+        bat_sig.append(None if bsig_all is None
+                       else np.asarray(bsig_all[brow], dtype=float))
 
     pit_rows = []
     for prow, team, opp in ((18, away, home), (19, home, away)):
@@ -2017,6 +2162,7 @@ def game_frame(res):
         bn = _blend_market(res["mktfair"], spec, bat_rows, pit_rows,
                            grow, away, home)
     return dict(bat=bat_rows, pit=pit_rows, game=grow, blend_n=bn,
+                bat_sig=bat_sig,
                 pure=pure)
 
 

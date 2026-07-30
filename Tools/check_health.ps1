@@ -1,6 +1,8 @@
 # MLB Engine health watchdog ("MLB Engine Health Check" scheduled task:
 # at logon + 08:15 + 12:45, plus a 13:35 trigger so a noon run killed
-# at its PT1H limit is caught same-day). The in-script exit codes and
+# at its PT1H limit is caught same-day; the slate task itself fires at
+# 11:00 AM since 2026-07-26, so 12:45 stays the first scheduled check
+# after it). The in-script exit codes and
 # status JSON can only report a run that HAPPENED — this watchdog is
 # the one mechanism that catches a task that never started (the
 # 2026-07-23 failure mode). Every run also re-checks YESTERDAY's noon
@@ -97,9 +99,10 @@ if ($now.Hour -ge 7 -and -not (Test-TaskRunning "MLB Engine Daily Update")) {
     }
 }
 
-# 2) noon slate/odds capture ran (only meaningful after 12:30; skipped
-#    while the task is actually Running, e.g. waiting on the task lock)
-if ((($now.Hour -gt 12) -or ($now.Hour -eq 12 -and $now.Minute -ge 30)) -and
+# 2) noon slate/odds capture ran (task fires 11:00 since 2026-07-26, so
+#    this is only meaningful after 11:30; skipped while the task is
+#    actually Running, e.g. waiting on the task lock)
+if ((($now.Hour -gt 11) -or ($now.Hour -eq 11 -and $now.Minute -ge 30)) -and
     -not (Test-TaskRunning "MLB Engine Noon Slate")) {
     try {
         $noonLog = Join-Path $logs "noon_$today.log"
