@@ -2310,8 +2310,8 @@ def build_participation(pa):
         ["game_pk", "PlayerId", "Team"])
 
     sub = pa[pa["Season"] >= 2022][
-        ["game_pk", "at_bat_number", "BatterId", "bat_team", "stand",
-         "p_throws", "inning", "score_diff"]].copy()
+        ["game_pk", "Season", "at_bat_number", "BatterId", "bat_team",
+         "stand", "p_throws", "inning", "score_diff"]].copy()
     j = sub.merge(slot_map, left_on=["game_pk", "BatterId", "bat_team"],
                   right_on=["game_pk", "PlayerId", "Team"], how="inner")
     j = j.sort_values(["game_pk", "bat_team", "slot", "at_bat_number"])
@@ -2370,10 +2370,35 @@ def build_participation(pa):
     grp["rate"] = ((grp["ev"] + K_SHRINK * marg)
                    / (grp["n"] + K_SHRINK))
     grp.to_parquet(STORES / "participation.parquet", index=False)
+    # era anchor: the grid pools 2022+, but the substitution LEVEL is
+    # not stationary — 2026 bench-PA runs ~17% above the pool (1.657
+    # vs 1.374/team-game; the 2026-08-02 paired diagnosis showed the
+    # sim reproducing the POOLED era exactly: starters +0.29 PA/game,
+    # bench -0.25, P(4+ PA) +2.2pts across all slots). One EB-shrunk
+    # logit shift anchors the served grid to the current season's
+    # level (the SB models' era truth-anchoring pattern); predict.py
+    # applies it to the dense lookup at load time so both engines and
+    # the (k, slot) backfill cells shift identically.
+    season_max = int(risk["Season"].max())
+    cur = risk[risk["Season"] == season_max]
+    pred = cur.merge(grp[cells + ["rate"]], on=cells,
+                     how="left")["rate"].astype(float)
+    p_act, p_prd = float(cur["event"].mean()), float(pred.mean())
+    n_cur, n0 = len(cur), 30_000
+    delta = 0.0
+    if 0.0 < p_act < 1.0 and 0.0 < p_prd < 1.0:
+        delta = (n_cur / (n_cur + n0)) * (
+            np.log(p_act / (1 - p_act)) - np.log(p_prd / (1 - p_prd)))
+    (STORES / "participation_anchor.json").write_text(json.dumps(
+        {"season": season_max, "delta": float(delta),
+         "n_season": int(n_cur), "p_act": p_act, "p_pred": p_prd},
+        indent=1))
     print(f"participation: {len(risk):,} risk rows, "
           f"{int(risk.event.sum()):,} substitutions "
           f"({risk.event.mean():.3%}/slot-PA); k x slotb marginal "
-          f"rows {len(km)}", flush=True)
+          f"rows {len(km)}; era anchor {delta:+.4f} logit "
+          f"(season {season_max}, n {n_cur:,}, act {p_act:.4f} vs "
+          f"grid {p_prd:.4f})", flush=True)
 
 
 def build_forecast_error():

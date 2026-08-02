@@ -114,9 +114,8 @@ rows_w5ens_reject.parquet = rejected blend rows.)
   slot axis (features build_participation; EB toward (k,slot) marginal; predict densify
   [6,4,3,2,2,2,9]; both sims index it, 6-dim legacy accepted). Re-audit: slot-gradient range
   [-1.6,+9.0] -> [+0.8,+5.0] pts, slots 8/9 +2.9/+2.1, P(5+PA) clean everywhere. RESIDUAL: a
-  uniform ~+2pt P(4+PA) excess across ALL slots (sim generates ~0.3 extra team-PA/game of
-  lineup turnover) — touches the totals-calibrated run env, deliberately not chased; candidate
-  for the late-Aug session. (b) W5.2 SHRINK: full plumbing shipped INERT — per-batter bag-member
+  uniform ~+2pt P(4+PA) excess across ALL slots — RESOLVED by W5.3 (2026-08-02, below): it
+  was a 2026 substitution regime shift, not extra team-PA. (b) W5.2 SHRINK: full plumbing shipped INERT — per-batter bag-member
   sigma at both prep choke points (_class_vecs(sigma=True), _agg_bat_sigma vs opposing starter),
   logit shrink in game_frame pre-calibration (display cols only, Bets untouched), SHRINK gate +
   SHRINK_LAM/SHRINK_ANCHOR constants, sigma recording in replay (collect_sigma). SWEEP VERDICT
@@ -134,6 +133,28 @@ rows_w5ens_reject.parquet = rejected blend rows.)
   (panel_bat_pitchmet x arsenal usage = mx_class_whiff/dmg/ts/ride); xBA-grain T3 rebuild
   stays a late-Aug research item. Suite 236->242 fast + slow 3 green (Tests/test_shrink.py);
   rows_prew52.parquet = frozen baseline for the next A/B. Tools/5 board regenerated 07-27.
+- [x] **W5.3 participation era anchor SHIPPED 2026-08-02** (closes the W5.2 turnover residual).
+  (a) DIAGNOSIS (700-game paired replay Apr-Jul 2026, 1,414 team-games, scratchpad
+  pa_turnover_diag.py, Logs/pa_turnover_diag_big_2026-08-02.log): team PA EXACT (+0.04±0.12),
+  runs exact — but starters +0.287±0.115 PA/g, bench −0.250±0.046. Bench-PA/team-game by
+  season: 2022 1.27, 2023-25 ~1.41, 2026 1.657 (+17%); the sim's 1.404 reproduced its 2022+
+  pooled training era exactly. The "0.3 extra team-PA" framing was wrong — it was starter-vs-
+  bench ALLOCATION (substitution under-firing vs the current season), not game length.
+  (b) FIX: build_participation writes stores/participation_anchor.json — one EB-shrunk logit
+  shift δ = w·(logit(act_cur) − logit(pred_cur)), w = n_cur/(n_cur+30k); 2026-08-02 δ=+0.1029
+  (n 124,317, act 2.98% vs grid 2.63%). predict.py applies δ to the dense lookup at LOAD time
+  (covers both engines and the (k,slot) ev/n marginal backfills). Self-tightens at every
+  store rebuild. (c) VERIFY (same 700 games): bench deficit −0.250 → −0.117±0.046, starter
+  excess +0.287 → +0.141, P(4+PA) gap ~halved per slot, team PA/runs still exact. Residual
+  −0.117 = deliberate EB conservatism — WATCH, do not retune N0 to the diagnostic. Extras
+  rate sim 9.6% vs actual 8.3% — separate small watch. (d) SHIP GATE: paired A/B rows_prew53
+  vs rows_w53 (690,766 rows, 121 slates 2026-03-25..07-26, both 2026-only): ALL 20 families
+  TIE after BH (r/pha/ml raw-positive, worst b2 −0.00012 n.s.); goal board t1 broadly
+  positive, 2+ Hits +2.5/+2.5/+2.0 pts t1/t3/t10; suite 242 green. Shipped on no-harm-tie +
+  generative correctness (contact-tree precedent). rows_w53.parquet basis = next A/B baseline.
+  Same-day context: calibrators refreshed FRESH 2026-only (guard-compliant, fit_end 07-26
+  preserved for gate OOS); heads leaner (h/hr/pha/pout/r/rbi now identity); walkforward +
+  skill ledger + prop_bench + tracker all regenerated post-W5.2.
 
 - [ ] **B2. Forecast-error weather sampling** — sample temp/wind per sim from the historical
   forecast-error distribution. Blocked: `forecast_error.json` has n=46, `sufficient: false`

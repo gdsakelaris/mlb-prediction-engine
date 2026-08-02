@@ -310,6 +310,22 @@ class Predictor:
                 for r in pt.itertuples(index=False):
                     dense[int(r.k) - 1, int(r.inn_b), int(r.margin_b),
                           int(r.lead), int(r.same), int(r.isc)] = r.rate
+            # era anchor (features build_participation): one logit
+            # shift applied to every cell INCLUDING the (k, slot)
+            # marginal backfills — the 2022+ pooled grid under-fires
+            # the current season's substitution level otherwise
+            anc = F.STORES / "participation_anchor.json"
+            if anc.exists():
+                try:
+                    _d = float(json.loads(anc.read_text())
+                               .get("delta", 0.0))
+                except (ValueError, TypeError, OSError,
+                        json.JSONDecodeError):
+                    _d = 0.0
+                if _d:
+                    nz = (dense > 0.0) & (dense < 1.0)
+                    z = np.log(dense[nz] / (1.0 - dense[nz]))
+                    dense[nz] = 1.0 / (1.0 + np.exp(-(z + _d)))
             self.part_haz = dense
         # cross-line-coherent output calibrators (one shared monotone
         # map per market FAMILY; fit by evaluate.py --fit-calibrators).
